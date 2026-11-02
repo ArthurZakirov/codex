@@ -79,4 +79,16 @@ mod tests {
         assert!(prompt.contains("The user's name is "));
         assert!(!prompt.contains("{{ user_first_name }}"));
     }
+
+    #[test]
+    fn default_voice_prompt_reads_code_without_asking_for_spoken_duplicates() {
+        let prompt =
+            prepare_realtime_backend_prompt(/*prompt*/ None, /*config_prompt*/ None);
+
+        assert!(prompt.contains("Speak commands inside code blocks directly"));
+        assert!(prompt.contains("ask for the normal Markdown artifact"));
+        assert!(
+            !prompt.contains("tell the backend to provide an appropriate spoken-text companion")
+        );
+    }
 }
