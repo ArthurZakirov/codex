@@ -1646,15 +1646,9 @@ pub(crate) async fn build_realtime_session_config(
         .or(config_voice)
         .unwrap_or_else(|| default_realtime_voice(version));
     validate_realtime_voice(version, voice)?;
-    // In the opt-in macOS verbatim path, the client submits transcribed turns
-    // itself upon a standalone spoken "go". The realtime model must not also
-    // send handoffs for those same utterances.
-    let mut prompt = prompt;
-    if cfg!(target_os = "macos")
-        && std::env::var("CODEX_REALTIME_VERBATIM_SPEECH").is_ok_and(|value| value == "1")
-    {
-        prompt.push_str("\n\nIn this voice session, do not delegate, call backend tools, or speak answers. Transcribe the user's audio faithfully. The local client collects spoken segments and submits them only after a separate spoken 'go'. Do not decide turn completion or produce a reply.");
-    }
+    // The realtime model receives the same instructions as standard Codex.
+    // In verbatim mode, the client separately owns spoken "go" submission and
+    // output suppression; changing model instructions can affect V3 transcription.
     Ok(RealtimeSessionConfig {
         instructions: prompt,
         initial_items: params.initial_items.clone(),
