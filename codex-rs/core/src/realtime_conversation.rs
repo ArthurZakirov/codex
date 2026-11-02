@@ -1646,6 +1646,15 @@ pub(crate) async fn build_realtime_session_config(
         .or(config_voice)
         .unwrap_or_else(|| default_realtime_voice(version));
     validate_realtime_voice(version, voice)?;
+    // In the opt-in macOS verbatim path, the client submits transcribed turns
+    // itself upon a standalone spoken "go". The realtime model must not also
+    // send handoffs for those same utterances.
+    let mut prompt = prompt;
+    if cfg!(target_os = "macos")
+        && std::env::var("CODEX_REALTIME_VERBATIM_SPEECH").is_ok_and(|value| value == "1")
+    {
+        prompt.push_str("\n\nIn this voice session, do not delegate, call backend tools, or speak answers. Transcribe the user's audio faithfully. The local client collects spoken segments and submits them only after a separate spoken 'go'. Do not decide turn completion or produce a reply.");
+    }
     Ok(RealtimeSessionConfig {
         instructions: prompt,
         initial_items: params.initial_items.clone(),
@@ -1847,7 +1856,12 @@ async fn handle_start_inner(
                 ),
                 _ => None,
             };
-            if let Some(text) = maybe_routed_text {
+            // With local explicit voice turns the client routes the finalized
+            // transcript. Ignore model-originated handoffs to avoid a duplicate
+            // request racing the spoken 'go' submission.
+            let locally_routed = cfg!(target_os = "macos")
+                && std::env::var("CODEX_REALTIME_VERBATIM_SPEECH").is_ok_and(|value| value == "1");
+            if let Some(text) = maybe_routed_text.filter(|_| !locally_routed) {
                 // The routed text can contain spoken prompts or workspace secrets.
                 debug!("[realtime-text] realtime conversation text output");
                 handoff_error = route_handoffs.route(&sess_clone, text).await.err();

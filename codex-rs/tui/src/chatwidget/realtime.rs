@@ -8,6 +8,8 @@ mod recording_controls;
 mod transcript_replay;
 #[cfg(target_os = "macos")]
 mod verbatim_speech;
+#[cfg(target_os = "macos")]
+mod voice_turn;
 
 pub(crate) use failure_metrics::RealtimeFailureCause;
 
@@ -186,6 +188,8 @@ pub(super) struct RealtimeConversationUiState {
     pending_speech: VecDeque<PendingRealtimeSpeech>,
     #[cfg(target_os = "macos")]
     verbatim_speech_task: Option<tokio::task::JoinHandle<()>>,
+    #[cfg(target_os = "macos")]
+    voice_turn: voice_turn::VoiceTurnBuffer,
 }
 
 impl RealtimeConversationUiState {
@@ -371,6 +375,8 @@ impl ChatWidget {
 
         // Stopping may prevent final transcript events from arriving.
         self.finish_realtime_partial_transcripts();
+        #[cfg(target_os = "macos")]
+        self.realtime_conversation.voice_turn.clear();
 
         if let Some(handle) = self.realtime_conversation.handle.take() {
             handle.close();
@@ -1682,6 +1688,10 @@ impl ChatWidget {
                 .push_back(cell);
             self.bump_active_cell_revision();
             self.flush_realtime_transcript_history();
+            #[cfg(target_os = "macos")]
+            if role == "user" && verbatim_speech::enabled() {
+                self.on_client_managed_voice_transcript(&text);
+            }
         }
     }
 
@@ -1856,7 +1866,10 @@ impl ChatWidget {
 
     pub(crate) fn reset_realtime_conversation(&mut self) -> Option<ThreadId> {
         #[cfg(target_os = "macos")]
-        self.cancel_verbatim_speech();
+        {
+            self.cancel_verbatim_speech();
+            self.realtime_conversation.voice_turn.clear();
+        }
         if self.realtime_conversation_is_running() {
             self.app_event_tx
                 .send(AppEvent::RealtimeConversationStateChanged);
