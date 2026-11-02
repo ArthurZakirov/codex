@@ -900,6 +900,20 @@ impl App {
                         .restore_undelivered_realtime_speech(*delivery_id);
                     return Ok(true);
                 }
+                #[cfg(target_os = "macos")]
+                if self.chat_widget.realtime_verbatim_speech_enabled() {
+                    match self.chat_widget.play_verbatim_speech(text.as_str()) {
+                        Ok(()) => self.chat_widget.accept_realtime_speech(*delivery_id),
+                        Err(error) => {
+                            self.chat_widget
+                                .restore_undelivered_realtime_speech(*delivery_id);
+                            self.chat_widget.add_error_message(format!(
+                                "Unable to read this answer aloud using macOS speech: {error}"
+                            ));
+                        }
+                    }
+                    return Ok(true);
+                }
                 app_server
                     .thread_realtime_append_speech(*realtime_thread_id, text.as_str().to_owned())
                     .await?;

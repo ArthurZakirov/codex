@@ -60,6 +60,10 @@ impl ChatWidget {
     }
 
     pub(super) fn release_realtime_speaker(&mut self) {
+        #[cfg(target_os = "macos")]
+        if verbatim_speech::enabled() {
+            return;
+        }
         let acknowledged = self
             .realtime_conversation
             .interruption_acknowledged_until

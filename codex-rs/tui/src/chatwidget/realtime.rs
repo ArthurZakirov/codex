@@ -6,6 +6,8 @@
 mod failure_metrics;
 mod recording_controls;
 mod transcript_replay;
+#[cfg(target_os = "macos")]
+mod verbatim_speech;
 
 pub(crate) use failure_metrics::RealtimeFailureCause;
 
@@ -69,6 +71,7 @@ static NEXT_REALTIME_SPEECH_DELIVERY_ID: AtomicU64 = AtomicU64::new(1);
 struct PendingRealtimeSpeech {
     state: PendingSpeechState,
     captioned: bool,
+    rendered_in_history: bool,
     input_generation: u64,
     thread_id: ThreadId,
     turn_id: String,
@@ -181,6 +184,8 @@ pub(super) struct RealtimeConversationUiState {
     delegated_reasoning_turns: VecDeque<String>,
     pub(super) agent_items: HashMap<(String, String), RealtimeAgentItemOrigin>,
     pending_speech: VecDeque<PendingRealtimeSpeech>,
+    #[cfg(target_os = "macos")]
+    verbatim_speech_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl RealtimeConversationUiState {
@@ -352,6 +357,8 @@ impl ChatWidget {
     }
 
     pub(crate) fn stop_realtime_conversation(&mut self) {
+        #[cfg(target_os = "macos")]
+        self.cancel_verbatim_speech();
         self.realtime_conversation.startup_retry = StartupRetry::Used;
         if matches!(
             self.realtime_conversation.phase,
@@ -430,6 +437,10 @@ impl ChatWidget {
             return;
         }
         self.realtime_conversation.handle = Some(offer.handle);
+        #[cfg(target_os = "macos")]
+        if verbatim_speech::enabled() {
+            self.suppress_realtime_speaker();
+        }
         self.update_realtime_footer();
         self.refresh_terminal_title();
         self.frame_requester
@@ -598,6 +609,8 @@ impl ChatWidget {
             return;
         }
         self.realtime_conversation.latest_input_was_voice = false;
+        #[cfg(target_os = "macos")]
+        self.cancel_verbatim_speech();
         self.realtime_conversation.input_generation = self
             .realtime_conversation
             .input_generation
@@ -892,6 +905,13 @@ impl ChatWidget {
             *suppressed_nonfinal = true;
             return true;
         }
+        // Only the delegated final answer is eligible for visible Markdown.
+        // A provisional item with no final marker must never leak into history.
+        if !explicitly_final && !trimmed.starts_with("[FINAL]") {
+            *completed = true;
+            *suppressed_nonfinal = true;
+            return true;
+        }
         // Typing ends the old item's speech ownership, but it does not make
         // private voice commentary into typed output. Only a visible answer
         // returns to the ordinary completion path.
@@ -920,13 +940,16 @@ impl ChatWidget {
             .push_back(PendingRealtimeSpeech {
                 state: PendingSpeechState::AwaitingTurn,
                 captioned: false,
+                rendered_in_history: true,
                 input_generation,
                 thread_id,
                 turn_id: turn_id.to_string(),
                 item: item.clone(),
             });
 
-        true
+        // Keep the speech handoff, but also render the final answer as Markdown.
+        // Private commentary and reasoning still return early above.
+        false
     }
 
     pub(super) fn speak_completed_realtime_delegation(
@@ -989,16 +1012,16 @@ impl ChatWidget {
             return;
         }
         *may_speak = false;
+        let native_speech = cfg!(target_os = "macos")
+            && std::env::var("CODEX_REALTIME_VERBATIM_SPEECH").is_ok_and(|value| value == "1");
         if !can_retain_realtime_speech(turn_id, item)
-            || codex_utils_string::approx_token_count(&text) > MAX_SPEAKABLE_FINAL_TOKENS
+            || (!native_speech
+                && codex_utils_string::approx_token_count(&text) > MAX_SPEAKABLE_FINAL_TOKENS)
         {
             self.remove_waiting_realtime_speech(turn_id, item_id);
             self.finish_realtime_turn(turn_id);
-            self.handle_thread_item(
-                item.clone(),
-                turn_id.to_string(),
-                super::ThreadItemRenderSource::Live,
-            );
+            // The completed item has already been rendered in Markdown.
+            // Do not render it again merely because speech is over budget.
             return;
         }
         let delivery_id = NEXT_REALTIME_SPEECH_DELIVERY_ID.fetch_add(1, Ordering::Relaxed);
@@ -1024,6 +1047,7 @@ impl ChatWidget {
                     .push_back(PendingRealtimeSpeech {
                         state: PendingSpeechState::AwaitingTurn,
                         captioned: false,
+                        rendered_in_history: false,
                         input_generation,
                         thread_id,
                         turn_id: turn_id.to_string(),
@@ -1205,7 +1229,8 @@ impl ChatWidget {
         // Do not append old queued speech under a newer question. An answer that
         // never reached speech still needs its text fallback: a delayed user
         // transcript can advance the generation after its delegation starts.
-        if delivery.captioned
+        if delivery.rendered_in_history
+            || delivery.captioned
             || (delivery.state != PendingSpeechState::AwaitingTurn
                 && delivery.input_generation != self.realtime_conversation.input_generation)
             || self.thread_id() != Some(delivery.thread_id)
@@ -1270,6 +1295,15 @@ impl ChatWidget {
     }
 
     pub(super) fn on_realtime_transcript_delta(&mut self, role: String, delta: String) {
+        #[cfg(target_os = "macos")]
+        if verbatim_speech::enabled() {
+            if role == "assistant" {
+                return;
+            }
+            if role == "user" && !delta.trim().is_empty() {
+                self.cancel_verbatim_speech();
+            }
+        }
         if self.realtime_conversation.phase == RealtimeConversationPhase::Inactive
             && !self.realtime_conversation.recover_late_transcripts
         {
@@ -1413,6 +1447,15 @@ impl ChatWidget {
     }
 
     pub(super) fn on_realtime_transcript_done(&mut self, role: String, mut text: String) {
+        #[cfg(target_os = "macos")]
+        if verbatim_speech::enabled() {
+            if role == "assistant" {
+                return;
+            }
+            if role == "user" && !text.trim().is_empty() {
+                self.cancel_verbatim_speech();
+            }
+        }
         if matches!(
             self.realtime_conversation.phase,
             RealtimeConversationPhase::Inactive | RealtimeConversationPhase::Stopping
@@ -1812,6 +1855,8 @@ impl ChatWidget {
     }
 
     pub(crate) fn reset_realtime_conversation(&mut self) -> Option<ThreadId> {
+        #[cfg(target_os = "macos")]
+        self.cancel_verbatim_speech();
         if self.realtime_conversation_is_running() {
             self.app_event_tx
                 .send(AppEvent::RealtimeConversationStateChanged);
@@ -1821,24 +1866,9 @@ impl ChatWidget {
             != RealtimeConversationPhase::Inactive
             && self.last_terminal_title.is_some();
         self.restore_all_undelivered_realtime_speech();
-        // A delegated item is hidden until the turn completes so it can be spoken.
-        // If voice ends first, let the later turn completion render it normally.
-        if self
-            .transcript
-            .last_completed_agent_message
-            .as_ref()
-            .is_some_and(|completed_item| {
-                matches!(
-                    self.realtime_conversation.agent_items.get(completed_item),
-                    Some(RealtimeAgentItemOrigin::Delegated {
-                        completed: true,
-                        ..
-                    })
-                )
-            })
-        {
-            self.transcript.last_completed_agent_message = None;
-        }
+        // Delegated final answers now enter ordinary Markdown history at item
+        // completion. Keep their completion identity when voice closes: clearing
+        // it would cause TurnCompleted to insert the same answer a second time.
         // The helper may already have exited while app-server still owns the
         // voice session. An acknowledged backend start still needs a stop RPC.
         let backend_thread_id = if self.realtime_conversation.handle.is_some()
