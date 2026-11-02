@@ -641,6 +641,43 @@ ignored = [
 # use CARGO_PROFILE_DEV_DEBUG=full (or CARGO_PROFILE_TEST_DEBUG=full) for locals.
 debug = "line-tables-only"
 
+# Microphone processing has a real-time deadline. Unoptimized Sonora/Rubato
+# caused 10 seconds of audio to require over 23 seconds of CPU on Apple Silicon,
+# dropping captured speech. Optimize only the native voice-host DSP pipeline in
+# normal development builds; the rest of Codex retains fast debug compilation.
+[profile.dev.package."codex-voice-host"]
+opt-level = 3
+
+[profile.dev.package.rubato]
+opt-level = 3
+
+[profile.dev.package.audioadapter]
+opt-level = 3
+
+[profile.dev.package."audioadapter-buffers"]
+opt-level = 3
+
+[profile.dev.package.windowfunctions]
+opt-level = 3
+
+[profile.dev.package.sonora]
+opt-level = 3
+
+[profile.dev.package."sonora-aec3"]
+opt-level = 3
+
+[profile.dev.package."sonora-agc2"]
+opt-level = 3
+
+[profile.dev.package."sonora-common-audio"]
+opt-level = 3
+
+[profile.dev.package."sonora-ns"]
+opt-level = 3
+
+[profile.dev.package."sonora-simd"]
+opt-level = 3
+
 [profile.dev-small]
 inherits = "dev"
 opt-level = 0
