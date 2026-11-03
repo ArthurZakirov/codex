@@ -28,7 +28,9 @@ jobs:
       matrix:
         include:
           - target: aarch64-apple-darwin
-            runner: macos-15
+            # macos-15 arm64 jobs may never acquire a runner during capacity incidents.
+            # macos-26 uses the separate GA Apple Silicon runner image/pool.
+            runner: macos-26
             native_prefix: macos_aarch64
           - target: x86_64-apple-darwin
             runner: macos-15-intel
@@ -57,6 +59,22 @@ jobs:
           [[ "$RELEASE_TAG" == "voice-v${version}-r"* ]] || exit 2
           echo "VOICE_VERSION=$version" >> "$GITHUB_ENV"
           echo "VOICE_RELEASE_TAG=$RELEASE_TAG" >> "$GITHUB_ENV"
+      - name: Verify that the hosted runner matches the package CPU
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          case "$TARGET" in
+            aarch64-apple-darwin) expected=arm64 ;;
+            x86_64-apple-darwin) expected=x86_64 ;;
+            *) echo "Unsupported macOS package target: $TARGET" >&2; exit 2 ;;
+          esac
+          actual="$(uname -m)"
+          if [[ "$actual" != "$expected" ]]; then
+            echo "Runner architecture $actual is not $expected ($TARGET)" >&2
+            exit 1
+          fi
       - name: Build versioned Codex CLI package
         shell: bash
         env:
