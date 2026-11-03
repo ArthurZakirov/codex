@@ -813,6 +813,7 @@ async fn new_voice_turn_interrupts_uncaptioned_queued_speech() {
             .push_back(PendingRealtimeSpeech {
                 state,
                 captioned,
+                rendered_in_history: false,
                 input_generation: 0,
                 thread_id,
                 turn_id: "old-turn".into(),

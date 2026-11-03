@@ -3,6 +3,8 @@
 
 use super::*;
 use codex_app_server_protocol::AskForApproval;
+#[cfg(target_os = "macos")]
+use std::process::Stdio;
 
 const MAX_SPOKEN_REQUEST_BYTES: usize = 4096;
 
@@ -11,6 +13,7 @@ pub(super) struct VoiceTurnBuffer {
     segments: Vec<String>,
     bytes: usize,
     awaiting_result: Option<String>,
+    backend_start_acknowledged: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -43,6 +46,7 @@ impl VoiceTurnBuffer {
                 return VoiceTurnAction::Empty;
             }
             self.awaiting_result = Some(text.clone());
+            self.backend_start_acknowledged = false;
             return VoiceTurnAction::Submit(text);
         }
         if !self.push_segment(segment) {
@@ -68,19 +72,37 @@ impl VoiceTurnBuffer {
         let Some(previous) = self.awaiting_result.take() else {
             return false;
         };
+        self.backend_start_acknowledged = false;
         self.bytes += previous.len() + usize::from(!self.segments.is_empty());
         self.segments.insert(0, previous);
         true
     }
 
+    /// Only the matching backend user-item event confirms the submitted spoken request.
+    /// A local "go" or an unrelated typed turn must never trigger the sound.
+    fn acknowledge_backend_start(&mut self, input: &str) -> bool {
+        if self.backend_start_acknowledged
+            || !self
+                .awaiting_result
+                .as_ref()
+                .is_some_and(|expected| expected == &realtime_delegation_display_text(input))
+        {
+            return false;
+        }
+        self.backend_start_acknowledged = true;
+        true
+    }
+
     pub(super) fn complete_submission(&mut self) {
         self.awaiting_result = None;
+        self.backend_start_acknowledged = false;
     }
 
     pub(super) fn clear(&mut self) {
         self.segments.clear();
         self.bytes = 0;
         self.awaiting_result = None;
+        self.backend_start_acknowledged = false;
     }
 }
 
@@ -120,6 +142,37 @@ fn delegated_input(text: &str) -> String {
 }
 
 impl ChatWidget {
+    #[cfg(target_os = "macos")]
+    pub(super) fn signal_confirmed_spoken_turn_start(&mut self, input: &str) {
+        if !verbatim_speech::enabled()
+            || !self
+                .realtime_conversation
+                .voice_turn
+                .acknowledge_backend_start(input)
+        {
+            return;
+        }
+        // Play a short local cue only after the backend echoes our exact spoken
+        // request as a started user item. Never make a network/model call for feedback.
+        let child = tokio::process::Command::new("/usr/bin/afplay")
+            .arg("/System/Library/Sounds/Tink.aiff")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn();
+        match child {
+            Ok(mut child) => {
+                tokio::spawn(async move {
+                    if let Err(error) = child.wait().await {
+                        tracing::warn!("voice start cue failed: {error}");
+                    }
+                });
+            }
+            Err(error) => tracing::warn!("could not start voice confirmation cue: {error}"),
+        }
+    }
+
     pub(crate) fn complete_voice_submission(&mut self) {
         self.realtime_conversation.voice_turn.complete_submission();
     }
@@ -216,6 +269,30 @@ impl ChatWidget {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_matching_backend_start_acknowledges_a_spoken_turn_once() {
+        let mut input = VoiceTurnBuffer::default();
+        assert_eq!(
+            input.accept("Pydantic < dataclass & Git"),
+            VoiceTurnAction::Pending
+        );
+        assert_eq!(
+            input.accept("Go"),
+            VoiceTurnAction::Submit("Pydantic < dataclass & Git".into())
+        );
+        assert!(!input.acknowledge_backend_start("some unrelated typed input"));
+        assert!(input.acknowledge_backend_start("Pydantic &lt; dataclass &amp; Git"));
+        assert!(!input.acknowledge_backend_start("Pydantic &lt; dataclass &amp; Git"));
+        assert!(input.restore_failed_submission());
+        assert_eq!(
+            input.accept("Go"),
+            VoiceTurnAction::Submit("Pydantic < dataclass & Git".into())
+        );
+        assert!(input.acknowledge_backend_start("Pydantic &lt; dataclass &amp; Git"));
+        input.complete_submission();
+        assert!(!input.acknowledge_backend_start("Pydantic &lt; dataclass &amp; Git"));
+    }
 
     #[test]
     fn spoken_go_submits_all_prior_segments_once() {

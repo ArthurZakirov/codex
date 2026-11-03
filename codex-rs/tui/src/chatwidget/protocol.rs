@@ -701,6 +701,16 @@ impl ChatWidget {
             item @ ThreadItemPayload::CommandExecution { .. } => {
                 self.on_command_execution_completed(item)
             }
+            item @ ThreadItemPayload::AgentMessage { .. } if replay_kind.is_none() => {
+                // The completed final message is already ready for Markdown display.
+                // Start speech here instead of waiting for the whole agent turn to end.
+                self.handle_thread_item(
+                    item.clone(),
+                    notification.turn_id.clone(),
+                    ThreadItemRenderSource::Live,
+                );
+                self.speak_completed_realtime_delegation(&notification.turn_id, &item);
+            }
             item => self.handle_thread_item(
                 item,
                 notification.turn_id,

@@ -31,6 +31,29 @@ impl Runtime {
         }) {
             return Err(io::Error::other("private runtime environment is required"));
         }
+        // Cargo-built development helpers link Homebrew's GStreamer, while
+        // release helpers link the private runtime. Loading both in one process
+        // creates distinct registries and breaks initial speaker controls.
+        #[cfg(all(debug_assertions, target_os = "macos"))]
+        if crate::BUILD_COMMIT == "dev" {
+            gstreamer::init().map_err(|_| runtime_error())?;
+            let plugins = std::path::Path::new("/opt/homebrew/opt/gstreamer/lib/gstreamer-1.0");
+            for name in [
+                "app",
+                "audioconvert",
+                "audioresample",
+                "coreelements",
+                "opus",
+                "rtp",
+                "rtpmanager",
+            ] {
+                gstreamer::Plugin::load_file(plugins.join(format!("libgst{name}.dylib")))
+                    .map_err(|_| runtime_error())?;
+            }
+            return Ok(Self {
+                _libraries: Vec::new(),
+            });
+        }
         let executable = std::env::current_exe()?.canonicalize()?;
         let bin = executable.parent().ok_or_else(runtime_error)?;
         let root = bin.parent().ok_or_else(runtime_error)?;

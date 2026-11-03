@@ -668,6 +668,8 @@ impl ChatWidget {
         if let Some(input) = realtime_delegation_input(items)
             && !matches_local_typed_input
         {
+            #[cfg(target_os = "macos")]
+            self.signal_confirmed_spoken_turn_start(input);
             let transcript_tail_flush = items.iter().any(|item| {
                 matches!(item, UserInput::Text { text, .. }
                     if text.contains("<source>transcript_tail_flush</source>"))

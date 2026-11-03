@@ -50,6 +50,25 @@ fn main() {
     let mut args = std::env::args_os().skip(/*n*/ 1);
     match (args.next(), args.next()) {
         (Some(arg), None) if arg == "--build-commit" => println!("{BUILD_COMMIT}"),
+        #[cfg(debug_assertions)]
+        (Some(arg), None) if arg == "--probe-audio-controls" => {
+            let outcome = (|| -> io::Result<()> {
+                let _runtime = runtime::Runtime::initialize()?;
+                let mut devices = devices::Devices::open(Default::default())?;
+                devices.set_controls(codex_realtime_webrtc::AudioControls {
+                    microphone_muted: false,
+                    speaker_suppressed: false,
+                })?;
+                Ok(())
+            })();
+            match outcome {
+                Ok(()) => println!("audio controls OK"),
+                Err(error) => {
+                    eprintln!("audio controls probe failed: {error}");
+                    std::process::exit(1);
+                }
+            }
+        }
         (None, None) => {
             let phase = Cell::new(HelperExitStage::ControlSequence);
             if run(&phase, |executor| {
