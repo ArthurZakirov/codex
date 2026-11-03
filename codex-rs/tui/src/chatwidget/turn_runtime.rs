@@ -143,6 +143,10 @@ impl ChatWidget {
         completion: Option<history_cell::FinalMessageSeparator>,
         from_replay: bool,
     ) {
+        #[cfg(target_os = "macos")]
+        if !from_replay {
+            self.complete_voice_submission();
+        }
         if self.status_state.reasoning_resume_turn_id.is_some() {
             self.on_agent_reasoning_final();
         }
@@ -405,6 +409,8 @@ impl ChatWidget {
     }
 
     fn on_error(&mut self, message: String) {
+        #[cfg(target_os = "macos")]
+        self.restore_unanswered_voice_turn();
         self.input_queue.submit_pending_steers_after_interrupt = false;
         self.finalize_turn();
         self.add_to_history(history_cell::new_error_event(message));
