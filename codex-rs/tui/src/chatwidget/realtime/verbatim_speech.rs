@@ -6,10 +6,44 @@ use pulldown_cmark::Event;
 use pulldown_cmark::Parser;
 use pulldown_cmark::Tag;
 use pulldown_cmark::TagEnd;
+use std::process::ExitStatus;
 use std::process::Stdio;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use tokio::io::AsyncWriteExt;
 
 const MAX_NARRATED_ITEM_IDS: usize = 256;
+
+/// A handle for the currently speaking synthesizer. A queued message does not
+/// make Space a playback shortcut until a real speech process has started.
+pub(super) struct SpeechPlaybackControl {
+    paused: tokio::sync::watch::Sender<bool>,
+    active: Arc<AtomicBool>,
+}
+
+impl SpeechPlaybackControl {
+    fn is_active(&self) -> bool {
+        self.active.load(Ordering::Acquire)
+    }
+
+    fn toggle_pause(&self) -> Option<bool> {
+        if !self.is_active() {
+            return None;
+        }
+        let next = !*self.paused.borrow();
+        self.paused.send_replace(next);
+        Some(next)
+    }
+}
+
+struct ActiveSpeechGuard(Arc<AtomicBool>);
+
+impl Drop for ActiveSpeechGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
 
 pub(crate) fn enabled() -> bool {
     std::env::var("CODEX_REALTIME_VERBATIM_SPEECH").is_ok_and(|value| value == "1")
@@ -58,8 +92,56 @@ fn markdown_to_spoken_text(markdown: &str) -> String {
 
 /// One speech synthesizer at a time: subsequent commentary and final answers
 /// must not stop a message that is already being spoken.
-async fn speak_spoken_text(spoken: String) -> std::io::Result<()> {
-    // Send speech only over stdin, never process arguments or application logs.
+/// Only the worker holding this Child can signal its PID. This avoids the TUI
+/// signaling a stale PID after the synthesizer exits and the PID is reused.
+async fn wait_for_speech_process(
+    mut child: tokio::process::Child,
+    mut pause_rx: tokio::sync::watch::Receiver<bool>,
+    active: Arc<AtomicBool>,
+) -> std::io::Result<ExitStatus> {
+    let pid = child
+        .id()
+        .and_then(|id| libc::pid_t::try_from(id).ok())
+        .ok_or_else(|| std::io::Error::other("macOS speech synthesizer has no process ID"))?;
+    active.store(true, Ordering::Release);
+    let _active_guard = ActiveSpeechGuard(active);
+    let mut suspended = false;
+    loop {
+        tokio::select! {
+            status = child.wait() => return status,
+            updated = pause_rx.changed() => {
+                if updated.is_err() {
+                    return child.wait().await;
+                }
+                let requested = *pause_rx.borrow_and_update();
+                if requested == suspended {
+                    continue;
+                }
+                if let Some(status) = child.try_wait()? {
+                    return Ok(status);
+                }
+                // SAFETY: pid belongs to the Child held by this task; check
+                // termination before signaling and never expose it to the UI.
+                let signal = if requested { libc::SIGSTOP } else { libc::SIGCONT };
+                if unsafe { libc::kill(pid, signal) } != 0 {
+                    let error = std::io::Error::last_os_error();
+                    if error.raw_os_error() == Some(libc::ESRCH) {
+                        return child.wait().await;
+                    }
+                    return Err(error);
+                }
+                suspended = requested;
+            }
+        }
+    }
+}
+
+async fn speak_spoken_text(
+    spoken: String,
+    pause_rx: tokio::sync::watch::Receiver<bool>,
+    active: Arc<AtomicBool>,
+) -> std::io::Result<()> {
+    // Deliver audio from stdin, never command arguments or application logs.
     let mut child = tokio::process::Command::new("/usr/bin/say")
         .arg("-f")
         .arg("-")
@@ -72,9 +154,11 @@ async fn speak_spoken_text(spoken: String) -> std::io::Result<()> {
         .stdin
         .take()
         .ok_or_else(|| std::io::Error::other("macOS speech synthesizer has no input stream"))?;
-    input.write_all(spoken.as_bytes()).await?;
-    drop(input);
-    let status = child.wait().await?;
+    // Writing concurrently allows pause/resume even for long spoken messages
+    // whose content would otherwise fill the synthesizer's stdin pipe.
+    let writer = tokio::spawn(async move { input.write_all(spoken.as_bytes()).await });
+    let status = wait_for_speech_process(child, pause_rx, active).await?;
+    writer.await.map_err(std::io::Error::other)??;
     if !status.success() {
         return Err(std::io::Error::other(format!(
             "macOS speech synthesizer exited with {status}"
@@ -104,8 +188,24 @@ impl ChatWidget {
         enabled()
     }
 
+    pub(crate) fn realtime_verbatim_speech_active(&self) -> bool {
+        self.realtime_conversation
+            .verbatim_speech_control
+            .as_ref()
+            .is_some_and(SpeechPlaybackControl::is_active)
+    }
+
+    /// Return None rather than intercept Space when no synthesizer is speaking.
+    pub(crate) fn toggle_verbatim_speech_pause(&mut self) -> Option<bool> {
+        self.realtime_conversation
+            .verbatim_speech_control
+            .as_ref()
+            .and_then(SpeechPlaybackControl::toggle_pause)
+    }
+
     pub(crate) fn cancel_verbatim_speech(&mut self) {
         self.realtime_conversation.verbatim_speech_sender.take();
+        self.realtime_conversation.verbatim_speech_control.take();
         if let Some(task) = self.realtime_conversation.verbatim_speech_task.take() {
             task.abort();
         }
@@ -164,10 +264,21 @@ impl ChatWidget {
         sender
             .send(spoken)
             .map_err(|_| std::io::Error::other("Unable to queue macOS speech"))?;
+        let (pause_sender, pause_receiver) = tokio::sync::watch::channel(false);
+        let active = Arc::new(AtomicBool::new(false));
         self.realtime_conversation.verbatim_speech_sender = Some(sender);
+        self.realtime_conversation.verbatim_speech_control = Some(SpeechPlaybackControl {
+            paused: pause_sender.clone(),
+            active: Arc::clone(&active),
+        });
         self.realtime_conversation.verbatim_speech_task = Some(tokio::spawn(drain_speech_queue(
             receiver,
-            speak_spoken_text,
+            move |spoken| {
+                // Each new spoken item starts unpaused. All queued items retain
+                // their original FIFO order during an earlier item's pause.
+                pause_sender.send_replace(false);
+                speak_spoken_text(spoken, pause_receiver.clone(), Arc::clone(&active))
+            },
         )));
         Ok(())
     }
@@ -187,6 +298,11 @@ mod tests {
     use super::drain_speech_queue;
     use super::markdown_to_spoken_text;
     use super::should_narrate_visible_agent_message;
+    use super::wait_for_speech_process;
+    use super::SpeechPlaybackControl;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
 
     #[test]
     fn code_and_explanation_are_spoken_once_and_in_order() {
@@ -265,6 +381,83 @@ mod tests {
             *spoken.lock().unwrap(),
             ["Commentary", "Typed reply", "Final answer"]
         );
+    }
+
+    #[test]
+    fn space_toggles_only_when_a_speech_process_is_active() {
+        let (paused, _receiver) = tokio::sync::watch::channel(false);
+        let active = Arc::new(AtomicBool::new(false));
+        let control = SpeechPlaybackControl {
+            paused,
+            active: Arc::clone(&active),
+        };
+        assert_eq!(control.toggle_pause(), None);
+        active.store(true, Ordering::Release);
+        assert_eq!(control.toggle_pause(), Some(true));
+        assert_eq!(control.toggle_pause(), Some(false));
+        active.store(false, Ordering::Release);
+        assert_eq!(control.toggle_pause(), None);
+    }
+
+    #[tokio::test]
+    async fn pause_and_resume_suspend_one_running_child_without_dropping_its_queue() {
+        let mut child = tokio::process::Command::new("/bin/sleep")
+            .arg("30")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("start a harmless stand-in for speech");
+        let pid = child.id().expect("process PID");
+        // Ownership transfers to the worker that is allowed to signal it.
+        let (paused, receiver) = tokio::sync::watch::channel(false);
+        let active = Arc::new(AtomicBool::new(false));
+        let control = SpeechPlaybackControl {
+            paused,
+            active: Arc::clone(&active),
+        };
+        let worker = tokio::spawn(wait_for_speech_process(
+            child,
+            receiver,
+            Arc::clone(&active),
+        ));
+        for _ in 0..50 {
+            if control.is_active() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(control.is_active());
+        assert_eq!(control.toggle_pause(), Some(true));
+
+        let state = || {
+            let output = std::process::Command::new("/bin/ps")
+                .args(["-o", "state=", "-p", &pid.to_string()])
+                .output()
+                .expect("inspect child state");
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        let mut stopped = false;
+        for _ in 0..50 {
+            if state().starts_with('T') {
+                stopped = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(stopped, "speech process did not enter the stopped state");
+        assert_eq!(control.toggle_pause(), Some(false));
+        let mut resumed = false;
+        for _ in 0..50 {
+            let status = state();
+            if !status.is_empty() && !status.starts_with('T') {
+                resumed = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(resumed, "speech process did not resume");
+        worker.abort();
+        let _ = worker.await;
+        assert!(!control.is_active());
     }
 
     #[test]
