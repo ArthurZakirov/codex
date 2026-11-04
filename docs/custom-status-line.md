@@ -21,6 +21,12 @@ command = "codex-agents-status"
 **Do not put `tui.status_line_commands` in a config shared with unmodified
 Codex**: older binaries do not recognize this fork-only key.
 
+Only user, system, managed, or explicit runtime configuration may define executable
+status providers. Project-local `.codex/config.toml` files cannot define
+`tui.status_line_commands` or enable the `custom-commands` item. These
+settings are removed before project configuration is merged, because status
+commands execute on the host outside the agent sandbox.
+
 Alternatively, a launcher can provide commands without changing the shared
 configuration:
 

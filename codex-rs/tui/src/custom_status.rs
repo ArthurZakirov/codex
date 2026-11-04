@@ -57,11 +57,9 @@ pub(crate) async fn run_commands(
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use std::str::FromStr;
-
     #[tokio::test]
     async fn command_receives_thread_id_and_outputs_visible_status() {
-        let thread_id = ThreadId::from_str("01234567-89ab-cdef-0123-456789abcdef").unwrap();
+        let thread_id = ThreadId::from_string("01234567-89ab-cdef-0123-456789abcdef").unwrap();
         let commands = vec![TuiStatusLineCommand {
             label: "AGENTS".into(),
             command: "/bin/sh".into(),
@@ -78,7 +76,7 @@ mod tests {
 
     #[tokio::test]
     async fn missing_provider_shows_unknown_instead_of_false_green() {
-        let thread_id = ThreadId::from_str("01234567-89ab-cdef-0123-456789abcdef").unwrap();
+        let thread_id = ThreadId::from_string("01234567-89ab-cdef-0123-456789abcdef").unwrap();
         let commands = vec![TuiStatusLineCommand {
             label: "AGENTS".into(),
             command: "/definitely/not/a/command".into(),
