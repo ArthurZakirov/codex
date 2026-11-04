@@ -1016,7 +1016,7 @@ impl App {
             && key.code == KeyCode::Char(' ')
             && key.modifiers == KeyModifiers::NONE
             && self.overlay.is_none()
-            && tui.is_owned_screen()
+            // Voice playback is independent of alternate-screen rendering.
             && !self.transcript_view.owns_interaction_key(*key)
             && !self.backtrack.primed
             && !self.backtrack.overlay_preview_active
