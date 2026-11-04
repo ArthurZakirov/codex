@@ -1010,13 +1010,13 @@ impl App {
         // Space pauses/resumes only the currently playing macOS narration.
         // Do not displace normal typing, transcript selection, dialogs or key
         // repeats, and leave the microphone/agent work running independently.
+        // Playback controls work in normal terminals and --no-alt-screen mode.
         #[cfg(target_os = "macos")]
         if let TuiEvent::Key(key) = &event
             && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
             && key.code == KeyCode::Char(' ')
             && key.modifiers == KeyModifiers::NONE
             && self.overlay.is_none()
-            // Voice playback is independent of alternate-screen rendering.
             && !self.transcript_view.owns_interaction_key(*key)
             && !self.backtrack.primed
             && !self.backtrack.overlay_preview_active
