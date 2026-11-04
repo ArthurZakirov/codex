@@ -1007,6 +1007,36 @@ impl App {
         };
 
         self.cancel_primed_browsing_for_event(&event);
+        // Space pauses/resumes only the currently playing macOS narration.
+        // Do not displace normal typing, transcript selection, dialogs or key
+        // repeats, and leave the microphone/agent work running independently.
+        #[cfg(target_os = "macos")]
+        if let TuiEvent::Key(key) = &event
+            && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+            && key.code == KeyCode::Char(' ')
+            && key.modifiers == KeyModifiers::NONE
+            && self.overlay.is_none()
+            && tui.is_owned_screen()
+            && !self.transcript_view.owns_interaction_key(*key)
+            && !self.backtrack.primed
+            && !self.backtrack.overlay_preview_active
+            && self.chat_widget.no_modal_or_popup_active()
+            && self.chat_widget.composer_is_empty()
+        {
+            if key.kind == KeyEventKind::Repeat {
+                if self.chat_widget.realtime_verbatim_speech_active() {
+                    return Ok(AppRunControl::Continue);
+                }
+            } else if let Some(paused) = self.chat_widget.toggle_verbatim_speech_pause() {
+                let status = if paused {
+                    "Speech paused. Press Space to resume."
+                } else {
+                    "Speech resumed. Press Space to pause."
+                };
+                self.chat_widget.add_info_message(status.to_string(), None);
+                return Ok(AppRunControl::Continue);
+            }
+        }
         let voice_toggle = |app: &Self, key: KeyEvent| {
             key.kind == KeyEventKind::Press
                 && app
