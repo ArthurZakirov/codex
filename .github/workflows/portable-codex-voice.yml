@@ -124,7 +124,6 @@ jobs:
           # These are unsigned personal preview builds, not Apple-notarized releases.
           codesign --force --sign - --timestamp=none \
             "$RUNNER_TEMP/voice-input/codex-voice-host"
-          [[ "$("$RUNNER_TEMP/voice-input/codex-voice-host" --build-commit)" == "$GITHUB_SHA" ]]
       - name: Assemble and verify relocatable voice package
         shell: bash
         env:
@@ -151,6 +150,9 @@ jobs:
           assert manifest["appTarget"] == target
           assert (voice / "bin/codex-voice-host").is_file()
           PY
+          # The helper needs its sibling ../lib runtime to resolve libffi at startup.
+          # Verify the installed layout, not the unpackaged Bazel executable.
+          [[ "$("$RUNNER_TEMP/voice-package/codex-resources/voice/bin/codex-voice-host" --build-commit)" == "$GITHUB_SHA" ]]
           "$RUNNER_TEMP/voice-package/bin/codex" --version
           mkdir -p dist
           tar -C "$RUNNER_TEMP/voice-package" -czf "dist/codex-voice-${TARGET}.tar.gz" .
