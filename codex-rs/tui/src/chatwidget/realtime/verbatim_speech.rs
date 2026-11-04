@@ -400,7 +400,7 @@ mod tests {
 
     #[tokio::test]
     async fn pause_and_resume_suspend_one_running_child_without_dropping_its_queue() {
-        let mut child = tokio::process::Command::new("/bin/sleep")
+        let child = tokio::process::Command::new("/bin/sleep")
             .arg("30")
             .kill_on_drop(true)
             .spawn()
@@ -481,6 +481,5 @@ mod tests {
             false,
             " \n "
         ));
-
     }
 }
