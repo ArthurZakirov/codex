@@ -1007,6 +1007,39 @@ impl App {
         };
 
         self.cancel_primed_browsing_for_event(&event);
+        // Space controls locally narrated backend speech only when it would not
+        // displace typing, a modal interaction, or transcript navigation.
+        #[cfg(target_os = "macos")]
+        if let TuiEvent::Key(key) = &event
+            && key.kind == KeyEventKind::Press
+            && key.code == KeyCode::Char(' ')
+            && key.modifiers == KeyModifiers::NONE
+            && self.overlay.is_none()
+            && tui.is_owned_screen()
+            && !transcript_owns_input
+            && !self.backtrack.primed
+            && !self.backtrack.overlay_preview_active
+            && self.chat_widget.no_modal_or_popup_active()
+            && self.chat_widget.composer_is_empty()
+        {
+            match self.chat_widget.toggle_verbatim_speech_pause() {
+                Ok(Some(paused)) => {
+                    let message = if paused {
+                        "Speech paused. Press Space to resume."
+                    } else {
+                        "Speech resumed. Press Space to pause."
+                    };
+                    self.chat_widget.add_info_message(message.to_string(), None);
+                    return Ok(AppRunControl::Continue);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    self.chat_widget
+                        .add_error_message(format!("Unable to control spoken output: {error}"));
+                    return Ok(AppRunControl::Continue);
+                }
+            }
+        }
         let voice_toggle = |app: &Self, key: KeyEvent| {
             key.kind == KeyEventKind::Press
                 && app

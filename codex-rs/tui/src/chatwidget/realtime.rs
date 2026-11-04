@@ -187,7 +187,7 @@ pub(super) struct RealtimeConversationUiState {
     pub(super) agent_items: HashMap<(String, String), RealtimeAgentItemOrigin>,
     pending_speech: VecDeque<PendingRealtimeSpeech>,
     #[cfg(target_os = "macos")]
-    verbatim_speech_task: Option<tokio::task::JoinHandle<()>>,
+    verbatim_speech: Option<verbatim_speech::VerbatimSpeechPlayback>,
     #[cfg(target_os = "macos")]
     voice_turn: voice_turn::VoiceTurnBuffer,
 }
