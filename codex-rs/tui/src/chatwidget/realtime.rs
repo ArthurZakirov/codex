@@ -189,6 +189,10 @@ pub(super) struct RealtimeConversationUiState {
     #[cfg(target_os = "macos")]
     verbatim_speech_task: Option<tokio::task::JoinHandle<()>>,
     #[cfg(target_os = "macos")]
+    verbatim_speech_sender: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+    #[cfg(target_os = "macos")]
+    narrated_agent_items: VecDeque<(String, String)>,
+    #[cfg(target_os = "macos")]
     voice_turn: voice_turn::VoiceTurnBuffer,
 }
 
@@ -615,8 +619,7 @@ impl ChatWidget {
             return;
         }
         self.realtime_conversation.latest_input_was_voice = false;
-        #[cfg(target_os = "macos")]
-        self.cancel_verbatim_speech();
+        // Typed questions do not interrupt the already queued local narration.
         self.realtime_conversation.input_generation = self
             .realtime_conversation
             .input_generation
@@ -965,6 +968,12 @@ impl ChatWidget {
         turn_id: &str,
         item: &ThreadItemPayload,
     ) {
+        // Local narration happens for each visible completed item, including
+        // commentary and typed answers. Do not schedule the final twice.
+        #[cfg(target_os = "macos")]
+        if verbatim_speech::enabled() {
+            return;
+        }
         let ThreadItemPayload::AgentMessage {
             id: item_id, text, ..
         } = item
@@ -1304,13 +1313,8 @@ impl ChatWidget {
 
     pub(super) fn on_realtime_transcript_delta(&mut self, role: String, delta: String) {
         #[cfg(target_os = "macos")]
-        if verbatim_speech::enabled() {
-            if role == "assistant" {
-                return;
-            }
-            if role == "user" && !delta.trim().is_empty() {
-                self.cancel_verbatim_speech();
-            }
+        if verbatim_speech::enabled() && role == "assistant" {
+            return;
         }
         if self.realtime_conversation.phase == RealtimeConversationPhase::Inactive
             && !self.realtime_conversation.recover_late_transcripts
@@ -1456,13 +1460,8 @@ impl ChatWidget {
 
     pub(super) fn on_realtime_transcript_done(&mut self, role: String, mut text: String) {
         #[cfg(target_os = "macos")]
-        if verbatim_speech::enabled() {
-            if role == "assistant" {
-                return;
-            }
-            if role == "user" && !text.trim().is_empty() {
-                self.cancel_verbatim_speech();
-            }
+        if verbatim_speech::enabled() && role == "assistant" {
+            return;
         }
         if matches!(
             self.realtime_conversation.phase,
