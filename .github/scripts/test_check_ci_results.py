@@ -62,6 +62,22 @@ class CheckCiResultsTests(unittest.TestCase):
         self.assertNotEqual(failure.returncode, 0)
         self.assertIn("rust-ci: skipped", failure.stdout)
 
+    def test_voice_release_pr_requires_both_fork_and_macos_validation(self) -> None:
+        required = "fork-smoke,fork-voice-check"
+        passed = {"fork-smoke": "success", "fork-voice-check": "success"}
+        self.assertEqual(self.check(passed, required=required).returncode, 0)
+
+        for result in ("failure", "skipped", "cancelled"):
+            with self.subTest(voice_check=result):
+                failed = {**passed, "fork-voice-check": result}
+                outcome = self.check(failed, required=required)
+                self.assertNotEqual(outcome.returncode, 0)
+                self.assertIn(f"fork-voice-check: {result}", outcome.stdout)
+
+        missing = self.check({"fork-smoke": "success"}, required=required)
+        self.assertNotEqual(missing.returncode, 0)
+        self.assertIn("fork-voice-check: missing", missing.stdout)
+
     def test_unconfigured_postmerge_policy_still_requires_all_jobs(self) -> None:
         result = self.check({"fork-smoke": "skipped", "codespell": "success"})
         self.assertNotEqual(result.returncode, 0)
