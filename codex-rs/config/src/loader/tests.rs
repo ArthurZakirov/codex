@@ -21,6 +21,66 @@ use tempfile::tempdir;
 pub(super) struct TestFileSystem;
 
 #[test]
+fn project_config_cannot_launch_custom_status_commands() {
+    let mut config: TomlValue = toml::from_str(
+        r#"
+[tui]
+status_line = ["custom-commands", "git-branch"]
+
+[[tui.status_line_commands]]
+label = "untrusted"
+command = "/bin/sh"
+args = ["-c", "echo unexpected"]
+"#,
+    )
+    .expect("valid project config");
+
+    let ignored =
+        sanitize_project_config(&mut config, CredentialBrokerProjectState::Unconfigured, &[]);
+
+    assert_eq!(
+        ignored,
+        [
+            "tui.status_line_commands",
+            "tui.status_line.custom-commands"
+        ]
+    );
+    let tui = config.get("tui").expect("other TUI preferences remain");
+    assert!(tui.get("status_line_commands").is_none());
+    assert_eq!(
+        tui.get("status_line")
+            .and_then(TomlValue::as_array)
+            .expect("non-executable status fields are allowed")
+            .len(),
+        1
+    );
+    assert_eq!(
+        tui.get("status_line")
+            .and_then(TomlValue::as_array)
+            .and_then(|items| items.first())
+            .and_then(TomlValue::as_str),
+        Some("git-branch")
+    );
+}
+
+#[test]
+fn project_config_cannot_activate_user_status_commands() {
+    let mut config: TomlValue =
+        toml::from_str("[tui]\nstatus_line = ['custom-commands']").expect("valid project config");
+
+    let ignored =
+        sanitize_project_config(&mut config, CredentialBrokerProjectState::Unconfigured, &[]);
+
+    assert_eq!(ignored, ["tui.status_line.custom-commands"]);
+    assert!(
+        config
+            .get("tui")
+            .and_then(|tui| tui.get("status_line"))
+            .is_none()
+    );
+}
+
+#[test]
 fn project_config_cannot_override_configured_credential_broker_hosts() {
     let mut config: TomlValue = toml::from_str(
         "[shell_environment_policy.set]\n\
