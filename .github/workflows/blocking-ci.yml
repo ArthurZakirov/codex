@@ -67,7 +67,7 @@ jobs:
   fork-voice-check:
     name: Fork voice macOS validation
     if: ${{ github.repository == 'ArthurZakirov/codex' && github.event_name == 'pull_request' && github.base_ref == 'feat/portable-codex-voice-release' }}
-    runs-on: macos-26
+    runs-on: macos-15-intel
     timeout-minutes: 120
     permissions:
       contents: read
