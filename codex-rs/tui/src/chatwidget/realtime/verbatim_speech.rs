@@ -114,7 +114,7 @@ impl ChatWidget {
     /// Include every completed assistant message that is shown in the live TUI:
     /// typed replies, progress/commentary, and voice-delegated final answers.
     /// Do not read out transcript snapshots or items already narrated.
-    pub(super) fn narrate_visible_agent_message(
+    pub(crate) fn narrate_visible_agent_message(
         &mut self,
         turn_id: &str,
         item_id: &str,
