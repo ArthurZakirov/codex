@@ -11,7 +11,7 @@ This repository is an upstream Codex fork. Its **portable macOS Codex Voice** di
 
 ## Voice behavior to preserve
 
-- With the local verbatim option active and an active Voice session, speak **every completed, visible assistant message**: commentary/progress and final answers, whether the user spoke or typed. Do not speak private reasoning, tool logs, or replayed historical messages.
+- When launched with dedicated `codex-voice` and local verbatim speech enabled, speak **every completed, visible assistant message**: commentary/progress and final answers, whether the user spoke or typed, **even before a microphone call is started**. The regular `codex` launcher remains silent unless explicitly opted in. Do not speak private reasoning, tool logs, or replayed historical messages.
 - Local speech uses one ordered queue. New typed input or microphone transcription must not discard a previously queued message.
 - On macOS, **Space pauses/resumes the currently speaking local synthesizer**, without losing its position, canceling the Voice session, or dropping queued messages. Preserve normal Space input when the composer contains text, no local speech is active, or a dialog/transcript interaction owns the key. Ignore key-repeat toggles.
 - The separate `codex-voice` launcher should enable `CODEX_REALTIME_VERBATIM_SPEECH=1` by default; avoid modifying the stock `codex` command.
