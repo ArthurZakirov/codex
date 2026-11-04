@@ -1412,6 +1412,7 @@ fn config_toml_deserializes_model_availability_nux() {
             right_click_paste: Default::default(),
             alternate_screen: AltScreenMode::default(),
             status_line: None,
+            status_line_commands: Vec::new(),
             status_line_use_colors: true,
             terminal_title: None,
             theme: None,
@@ -1447,6 +1448,33 @@ status_line_use_colors = false
             .expect("tui config should deserialize")
             .status_line_use_colors
     );
+}
+
+#[test]
+fn config_toml_accepts_custom_status_provider_commands() {
+    let toml = r#"
+[tui]
+status_line = ["model-with-reasoning", "custom-commands"]
+
+[[tui.status_line_commands]]
+label = "AGENTS"
+command = "codex-agents-status"
+args = ["--check"]
+"#;
+    let cfg: ConfigToml = toml::from_str(toml).expect("valid status provider configuration");
+    let tui = cfg.tui.expect("TUI section exists");
+
+    assert_eq!(
+        tui.status_line,
+        Some(vec![
+            "model-with-reasoning".into(),
+            "custom-commands".into()
+        ])
+    );
+    assert_eq!(tui.status_line_commands.len(), 1);
+    assert_eq!(tui.status_line_commands[0].label, "AGENTS");
+    assert_eq!(tui.status_line_commands[0].command, "codex-agents-status");
+    assert_eq!(tui.status_line_commands[0].args, vec!["--check"]);
 }
 
 #[test]
@@ -4773,6 +4801,7 @@ fn tui_config_missing_notifications_field_defaults_to_enabled() {
             right_click_paste: Default::default(),
             alternate_screen: AltScreenMode::Auto,
             status_line: None,
+            status_line_commands: Vec::new(),
             status_line_use_colors: true,
             terminal_title: None,
             theme: None,

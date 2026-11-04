@@ -3460,6 +3460,14 @@ impl App {
                 self.chat_widget.set_status_line_git_summary(cwd, summary);
                 self.refresh_status_line();
             }
+            AppEvent::RefreshStatusLineCommands => {
+                self.refresh_status_line();
+            }
+            AppEvent::StatusLineCommandsUpdated { thread_id, request_id, values } => {
+                if self.chat_widget.set_status_line_commands(thread_id, request_id, values) {
+                    tui.frame_requester().schedule_frame();
+                }
+            }
             AppEvent::StatusLineWorkspaceHeadlineUpdated { request_id, result } => {
                 if self
                     .chat_widget

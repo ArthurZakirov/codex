@@ -74,6 +74,11 @@ impl StatusSurfaceSelections {
                 .contains(&StatusLineItem::BranchChanges)
     }
 
+    fn uses_custom_commands(&self) -> bool {
+        self.status_line_items
+            .contains(&StatusLineItem::CustomCommands)
+    }
+
     fn uses_workspace_headline(&self) -> bool {
         self.status_line_items
             .contains(&StatusLineItem::WorkspaceHeadline)
@@ -106,8 +111,36 @@ pub(super) struct CachedProjectRootName {
 }
 
 impl ChatWidget {
+    fn env_status_line_commands(&self) -> Vec<codex_config::types::TuiStatusLineCommand> {
+        let Ok(raw) = std::env::var("CODEX_STATUS_LINE_COMMANDS") else {
+            return Vec::new();
+        };
+        match serde_json::from_str(&raw) {
+            Ok(commands) => commands,
+            Err(error) => {
+                tracing::warn!(%error, "invalid CODEX_STATUS_LINE_COMMANDS JSON");
+                Vec::new()
+            }
+        }
+    }
+
+    fn configured_custom_status_commands(&self) -> Vec<codex_config::types::TuiStatusLineCommand> {
+        let mut commands = self.local_settings.tui.status_line_commands.clone();
+        commands.extend(self.env_status_line_commands());
+        commands
+    }
+
     fn status_surface_selections(&self) -> StatusSurfaceSelections {
-        let (status_line_items, invalid_status_line_items) = self.status_line_items_with_invalids();
+        let (mut status_line_items, invalid_status_line_items) =
+            self.status_line_items_with_invalids();
+        // The custom fork's launcher may opt in without introducing config keys
+        // that older Codex installations would reject.
+        if self.local_settings.tui.status_line.is_none()
+            && !self.env_status_line_commands().is_empty()
+            && !status_line_items.contains(&StatusLineItem::CustomCommands)
+        {
+            status_line_items.push(StatusLineItem::CustomCommands);
+        }
         let (terminal_title_items, invalid_terminal_title_items) =
             self.terminal_title_items_with_invalids();
         StatusSurfaceSelections {
@@ -194,11 +227,80 @@ impl ChatWidget {
             self.request_status_line_workspace_headline_if_due(Instant::now());
         }
 
+        if selections.uses_custom_commands() && !self.configured_custom_status_commands().is_empty()
+        {
+            self.request_status_line_commands_if_due();
+        } else {
+            self.status_line_command_values.clear();
+            self.status_line_command_pending_request_id = None;
+            self.status_line_command_last_requested_at = None;
+        }
+
         if selections.uses_thread_usage() {
             self.ensure_thread_usage_requested();
         } else {
             self.cancel_thread_usage_polling();
         }
+    }
+
+    /// Request status providers only for the currently displayed conversation.
+    /// The pending request ID prevents duplicate launches from rapid UI refreshes.
+    fn request_status_line_commands_if_due(&mut self) {
+        if self.status_line_command_thread_id != self.thread_id {
+            self.status_line_command_thread_id = self.thread_id;
+            self.status_line_command_values.clear();
+            self.status_line_command_pending_request_id = None;
+            self.status_line_command_last_requested_at = None;
+        }
+        let Some(thread_id) = self.thread_id else {
+            return;
+        };
+        if self.status_line_command_pending_request_id.is_some()
+            || self
+                .status_line_command_last_requested_at
+                .is_some_and(|when| when.elapsed() < crate::custom_status::REFRESH_INTERVAL)
+        {
+            return;
+        }
+        let request_id = self.next_status_line_command_request_id;
+        self.next_status_line_command_request_id =
+            self.next_status_line_command_request_id.wrapping_add(1);
+        self.status_line_command_pending_request_id = Some(request_id);
+        self.status_line_command_last_requested_at = Some(Instant::now());
+        let commands = self.configured_custom_status_commands();
+        let cwd = self.status_line_cwd().to_path_buf();
+        let app_event_tx = self.app_event_tx.clone();
+        tokio::spawn(async move {
+            let values = crate::custom_status::run_commands(commands, thread_id, cwd).await;
+            app_event_tx.send(AppEvent::StatusLineCommandsUpdated {
+                thread_id,
+                request_id,
+                values,
+            });
+        });
+    }
+
+    /// Ignore responses from a previous conversation or a superseded request.
+    pub(crate) fn set_status_line_commands(
+        &mut self,
+        thread_id: ThreadId,
+        request_id: u64,
+        values: Vec<String>,
+    ) -> bool {
+        if self.thread_id != Some(thread_id)
+            || self.status_line_command_pending_request_id != Some(request_id)
+        {
+            return false;
+        }
+        self.status_line_command_pending_request_id = None;
+        self.status_line_command_values = values;
+        self.refresh_status_line();
+        let app_event_tx = self.app_event_tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(crate::custom_status::REFRESH_INTERVAL).await;
+            app_event_tx.send(AppEvent::RefreshStatusLineCommands);
+        });
+        true
     }
 
     fn refresh_status_line_from_selections(&mut self, selections: &StatusSurfaceSelections) {
@@ -855,6 +957,21 @@ impl ChatWidget {
                 .and_then(normalize_thread_name)
                 .or_else(|| self.thread_id.map(|id| id.to_string())),
             StatusLineItem::WorkspaceHeadline => self.status_line_workspace_headline.clone(),
+            StatusLineItem::CustomCommands => {
+                if !self.status_line_command_values.is_empty() {
+                    Some(self.status_line_command_values.join(" | "))
+                } else {
+                    let marker = if self.thread_id.is_some() { "…" } else { "?" };
+                    let commands = self.configured_custom_status_commands();
+                    (!commands.is_empty()).then(|| {
+                        commands
+                            .iter()
+                            .map(|spec| format!("{} {marker}", spec.label))
+                            .collect::<Vec<_>>()
+                            .join(" | ")
+                    })
+                }
+            }
             StatusLineItem::TaskProgress => self.terminal_title_task_progress(),
         }
     }
@@ -901,6 +1018,7 @@ impl ChatWidget {
             StatusSurfacePreviewItem::Daybreak => StatusLineItem::Daybreak,
             StatusSurfacePreviewItem::RawOutput => StatusLineItem::RawOutput,
             StatusSurfacePreviewItem::WorkspaceHeadline => StatusLineItem::WorkspaceHeadline,
+            StatusSurfacePreviewItem::CustomCommands => StatusLineItem::CustomCommands,
             StatusSurfacePreviewItem::Model => StatusLineItem::ModelName,
             StatusSurfacePreviewItem::ModelWithReasoning => StatusLineItem::ModelWithReasoning,
             StatusSurfacePreviewItem::Reasoning => StatusLineItem::Reasoning,
