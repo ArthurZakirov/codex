@@ -223,7 +223,6 @@ impl ChatWidget {
     ) {
         if !should_narrate_visible_agent_message(
             enabled(),
-            self.realtime_conversation.phase == RealtimeConversationPhase::Active,
             from_replay,
             markdown,
         ) || self
@@ -286,11 +285,12 @@ impl ChatWidget {
 
 fn should_narrate_visible_agent_message(
     native_speech_enabled: bool,
-    voice_active: bool,
     from_replay: bool,
     visible_text: &str,
 ) -> bool {
-    native_speech_enabled && voice_active && !from_replay && !visible_text.trim().is_empty()
+    // The dedicated codex-voice launcher enables local narration. Typed
+    // replies must be audible even before the microphone call is started.
+    native_speech_enabled && !from_replay && !visible_text.trim().is_empty()
 }
 
 #[cfg(test)]
@@ -332,7 +332,6 @@ mod tests {
             "Earlier completed answer after a newer input.",
         ] {
             assert!(should_narrate_visible_agent_message(
-                true,
                 true,
                 false,
                 visible_message
@@ -461,21 +460,27 @@ mod tests {
     }
 
     #[test]
-    fn suppress_replay_empty_and_inactive_voice_messages() {
-        assert!(!should_narrate_visible_agent_message(
-            false, true, false, "Answer"
-        ));
-        assert!(!should_narrate_visible_agent_message(
-            true, false, false, "Answer"
-        ));
-        assert!(!should_narrate_visible_agent_message(
+    fn dedicated_voice_launcher_reads_typed_answers_without_microphone_call() {
+        assert!(should_narrate_visible_agent_message(
             true,
+            false,
+            "Typed answer without an active call"
+        ));
+        assert!(!should_narrate_visible_agent_message(
+            false,
+            false,
+            "The normal Codex launcher must stay silent"
+        ));
+        assert!(!should_narrate_visible_agent_message(
             true,
             true,
             "Replayed answer"
         ));
         assert!(!should_narrate_visible_agent_message(
-            true, true, false, " \n "
+            true,
+            false,
+            " \n "
         ));
+
     }
 }
