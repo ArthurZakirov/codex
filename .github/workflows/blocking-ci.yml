@@ -12,36 +12,71 @@ jobs:
   # version-controlled list that the main-branch ruleset should require.
   bazel:
     name: Bazel
+    if: ${{ github.repository == 'openai/codex' }}
     uses: ./.github/workflows/bazel.yml
     secrets: inherit
 
   blob-size-policy:
     name: Blob size policy
+    if: ${{ github.repository == 'openai/codex' }}
     uses: ./.github/workflows/blob-size-policy.yml
     secrets: inherit
 
   cargo-deny:
     name: cargo-deny
+    if: ${{ github.repository == 'openai/codex' }}
     uses: ./.github/workflows/cargo-deny.yml
     secrets: inherit
 
   codespell:
     name: Codespell
+    if: ${{ github.repository == 'openai/codex' }}
     uses: ./.github/workflows/codespell.yml
     secrets: inherit
 
+  # Upstream CI needs private runner groups and BuildBuddy, unavailable in forks.
+  # Restrict fork validation to standard hosted Ubuntu and fast checks.
+  fork-smoke:
+    name: Fork smoke checks
+    if: ${{ github.repository != 'openai/codex' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Verify workspace and TUI boundaries
+        run: |
+          python3 .github/scripts/verify_cargo_workspace_manifests.py
+          python3 .github/scripts/verify_tui_core_boundary.py
+
+      - name: Test required-check aggregation
+        run: python3 -m unittest discover -s .github/scripts -p 'test_check_ci_results.py'
+
+      - name: Test standalone installer
+        run: python3 -m unittest discover -s scripts/install -p 'test_*.py'
+
+      - name: Check TUI Rust formatting
+        run: cargo fmt --manifest-path codex-rs/Cargo.toml --package codex-tui --check
+
   repo-checks:
     name: repo-checks
+    if: ${{ github.repository == 'openai/codex' }}
     uses: ./.github/workflows/repo-checks.yml
     secrets: inherit
 
   rust-ci:
     name: rust-ci
+    if: ${{ github.repository == 'openai/codex' }}
     uses: ./.github/workflows/rust-ci.yml
     secrets: inherit
 
   sdk:
     name: sdk
+    if: ${{ github.repository == 'openai/codex' }}
     uses: ./.github/workflows/sdk.yml
     secrets: inherit
 
@@ -56,6 +91,7 @@ jobs:
       - blob-size-policy
       - cargo-deny
       - codespell
+      - fork-smoke
       - repo-checks
       - rust-ci
       - sdk
@@ -70,4 +106,7 @@ jobs:
       - name: Require successful dependencies
         env:
           NEEDS: ${{ toJSON(needs) }}
+          # Select the required jobs for this repository. Deliberately skipped
+          # upstream CI must not fail the fork gate, or vice versa.
+          REQUIRED_CI_DEPENDENCIES: ${{ github.repository == 'openai/codex' && 'blob-size-policy,cargo-deny,codespell,repo-checks,rust-ci,sdk' || 'fork-smoke' }}
         run: python3 .github/scripts/check_ci_results.py
