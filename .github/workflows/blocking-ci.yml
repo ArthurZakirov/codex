@@ -133,5 +133,5 @@ jobs:
           NEEDS: ${{ toJSON(needs) }}
           # Select the required jobs for this repository. Deliberately skipped
           # upstream CI must not fail the fork gate, or vice versa.
-          REQUIRED_CI_DEPENDENCIES: ${{ github.repository == 'openai/codex' && 'blob-size-policy,cargo-deny,codespell,repo-checks,rust-ci,sdk' || (github.event_name == 'pull_request' && github.base_ref == 'feat/portable-codex-voice-release' && 'fork-smoke,fork-voice-check' || 'fork-smoke') }}
+          REQUIRED_CI_DEPENDENCIES: ${{ github.repository == 'openai/codex' && 'blob-size-policy,cargo-deny,codespell,repo-checks,rust-ci,sdk' || (github.repository == 'ArthurZakirov/codex' && github.event_name == 'pull_request' && github.base_ref == 'feat/portable-codex-voice-release' && 'fork-smoke,fork-voice-check' || 'fork-smoke') }}
         run: python3 .github/scripts/check_ci_results.py
