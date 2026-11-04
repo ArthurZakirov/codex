@@ -15,10 +15,20 @@ def main() -> None:
     # Keep result policy in one script so blocking-ci and postmerge-ci cannot
     # drift in how they interpret dependency conclusions.
     needs = json.loads(os.environ["NEEDS"])
+    # Postmerge-ci continues to require all dependencies by default. The PR
+    # workflow selects the applicable upstream or fork checks explicitly.
+    selected = os.environ.get("REQUIRED_CI_DEPENDENCIES")
+    if selected is None:
+        required = list(needs)
+    else:
+        required = [name.strip() for name in selected.split(",")]
+        if not all(required) or len(required) != len(set(required)):
+            raise SystemExit("Invalid REQUIRED_CI_DEPENDENCIES configuration")
+
     failures = sorted(
-        (name, dependency["result"])
-        for name, dependency in needs.items()
-        if dependency["result"] != "success"
+        (name, needs[name]["result"] if name in needs else "missing")
+        for name in required
+        if name not in needs or needs[name]["result"] != "success"
     )
 
     if failures:
