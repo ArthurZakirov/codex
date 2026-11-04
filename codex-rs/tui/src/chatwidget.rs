@@ -782,6 +782,12 @@ pub(crate) struct ChatWidget {
     status_line_git_summary_pending: bool,
     // True once we've attempted a Git summary lookup for the current CWD.
     status_line_git_summary_lookup_complete: bool,
+    // Most recent command-backed status values, scoped to the displayed thread.
+    status_line_command_values: Vec<String>,
+    status_line_command_thread_id: Option<ThreadId>,
+    status_line_command_pending_request_id: Option<u64>,
+    next_status_line_command_request_id: u64,
+    status_line_command_last_requested_at: Option<Instant>,
     // Cached workspace notification headline for the status line.
     status_line_workspace_headline: Option<String>,
     // Request ID for the async workspace headline fetch currently in flight.
