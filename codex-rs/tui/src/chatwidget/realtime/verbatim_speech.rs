@@ -221,15 +221,12 @@ impl ChatWidget {
         markdown: &str,
         from_replay: bool,
     ) {
-        if !should_narrate_visible_agent_message(
-            enabled(),
-            from_replay,
-            markdown,
-        ) || self
-            .realtime_conversation
-            .narrated_agent_items
-            .iter()
-            .any(|(turn, item)| turn == turn_id && item == item_id)
+        if !should_narrate_visible_agent_message(enabled(), from_replay, markdown)
+            || self
+                .realtime_conversation
+                .narrated_agent_items
+                .iter()
+                .any(|(turn, item)| turn == turn_id && item == item_id)
         {
             return;
         }
@@ -270,15 +267,13 @@ impl ChatWidget {
             paused: pause_sender.clone(),
             active: Arc::clone(&active),
         });
-        self.realtime_conversation.verbatim_speech_task = Some(tokio::spawn(drain_speech_queue(
-            receiver,
-            move |spoken| {
+        self.realtime_conversation.verbatim_speech_task =
+            Some(tokio::spawn(drain_speech_queue(receiver, move |spoken| {
                 // Each new spoken item starts unpaused. All queued items retain
                 // their original FIFO order during an earlier item's pause.
                 pause_sender.send_replace(false);
                 speak_spoken_text(spoken, pause_receiver.clone(), Arc::clone(&active))
-            },
-        )));
+            })));
         Ok(())
     }
 }
@@ -295,11 +290,11 @@ fn should_narrate_visible_agent_message(
 
 #[cfg(test)]
 mod tests {
+    use super::SpeechPlaybackControl;
     use super::drain_speech_queue;
     use super::markdown_to_spoken_text;
     use super::should_narrate_visible_agent_message;
     use super::wait_for_speech_process;
-    use super::SpeechPlaybackControl;
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
     use std::sync::atomic::Ordering;
@@ -476,10 +471,6 @@ mod tests {
             true,
             "Replayed answer"
         ));
-        assert!(!should_narrate_visible_agent_message(
-            true,
-            false,
-            " \n "
-        ));
+        assert!(!should_narrate_visible_agent_message(true, false, " \n "));
     }
 }
