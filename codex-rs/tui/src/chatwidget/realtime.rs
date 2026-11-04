@@ -191,6 +191,8 @@ pub(super) struct RealtimeConversationUiState {
     #[cfg(target_os = "macos")]
     verbatim_speech_sender: Option<tokio::sync::mpsc::UnboundedSender<String>>,
     #[cfg(target_os = "macos")]
+    verbatim_speech_control: Option<verbatim_speech::SpeechPlaybackControl>,
+    #[cfg(target_os = "macos")]
     narrated_agent_items: VecDeque<(String, String)>,
     #[cfg(target_os = "macos")]
     voice_turn: voice_turn::VoiceTurnBuffer,
