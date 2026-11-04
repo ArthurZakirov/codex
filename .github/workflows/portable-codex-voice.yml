@@ -22,14 +22,16 @@ jobs:
   build:
     name: Package ${{ matrix.target }}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 120
+    # A clean macOS Cargo build plus the native GStreamer/Bazel runtime can
+    # exceed two hours even without compiler errors on standard hosted runners.
+    timeout-minutes: 360
     strategy:
       fail-fast: false
       matrix:
         include:
           - target: aarch64-apple-darwin
-            # macos-15 arm64 jobs may never acquire a runner during capacity incidents.
-            # macos-26 uses the separate GA Apple Silicon runner image/pool.
+            # macos-15 arm64 previously exhausted its runner-acquisition attempts.
+            # macos-26 is a supported standard Apple Silicon runner label.
             runner: macos-26
             native_prefix: macos_aarch64
           - target: x86_64-apple-darwin
@@ -80,6 +82,17 @@ jobs:
         env:
           STABLE_GIT_COMMIT: ${{ github.sha }}
           TARGET: ${{ matrix.target }}
+          # The upstream release profile enables thin LTO and four codegen units.
+          # A cold build exceeded this workflow's original two-hour deadline.
+          # Retain an optimized preview binary, but minimize expensive release
+          # code generation without cross-crate LTO or debug symbols.
+          CARGO_PROFILE_RELEASE_LTO: "false"
+          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+          CARGO_PROFILE_RELEASE_OPT_LEVEL: "1"
+          CARGO_PROFILE_RELEASE_DEBUG: "0"
+          CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO: "off"
+          CARGO_PROFILE_RELEASE_STRIP: "symbols"
+          CARGO_BUILD_JOBS: ${{ startsWith(matrix.target, 'aarch64') && '2' || '4' }}
         run: |
           set -euo pipefail
           python3 scripts/build_codex_package.py --target "$TARGET" \
