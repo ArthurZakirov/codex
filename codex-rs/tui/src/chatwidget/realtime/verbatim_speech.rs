@@ -11,9 +11,58 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 
 const MAX_NARRATED_ITEM_IDS: usize = 256;
+// Apple's on-device NaturalLanguage recognizer requires no API key, download,
+// or extra runtime. Send text by stdin rather than in process arguments.
+const DETECT_SPEECH_LANGUAGE_JXA: &str = r#"
+ObjC.import("Foundation");
+ObjC.import("NaturalLanguage");
+var data = $.NSFileHandle.fileHandleWithStandardInput.readDataToEndOfFile;
+var text = $.NSString.alloc.initWithDataEncoding(data, $.NSUTF8StringEncoding);
+var lang = $.NLLanguageRecognizer.dominantLanguageForString(text);
+lang ? ObjC.unwrap(lang) : "unknown";
+"#;
+
+/// Unknown languages retain the user's configured system default voice.
+fn voice_for_language(language: &str) -> Option<&'static str> {
+    match language.trim() {
+        "de" => Some("Anna"),
+        "en" => Some("Samantha"),
+        _ => None,
+    }
+}
+
+/// Detect the language of the actual assistant answer on the local Mac.
+async fn detect_speech_voice(spoken: &str) -> Option<&'static str> {
+    let mut child = tokio::process::Command::new("/usr/bin/osascript")
+        .args(["-l", "JavaScript", "-e", DETECT_SPEECH_LANGUAGE_JXA])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .ok()?;
+    let mut input = child.stdin.take()?;
+    // Bound classification work even when a reply contains long code blocks.
+    let sample: String = spoken.chars().take(4_000).collect();
+    let write_result =
+        tokio::time::timeout(Duration::from_secs(2), input.write_all(sample.as_bytes())).await;
+    if !matches!(write_result, Ok(Ok(()))) {
+        return None;
+    }
+    drop(input);
+    let output = tokio::time::timeout(Duration::from_secs(3), child.wait_with_output())
+        .await
+        .ok()?
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    voice_for_language(std::str::from_utf8(&output.stdout).ok()?)
+}
 
 /// A handle for the currently speaking synthesizer. A queued message does not
 /// make Space a playback shortcut until a real speech process has started.
@@ -141,10 +190,16 @@ async fn speak_spoken_text(
     pause_rx: tokio::sync::watch::Receiver<bool>,
     active: Arc<AtomicBool>,
 ) -> std::io::Result<()> {
-    // Deliver audio from stdin, never command arguments or application logs.
-    let mut child = tokio::process::Command::new("/usr/bin/say")
-        .arg("-f")
-        .arg("-")
+    // Identify the visible answer language before playback starts, preserving
+    // FIFO ordering and the process-based Space pause/resume control.
+    let voice = detect_speech_voice(&spoken).await;
+    let mut command = tokio::process::Command::new("/usr/bin/say");
+    if let Some(voice) = voice {
+        command.args(["-v", voice]);
+    }
+    // Deliver text by stdin, never command arguments or application logs.
+    let mut child = command
+        .args(["-f", "-"])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -291,13 +346,41 @@ fn should_narrate_visible_agent_message(
 #[cfg(test)]
 mod tests {
     use super::SpeechPlaybackControl;
+    use super::detect_speech_voice;
     use super::drain_speech_queue;
     use super::markdown_to_spoken_text;
     use super::should_narrate_visible_agent_message;
+    use super::voice_for_language;
     use super::wait_for_speech_process;
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
     use std::sync::atomic::Ordering;
+
+    #[test]
+    fn speech_language_chooses_matching_voices_and_preserves_unknown_defaults() {
+        assert_eq!(voice_for_language("de\n"), Some("Anna"));
+        assert_eq!(voice_for_language("en\n"), Some("Samantha"));
+        assert_eq!(voice_for_language("unknown"), None);
+        assert_eq!(voice_for_language("fr"), None);
+    }
+
+    #[tokio::test]
+    async fn local_macos_language_detection_uses_answer_text() {
+        assert_eq!(
+            detect_speech_voice(
+                "Das ist eine deutsche Antwort. Ich erkläre dir, warum diese Funktion so arbeitet."
+            )
+            .await,
+            Some("Anna")
+        );
+        assert_eq!(
+            detect_speech_voice(
+                "This is an English answer. I will explain how the implementation works."
+            )
+            .await,
+            Some("Samantha")
+        );
+    }
 
     #[test]
     fn code_and_explanation_are_spoken_once_and_in_order() {
