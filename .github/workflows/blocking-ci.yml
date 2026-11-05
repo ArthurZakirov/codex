@@ -3,7 +3,8 @@ name: blocking-ci
 # This is the single entrypoint for checks that block a PR merge. It also runs
 # after pushes to main so the same check family stays grouped in the Actions UI.
 on:
-  pull_request: {}
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
   push:
     branches: [main]
 
@@ -62,12 +63,13 @@ jobs:
       - name: Check TUI Rust formatting
         run: cargo fmt --manifest-path codex-rs/Cargo.toml --package codex-tui --check
 
-  # On Voice PRs, compile and run the macOS playback tests on a standard
-  # GitHub-hosted runner, without invoking the costly upstream matrix.
+  # Expensive macOS compilation is opt-in on Voice PRs. Add the
+  # run-voice-macos-validation label only when full Rust validation is needed.
+  # Default PRs run the inexpensive Ubuntu smoke checks.
   fork-voice-check:
     name: Fork voice macOS validation
-    if: ${{ github.repository == 'ArthurZakirov/codex' && github.event_name == 'pull_request' && github.base_ref == 'feat/portable-codex-voice-release' }}
-    runs-on: macos-15-intel
+    if: ${{ github.repository == 'ArthurZakirov/codex' && github.event_name == 'pull_request' && github.base_ref == 'feat/portable-codex-voice-release' && contains(github.event.pull_request.labels.*.name, 'run-voice-macos-validation') }}
+    runs-on: macos-26
     timeout-minutes: 120
     permissions:
       contents: read
@@ -136,5 +138,5 @@ jobs:
           NEEDS: ${{ toJSON(needs) }}
           # Select the required jobs for this repository. Deliberately skipped
           # upstream CI must not fail the fork gate, or vice versa.
-          REQUIRED_CI_DEPENDENCIES: ${{ github.repository == 'openai/codex' && 'blob-size-policy,cargo-deny,codespell,repo-checks,rust-ci,sdk' || (github.repository == 'ArthurZakirov/codex' && github.event_name == 'pull_request' && github.base_ref == 'feat/portable-codex-voice-release' && 'fork-smoke,fork-voice-check' || 'fork-smoke') }}
+          REQUIRED_CI_DEPENDENCIES: ${{ github.repository == 'openai/codex' && 'blob-size-policy,cargo-deny,codespell,repo-checks,rust-ci,sdk' || (github.repository == 'ArthurZakirov/codex' && github.event_name == 'pull_request' && github.base_ref == 'feat/portable-codex-voice-release' && contains(github.event.pull_request.labels.*.name, 'run-voice-macos-validation') && 'fork-smoke,fork-voice-check' || 'fork-smoke') }}
         run: python3 .github/scripts/check_ci_results.py

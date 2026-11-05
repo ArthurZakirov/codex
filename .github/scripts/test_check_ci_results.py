@@ -62,7 +62,7 @@ class CheckCiResultsTests(unittest.TestCase):
         self.assertNotEqual(failure.returncode, 0)
         self.assertIn("rust-ci: skipped", failure.stdout)
 
-    def test_voice_release_pr_requires_both_fork_and_macos_validation(self) -> None:
+    def test_opted_in_voice_release_pr_requires_both_fork_and_macos_validation(self) -> None:
         required = "fork-smoke,fork-voice-check"
         passed = {"fork-smoke": "success", "fork-voice-check": "success"}
         self.assertEqual(self.check(passed, required=required).returncode, 0)
@@ -77,6 +77,13 @@ class CheckCiResultsTests(unittest.TestCase):
         missing = self.check({"fork-smoke": "success"}, required=required)
         self.assertNotEqual(missing.returncode, 0)
         self.assertIn("fork-voice-check: missing", missing.stdout)
+
+    def test_default_fork_pr_does_not_require_expensive_macos_job(self) -> None:
+        result = self.check(
+            {"fork-smoke": "success", "fork-voice-check": "skipped"},
+            required="fork-smoke",
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_unconfigured_postmerge_policy_still_requires_all_jobs(self) -> None:
         result = self.check({"fork-smoke": "skipped", "codespell": "success"})
