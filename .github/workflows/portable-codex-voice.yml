@@ -1,9 +1,14 @@
 name: Portable Codex Voice macOS release
 
 on:
+  # Building on every merge was costly and redundant. Request a release
+  # explicitly by changing the versioned .github/voice-release-request file
+  # on this branch (usually via a small PR).
   push:
     branches:
       - feat/portable-codex-voice-release
+    paths:
+      - .github/voice-release-request
   workflow_dispatch:
     inputs:
       tag:
@@ -25,18 +30,15 @@ jobs:
     # A clean macOS Cargo build plus the native GStreamer/Bazel runtime can
     # exceed two hours even without compiler errors on standard hosted runners.
     timeout-minutes: 360
+    # Both supported personal Macs use Apple Silicon. A single target cuts
+    # total runner work and avoids publishing unused Intel artifacts.
     strategy:
       fail-fast: false
       matrix:
         include:
           - target: aarch64-apple-darwin
-            # macos-15 arm64 previously exhausted its runner-acquisition attempts.
-            # macos-26 is a supported standard Apple Silicon runner label.
             runner: macos-26
             native_prefix: macos_aarch64
-          - target: x86_64-apple-darwin
-            runner: macos-15-intel
-            native_prefix: macos_x86_64
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -49,6 +51,18 @@ jobs:
         with:
           target: ${{ matrix.target }}
           cache-scope: portable-voice
+      # Reuse unchanged Cargo release dependencies across explicit releases.
+      # GitHub's default cache limit is 10 GiB; do not increase the quota.
+      - name: Restore cached Apple Silicon Rust build
+        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+        with:
+          path: |
+            ~/.cache/codex-ci/cargo-target
+            ~/.cargo/git
+            ~/.cargo/registry
+          key: voice-arm64-release-rust195-${{ hashFiles('codex-rs/Cargo.lock') }}
+          restore-keys: |
+            voice-arm64-release-rust195-
       - name: Validate release parameters and source version
         shell: bash
         env:
@@ -92,7 +106,7 @@ jobs:
           CARGO_PROFILE_RELEASE_DEBUG: "0"
           CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO: "off"
           CARGO_PROFILE_RELEASE_STRIP: "symbols"
-          CARGO_BUILD_JOBS: ${{ startsWith(matrix.target, 'aarch64') && '2' || '4' }}
+          CARGO_BUILD_JOBS: "2"
         run: |
           set -euo pipefail
           python3 scripts/build_codex_package.py --target "$TARGET" \
@@ -189,8 +203,14 @@ jobs:
             exit 1
           fi
           cat dist/SHA256SUMS-* > dist/SHA256SUMS
+          # Only the Apple Silicon archive is intentionally published.
+          test -f dist/codex-voice-aarch64-apple-darwin.tar.gz
+          test -f dist/SHA256SUMS
+          if find dist -maxdepth 1 -name 'codex-voice-x86_64-apple-darwin.tar.gz' | grep -q .; then
+            echo "Unexpected Intel release artifact" >&2; exit 1
+          fi
           gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
             --target "$GITHUB_SHA" --prerelease \
             --title "Codex Voice $RELEASE_TAG" \
-            --notes "Personal unsigned macOS preview build; not Apple notarized. Use the version-pinned DevMac installer. Includes the packaged GStreamer native voice runtime." \
-            dist/codex-voice-*.tar.gz dist/SHA256SUMS
+            --notes "Personal Apple Silicon macOS preview (arm64 only); unsigned/not notarized. Use the version-pinned DevMac installer. Includes the packaged GStreamer native voice runtime." \
+            dist/codex-voice-aarch64-apple-darwin.tar.gz dist/SHA256SUMS
