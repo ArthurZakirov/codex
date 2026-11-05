@@ -73,7 +73,7 @@ async fn delegated_voice_work_speaks_only_the_completed_final_answer_once() {
     complete_item(&mut chat, thread_id, turn_id, first_final);
     let final_answer = agent_item(
         "last-final",
-        "[FINAL] **Lucali** in Brooklyn",
+        "  [FINAL] **Lucali** in Brooklyn",
         /*phase*/ None,
     );
     start_item(&mut chat, thread_id, turn_id, final_answer.clone());
