@@ -62,6 +62,33 @@ jobs:
       - name: Check TUI Rust formatting
         run: cargo fmt --manifest-path codex-rs/Cargo.toml --package codex-tui --check
 
+  # On Voice PRs, compile and run the macOS playback tests on a standard
+  # GitHub-hosted runner, without invoking the costly upstream matrix.
+  fork-voice-check:
+    name: Fork voice macOS validation
+    if: ${{ github.repository == 'ArthurZakirov/codex' && github.event_name == 'pull_request' && github.base_ref == 'feat/portable-codex-voice-release' }}
+    runs-on: macos-15-intel
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    env:
+      CARGO_BUILD_JOBS: 2
+      # Use system Git for nested Chromium submodules; Cargo's built-in
+      # transport failed repeatedly with macOS SecureTransport disconnects.
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+      CARGO_INCREMENTAL: 0
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+      - name: Typecheck Codex TUI on macOS
+        run: cargo check --manifest-path codex-rs/Cargo.toml -p codex-tui --lib --locked -j 2
+      - name: Test local voice playback
+        run: cargo test --manifest-path codex-rs/Cargo.toml -p codex-tui --lib verbatim_speech::tests --locked -j 2
+
   repo-checks:
     name: repo-checks
     if: ${{ github.repository == 'openai/codex' }}
@@ -92,6 +119,7 @@ jobs:
       - cargo-deny
       - codespell
       - fork-smoke
+      - fork-voice-check
       - repo-checks
       - rust-ci
       - sdk
@@ -108,5 +136,5 @@ jobs:
           NEEDS: ${{ toJSON(needs) }}
           # Select the required jobs for this repository. Deliberately skipped
           # upstream CI must not fail the fork gate, or vice versa.
-          REQUIRED_CI_DEPENDENCIES: ${{ github.repository == 'openai/codex' && 'blob-size-policy,cargo-deny,codespell,repo-checks,rust-ci,sdk' || 'fork-smoke' }}
+          REQUIRED_CI_DEPENDENCIES: ${{ github.repository == 'openai/codex' && 'blob-size-policy,cargo-deny,codespell,repo-checks,rust-ci,sdk' || (github.repository == 'ArthurZakirov/codex' && github.event_name == 'pull_request' && github.base_ref == 'feat/portable-codex-voice-release' && 'fork-smoke,fork-voice-check' || 'fork-smoke') }}
         run: python3 .github/scripts/check_ci_results.py
