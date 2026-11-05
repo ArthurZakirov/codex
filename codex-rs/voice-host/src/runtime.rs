@@ -37,7 +37,12 @@ impl Runtime {
         #[cfg(all(debug_assertions, target_os = "macos"))]
         if crate::BUILD_COMMIT == "dev" {
             gstreamer::init().map_err(|_| runtime_error())?;
-            let plugins = std::path::Path::new("/opt/homebrew/opt/gstreamer/lib/gstreamer-1.0");
+            let homebrew_prefix = if cfg!(target_arch = "aarch64") {
+                "/opt/homebrew"
+            } else {
+                "/usr/local"
+            };
+            let plugins = Path::new(homebrew_prefix).join("opt/gstreamer/lib/gstreamer-1.0");
             for name in [
                 "app",
                 "audioconvert",
