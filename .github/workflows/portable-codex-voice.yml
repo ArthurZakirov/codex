@@ -1,0 +1,216 @@
+name: Portable Codex Voice macOS release
+
+on:
+  # Building on every merge was costly and redundant. Request a release
+  # explicitly by changing the versioned .github/voice-release-request file
+  # on this branch (usually via a small PR).
+  push:
+    branches:
+      - feat/portable-codex-voice-release
+    paths:
+      - .github/voice-release-request
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Optional new immutable release tag (e.g. voice-v0.166.0-r1)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: portable-voice-${{ github.ref }}-${{ inputs.tag || github.run_number }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Package ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    # A clean macOS Cargo build plus the native GStreamer/Bazel runtime can
+    # exceed two hours even without compiler errors on standard hosted runners.
+    timeout-minutes: 360
+    # Both supported personal Macs use Apple Silicon. A single target cuts
+    # total runner work and avoids publishing unused Intel artifacts.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            runner: macos-26
+            native_prefix: macos_aarch64
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+      - uses: ./.github/actions/prepare-bazel-ci
+        with:
+          target: ${{ matrix.target }}
+          cache-scope: portable-voice
+      # Reuse unchanged Cargo release dependencies across explicit releases.
+      # GitHub's default cache limit is 10 GiB; do not increase the quota.
+      - name: Restore cached Apple Silicon Rust build
+        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+        with:
+          path: |
+            ~/.cache/codex-ci/cargo-target
+            ~/.cargo/git
+            ~/.cargo/registry
+          key: voice-arm64-release-rust195-${{ hashFiles('codex-rs/Cargo.lock') }}
+          restore-keys: |
+            voice-arm64-release-rust195-
+      - name: Validate release parameters and source version
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' codex-rs/Cargo.toml | head -1)"
+          if [[ -z "$RELEASE_TAG" ]]; then RELEASE_TAG="voice-v${version}-r${GITHUB_RUN_NUMBER}"; fi
+          [[ "$RELEASE_TAG" =~ ^voice-v[0-9]+\.[0-9]+\.[0-9]+-r[0-9]+$ ]] || exit 2
+          [[ "$RELEASE_TAG" == "voice-v${version}-r"* ]] || exit 2
+          echo "VOICE_VERSION=$version" >> "$GITHUB_ENV"
+          echo "VOICE_RELEASE_TAG=$RELEASE_TAG" >> "$GITHUB_ENV"
+      - name: Verify that the hosted runner matches the package CPU
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          case "$TARGET" in
+            aarch64-apple-darwin) expected=arm64 ;;
+            x86_64-apple-darwin) expected=x86_64 ;;
+            *) echo "Unsupported macOS package target: $TARGET" >&2; exit 2 ;;
+          esac
+          actual="$(uname -m)"
+          if [[ "$actual" != "$expected" ]]; then
+            echo "Runner architecture $actual is not $expected ($TARGET)" >&2
+            exit 1
+          fi
+      - name: Build versioned Codex CLI package
+        shell: bash
+        env:
+          STABLE_GIT_COMMIT: ${{ github.sha }}
+          TARGET: ${{ matrix.target }}
+          # The upstream release profile enables thin LTO and four codegen units.
+          # A cold build exceeded this workflow's original two-hour deadline.
+          # Retain an optimized preview binary, but minimize expensive release
+          # code generation without cross-crate LTO or debug symbols.
+          CARGO_PROFILE_RELEASE_LTO: "false"
+          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+          CARGO_PROFILE_RELEASE_OPT_LEVEL: "1"
+          CARGO_PROFILE_RELEASE_DEBUG: "0"
+          CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO: "off"
+          CARGO_PROFILE_RELEASE_STRIP: "symbols"
+          CARGO_BUILD_JOBS: "2"
+        run: |
+          set -euo pipefail
+          python3 scripts/build_codex_package.py --target "$TARGET" \
+            --package-version "$VOICE_VERSION" --cargo-profile release \
+            --package-dir "$RUNNER_TEMP/standard-package"
+          "$RUNNER_TEMP/standard-package/bin/codex" --version
+      - name: Build pinned voice helper and native libraries
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          PREFIX: ${{ matrix.native_prefix }}
+          BUILDBUDDY_API_KEY: ""
+        run: |
+          set -euo pipefail
+          # Use the repository's own native build and receipt-verification pipeline.
+          python3 .github/scripts/run_bazel_with_buildbuddy.py build --config=release \
+            --macos_minimum_os=14.0 \
+            //codex-rs/voice-host:codex-voice-host //third_party/voice:native_runtime
+          source="bazel-bin/third_party/voice/native_runtime_${PREFIX}"
+          mkdir -p "$RUNNER_TEMP/voice-input"
+          python3 third_party/voice/release_runtime.py stage \
+            --target "$TARGET" --source "$source" \
+            --output "$RUNNER_TEMP/voice-input/runtime"
+          python3 third_party/voice/release_runtime.py seal \
+            --target "$TARGET" --output "$RUNNER_TEMP/voice-input/runtime"
+          cp bazel-bin/codex-rs/voice-host/codex-voice-host \
+            "$RUNNER_TEMP/voice-input/codex-voice-host"
+          chmod 0755 "$RUNNER_TEMP/voice-input/codex-voice-host"
+          # These are unsigned personal preview builds, not Apple-notarized releases.
+          codesign --force --sign - --timestamp=none \
+            "$RUNNER_TEMP/voice-input/codex-voice-host"
+      - name: Assemble and verify relocatable voice package
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          python3 third_party/voice/assemble_package.py \
+            --package "$RUNNER_TEMP/standard-package" \
+            --helper "$RUNNER_TEMP/voice-input/codex-voice-host" \
+            --voice-target "$TARGET" --build-commit "$GITHUB_SHA" \
+            --release-version "$VOICE_VERSION" \
+            --runtime "$RUNNER_TEMP/voice-input/runtime" \
+            --output "$RUNNER_TEMP/voice-package"
+          PYTHONPATH=third_party/voice python3 - "$RUNNER_TEMP/voice-package" "$TARGET" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+          from package_runtime import runtime_files
+          package, target = Path(sys.argv[1]), sys.argv[2]
+          voice = package / "codex-resources/voice"
+          runtime_files(voice, target, public_release=True)
+          manifest = json.loads((voice / "manifest.json").read_text())
+          assert manifest["buildCommit"] == __import__("os").environ["GITHUB_SHA"]
+          assert manifest["appTarget"] == target
+          assert (voice / "bin/codex-voice-host").is_file()
+          PY
+          # The helper needs its sibling ../lib runtime to resolve libffi at startup.
+          # Verify the installed layout, not the unpackaged Bazel executable.
+          [[ "$("$RUNNER_TEMP/voice-package/codex-resources/voice/bin/codex-voice-host" --build-commit)" == "$GITHUB_SHA" ]]
+          "$RUNNER_TEMP/voice-package/bin/codex" --version
+          mkdir -p dist
+          tar -C "$RUNNER_TEMP/voice-package" -czf "dist/codex-voice-${TARGET}.tar.gz" .
+          (cd dist && shasum -a 256 "codex-voice-${TARGET}.tar.gz" > "SHA256SUMS-${TARGET}")
+          printf '%s\n' "$VOICE_RELEASE_TAG" > "dist/TAG-${TARGET}"
+      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: portable-voice-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: portable-voice-*
+          merge-multiple: true
+          path: dist
+      - name: Publish a unique immutable preview release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [[ "$(cat dist/TAG-* | sort -u | wc -l | tr -d ' ')" == 1 ]] || exit 2
+          RELEASE_TAG="$(cat dist/TAG-* | head -1)"
+          [[ "$RELEASE_TAG" =~ ^voice-v[0-9]+\.[0-9]+\.[0-9]+-r[0-9]+$ ]] || exit 2
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release already exists: $RELEASE_TAG" >&2
+            exit 1
+          fi
+          cat dist/SHA256SUMS-* > dist/SHA256SUMS
+          # Only the Apple Silicon archive is intentionally published.
+          test -f dist/codex-voice-aarch64-apple-darwin.tar.gz
+          test -f dist/SHA256SUMS
+          if find dist -maxdepth 1 -name 'codex-voice-x86_64-apple-darwin.tar.gz' | grep -q .; then
+            echo "Unexpected Intel release artifact" >&2; exit 1
+          fi
+          gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" --prerelease \
+            --title "Codex Voice $RELEASE_TAG" \
+            --notes "Personal Apple Silicon macOS preview (arm64 only); unsigned/not notarized. Use the version-pinned DevMac installer. Includes the packaged GStreamer native voice runtime." \
+            dist/codex-voice-aarch64-apple-darwin.tar.gz dist/SHA256SUMS

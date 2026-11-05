@@ -21,7 +21,10 @@ async fn closing_voice_before_turn_completion_restores_the_delegated_answer_once
     );
     start_item(&mut chat, thread_id, turn_id, answer.clone());
     complete_item(&mut chat, thread_id, turn_id, answer.clone());
-    assert!(events.try_recv().is_err());
+    assert!(matches!(
+        ops.try_recv(),
+        Ok(AppCommand::RealtimeConversationSpeech { text, .. }) if text.as_str() == "The answer is 42."
+    ));
 
     chat.on_realtime_conversation_closed(/*reason*/ None);
     finish_turn(
@@ -70,7 +73,7 @@ async fn delegated_voice_work_speaks_only_the_completed_final_answer_once() {
     complete_item(&mut chat, thread_id, turn_id, first_final);
     let final_answer = agent_item(
         "last-final",
-        "[FINAL] Lucali in Brooklyn",
+        "  [FINAL] **Lucali** in Brooklyn",
         /*phase*/ None,
     );
     start_item(&mut chat, thread_id, turn_id, final_answer.clone());
@@ -84,8 +87,14 @@ async fn delegated_voice_work_speaks_only_the_completed_final_answer_once() {
         /*replay_kind*/ None,
     );
     complete_item(&mut chat, thread_id, turn_id, final_answer.clone());
+
+    // A visible final item must start speaking while its agent turn is still running.
+    assert!(matches!(
+        ops.try_recv(),
+        Ok(AppCommand::RealtimeConversationSpeech { thread_id: spoken_thread_id, text, .. })
+            if spoken_thread_id == thread_id && text.as_str() == "**Lucali** in Brooklyn"
+    ));
     assert!(ops.try_recv().is_err());
-    assert!(events.try_recv().is_err());
 
     finish_turn(
         &mut chat,
@@ -99,22 +108,28 @@ async fn delegated_voice_work_speaks_only_the_completed_final_answer_once() {
         chat.pending_notification.is_none(),
         "voice-delegated turns should not trigger desktop completion notifications"
     );
-    assert!(matches!(
-        ops.try_recv(),
-        Ok(AppCommand::RealtimeConversationSpeech { thread_id: spoken_thread_id, text, .. })
-            if spoken_thread_id == thread_id && text.as_str() == "Lucali in Brooklyn"
-    ));
-    assert!(ops.try_recv().is_err());
+    assert!(
+        ops.try_recv().is_err(),
+        "turn completion must not speak twice"
+    );
     commit_realtime_history_events(&mut chat, &mut events);
+    let mut visible_finals = 0;
     while let Ok(event) = events.try_recv() {
         if let AppEvent::InsertHistoryCell(cell) = event {
-            assert!(
-                cell.display_lines(/*width*/ 80)
-                    .iter()
-                    .all(|line| !line.to_string().contains("Earlier guess"))
-            );
+            let rendered = cell
+                .display_lines(/*width*/ 80)
+                .iter()
+                .map(ToString::to_string)
+                .collect::<String>();
+            assert!(!rendered.contains("Earlier guess"));
+            assert!(!rendered.contains("[FINAL]"));
+            visible_finals += usize::from(rendered.contains("Lucali in Brooklyn"));
         }
     }
+    assert_eq!(
+        visible_finals, 1,
+        "the spoken final must also be visible once"
+    );
 }
 
 #[tokio::test]
@@ -163,7 +178,7 @@ async fn delegation_started_before_peer_connection_keeps_its_voice_origin() {
                 .iter()
                 .map(ToString::to_string)
                 .collect::<String>();
-            assert!(!rendered.contains("Spoken answer"));
+            assert!(!rendered.contains("[FINAL]"));
             assert!(!rendered.contains("<realtime_delegation>"));
         }
     }
@@ -342,7 +357,7 @@ async fn explicit_final_answer_can_explain_private_channel_markers() {
 }
 
 #[tokio::test]
-async fn newer_spoken_input_prevents_an_older_voice_turn_from_speaking() {
+async fn newer_spoken_input_prevents_replaying_an_already_queued_answer() {
     let (mut chat, _sender, _events, mut ops) = make_chatwidget_manual_with_sender().await;
     let thread_id = activate_voice(&mut chat);
     chat.on_realtime_transcript_delta("user".to_string(), "first question".to_string());
@@ -362,6 +377,11 @@ async fn newer_spoken_input_prevents_an_older_voice_turn_from_speaking() {
     );
     start_item(&mut chat, thread_id, old_turn_id, old_answer.clone());
     complete_item(&mut chat, thread_id, old_turn_id, old_answer.clone());
+    assert!(matches!(
+        ops.try_recv(),
+        Ok(AppCommand::RealtimeConversationSpeech { text, .. })
+            if text.as_str() == "answer to the earlier question"
+    ));
 
     chat.on_realtime_transcript_delta("user".to_string(), "newer question".to_string());
     chat.on_realtime_transcript_done("user".to_string(), "newer question".to_string());
@@ -377,7 +397,7 @@ async fn newer_spoken_input_prevents_an_older_voice_turn_from_speaking() {
 }
 
 #[tokio::test]
-async fn newer_voice_delegation_on_the_same_turn_speaks_only_its_own_answer() {
+async fn newer_voice_delegation_on_the_same_turn_supersedes_earlier_speech() {
     let (mut chat, _sender, _events, mut ops) = make_chatwidget_manual_with_sender().await;
     let thread_id = activate_voice(&mut chat);
     chat.on_realtime_transcript_done("user".to_string(), "first".to_string());
@@ -395,6 +415,11 @@ async fn newer_voice_delegation_on_the_same_turn_speaks_only_its_own_answer() {
     );
     start_item(&mut chat, thread_id, turn_id, old_answer.clone());
     complete_item(&mut chat, thread_id, turn_id, old_answer);
+    assert!(matches!(
+        ops.try_recv(),
+        Ok(AppCommand::RealtimeConversationSpeech { text, .. })
+            if text.as_str() == "answer to the earlier question"
+    ));
 
     start_item(
         &mut chat,

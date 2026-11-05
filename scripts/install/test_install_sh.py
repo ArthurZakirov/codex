@@ -427,7 +427,10 @@ class InstallShTest(unittest.TestCase):
                     capture_output=True,
                 )
             # A helper can outlive its parent CLI; retain its whole release.
-            with subprocess.Popen([str(helper), "300"]) as running:
+            # On Linux, /bin/sleep may be a Coreutils multicall binary that
+            # dispatches by argv[0]. Execute the copied helper but keep "sleep"
+            # as argv[0], so this tests release retention on either platform.
+            with subprocess.Popen(["sleep", "300"], executable=str(helper)) as running:
                 try:
                     second, _ = run_installer_in(
                         root, versions[1], **install_options[versions[1]]

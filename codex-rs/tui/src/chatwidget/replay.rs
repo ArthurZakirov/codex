@@ -325,6 +325,17 @@ impl ChatWidget {
                 ) {
                     return;
                 }
+                // The speech payload retains the original protocol text, while
+                // the visible Markdown should not include the voice-only marker.
+                let text = if !from_replay && self.is_realtime_delegated_agent_item(&turn_id, &id) {
+                    text.trim_start()
+                        .strip_prefix("[FINAL]")
+                        .map(str::trim_start)
+                        .unwrap_or(&text)
+                        .to_string()
+                } else {
+                    text
+                };
                 self.on_agent_message_item_completed(
                     AgentMessageItem {
                         id,

@@ -18,7 +18,7 @@ fn history_text(events: &mut tokio::sync::mpsc::UnboundedReceiver<AppEvent>) -> 
 }
 
 #[tokio::test]
-async fn paraphrased_voice_answers_do_not_reappear_on_overflow_or_stop() {
+async fn backend_answers_remain_visible_even_if_voice_paraphrases() {
     let (mut chat, _sender, mut events, mut ops) = make_chatwidget_manual_with_sender().await;
     let thread_id = activate_voice(&mut chat);
     let mut last_exchange = String::new();
@@ -60,8 +60,8 @@ async fn paraphrased_voice_answers_do_not_reappear_on_overflow_or_stop() {
         commit_realtime_history_events(&mut chat, &mut events);
         last_exchange = history_text(&mut events);
         assert!(
-            !last_exchange.contains("Backend answer"),
-            "old backend answer appeared during turn {index}"
+            last_exchange.contains(&format!("Backend answer {index}")),
+            "the final backend answer must remain visible during turn {index}"
         );
     }
     chat.on_realtime_transcript_done("user".into(), "Next question".into());
@@ -107,14 +107,8 @@ async fn failed_speech_recovers_only_for_the_current_input() {
         while events.try_recv().is_ok() {}
         chat.restore_undelivered_realtime_speech(delivery_id);
         chat.restore_undelivered_realtime_speech(delivery_id);
-        assert_eq!(
-            history_text(&mut events),
-            if superseded {
-                ""
-            } else {
-                "• Undelivered answer"
-            }
-        );
+        // Already rendered in Markdown; recovering undelivered speech adds no duplicate.
+        assert_eq!(history_text(&mut events), "");
     }
 }
 
@@ -148,15 +142,23 @@ async fn delayed_voice_transcript_preserves_unspoken_text_fallback() {
             vec![answer],
             TurnStatus::Completed,
         );
-        insta::allow_duplicates! {
-            insta::assert_snapshot!(history_text(&mut events), @"• Current answer");
-        }
+        // A completed final is shown immediately. Draining history above must
+        // not cause a second copy when turn completion subsequently arrives.
+        let rendered = history_text(&mut events);
+        assert_eq!(
+            rendered,
+            if completed_before_transcript {
+                ""
+            } else {
+                "• Current answer"
+            }
+        );
         assert!(ops.try_recv().is_err());
     }
 }
 
 #[tokio::test]
-async fn queued_voice_answers_return_to_history_once_if_voice_closes_before_delivery() {
+async fn queued_voice_answers_do_not_duplicate_when_voice_closes_before_delivery() {
     let (mut chat, _sender, mut events, mut ops) = make_chatwidget_manual_with_sender().await;
     let thread_id = activate_voice(&mut chat);
     let mut deliveries = Vec::new();
@@ -210,14 +212,14 @@ async fn queued_voice_answers_return_to_history_once_if_voice_closes_before_deli
             .iter()
             .filter(|line| line.contains("First answer"))
             .count(),
-        1
+        0
     );
     assert_eq!(
         rendered
             .iter()
             .filter(|line| line.contains("Second answer"))
             .count(),
-        1
+        0
     );
 }
 
@@ -276,7 +278,7 @@ async fn pending_voice_answers_stay_bounded_without_restoring_old_inputs() {
             restored += 1;
         }
     }
-    assert_eq!(restored, 0);
+    assert_eq!(restored, 1); // The final answer was rendered before overflow.
     assert!(ops.try_recv().is_err());
     chat.stop_realtime_conversation();
     chat.reset_realtime_conversation();

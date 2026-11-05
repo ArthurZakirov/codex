@@ -170,7 +170,10 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.0.0"
+# Keep this source-built fork at the latest verified compatible release version.
+# The Codex backend gates the model catalog by client_version; the development
+# placeholder 0.0.0 hides models available to the same ChatGPT account.
+version = "0.166.0"
 # Track the edition for all workspace crates in one place. Individual
 # crates can still override this value, but keeping it here means new
 # crates created with `cargo new -w ...` automatically inherit the 2024
