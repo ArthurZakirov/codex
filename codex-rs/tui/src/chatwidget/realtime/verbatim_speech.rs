@@ -2,24 +2,27 @@
 //! The realtime model still handles listening and delegation, but never rewrites speech.
 
 use super::*;
+use objc2_app_kit::NSSpeechBoundary;
+#[allow(deprecated)]
+use objc2_app_kit::NSSpeechSynthesizer;
+use objc2_foundation::NSString;
 use pulldown_cmark::Event;
 use pulldown_cmark::Parser;
 use pulldown_cmark::Tag;
 use pulldown_cmark::TagEnd;
-use std::process::ExitStatus;
-use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
-use tokio::io::AsyncWriteExt;
+use std::time::Duration;
 
 const MAX_NARRATED_ITEM_IDS: usize = 256;
 
-/// A handle for the currently speaking synthesizer. A queued message does not
-/// make Space a playback shortcut until a real speech process has started.
+/// Controls the native speech synthesizer, including cancellation of a
+/// paused utterance. Queued speech does not intercept Space until it begins.
 pub(super) struct SpeechPlaybackControl {
     paused: tokio::sync::watch::Sender<bool>,
     active: Arc<AtomicBool>,
+    cancelled: Arc<AtomicBool>,
 }
 
 impl SpeechPlaybackControl {
@@ -34,6 +37,10 @@ impl SpeechPlaybackControl {
         let next = !*self.paused.borrow();
         self.paused.send_replace(next);
         Some(next)
+    }
+
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
     }
 }
 
@@ -90,81 +97,136 @@ fn markdown_to_spoken_text(markdown: &str) -> String {
     spoken.trim().to_string()
 }
 
-/// One speech synthesizer at a time: subsequent commentary and final answers
-/// must not stop a message that is already being spoken.
-/// Only the worker holding this Child can signal its PID. This avoids the TUI
-/// signaling a stale PID after the synthesizer exits and the PID is reused.
-async fn wait_for_speech_process(
-    mut child: tokio::process::Child,
-    mut pause_rx: tokio::sync::watch::Receiver<bool>,
-    active: Arc<AtomicBool>,
-) -> std::io::Result<ExitStatus> {
-    let pid = child
-        .id()
-        .and_then(|id| libc::pid_t::try_from(id).ok())
-        .ok_or_else(|| std::io::Error::other("macOS speech synthesizer has no process ID"))?;
-    active.store(true, Ordering::Release);
-    let _active_guard = ActiveSpeechGuard(active);
-    let mut suspended = false;
-    loop {
-        tokio::select! {
-            status = child.wait() => return status,
-            updated = pause_rx.changed() => {
-                if updated.is_err() {
-                    return child.wait().await;
-                }
-                let requested = *pause_rx.borrow_and_update();
-                if requested == suspended {
-                    continue;
-                }
-                if let Some(status) = child.try_wait()? {
-                    return Ok(status);
-                }
-                // SAFETY: pid belongs to the Child held by this task; check
-                // termination before signaling and never expose it to the UI.
-                let signal = if requested { libc::SIGSTOP } else { libc::SIGCONT };
-                if unsafe { libc::kill(pid, signal) } != 0 {
-                    let error = std::io::Error::last_os_error();
-                    if error.raw_os_error() == Some(libc::ESRCH) {
-                        return child.wait().await;
-                    }
-                    return Err(error);
-                }
-                suspended = requested;
-            }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SpeechLanguage {
+    German,
+    English,
+}
+
+/// Technical identifiers should not overwhelm natural-language cues.
+fn detect_speech_language(text: &str) -> SpeechLanguage {
+    const GERMAN: &[&str] = &[
+        "der", "die", "das", "und", "ist", "ich", "nicht", "mit", "für", "eine", "einen", "wir",
+        "werden", "kann", "bitte", "diese", "wenn", "dann", "auch", "wird", "auf", "von", "zu",
+        "den", "dem", "sie", "hallo", "guten", "morgen", "wie", "geht", "es", "dir", "mir", "du",
+        "dein", "deine", "danke", "heute", "jetzt", "noch", "schon", "aber", "doch", "haben",
+        "sind", "kein", "keine", "kannst", "können", "weiter", "mal",
+    ];
+    const ENGLISH: &[&str] = &[
+        "the", "and", "is", "are", "with", "for", "this", "that", "you", "your", "will", "can",
+        "please", "when", "then", "from", "not", "we", "have", "does", "into", "should", "it",
+        "of", "to",
+    ];
+    let mut german = 0;
+    let mut english = 0;
+    for word in text
+        .split(|c: char| !c.is_alphabetic())
+        .filter(|w| !w.is_empty())
+    {
+        let lower = word.to_lowercase();
+        if lower.chars().any(|c| matches!(c, 'ä' | 'ö' | 'ü' | 'ß')) {
+            german += 3;
+        }
+        if GERMAN.contains(&lower.as_str()) {
+            german += 1;
+        }
+        if ENGLISH.contains(&lower.as_str()) {
+            english += 1;
         }
     }
+    if german > english {
+        SpeechLanguage::German
+    } else {
+        SpeechLanguage::English
+    }
+}
+
+#[allow(deprecated)]
+fn choose_speech_voice(language: SpeechLanguage) -> Option<String> {
+    let voices = NSSpeechSynthesizer::availableVoices();
+    let candidates: Vec<String> = voices.iter().map(|voice| voice.to_string()).collect();
+    let locale = match language {
+        SpeechLanguage::German => "de-de",
+        SpeechLanguage::English => "en-us",
+    };
+    let preferred = match language {
+        SpeechLanguage::German => "anna",
+        SpeechLanguage::English => "samantha",
+    };
+    candidates
+        .iter()
+        .find(|voice| {
+            let name = voice.to_ascii_lowercase();
+            name.contains(locale) && name.ends_with(&format!(".{preferred}"))
+        })
+        .or_else(|| {
+            candidates
+                .iter()
+                .find(|voice| voice.to_ascii_lowercase().contains(locale))
+        })
+        .cloned()
+}
+
+/// The speech engine, not its process, owns the playback position.
+/// SIGSTOP on /usr/bin/say only suspends its client process; CoreAudio may
+/// continue consuming queued audio, resulting in mute rather than true pause.
+/// NSSpeechSynthesizer explicitly preserves its utterance position on pause.
+#[allow(deprecated)]
+fn speak_spoken_text_blocking(
+    spoken: String,
+    mut pause_rx: tokio::sync::watch::Receiver<bool>,
+    active: Arc<AtomicBool>,
+    cancelled: Arc<AtomicBool>,
+) -> std::io::Result<()> {
+    if cancelled.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    let synthesizer = NSSpeechSynthesizer::new();
+    if let Some(voice) = choose_speech_voice(detect_speech_language(&spoken)) {
+        if !synthesizer.setVoice(Some(&NSString::from_str(&voice))) {
+            tracing::warn!("macOS speech voice {voice} was unavailable; using system default");
+        }
+    }
+    if !synthesizer.startSpeakingString(&NSString::from_str(&spoken)) {
+        return Err(std::io::Error::other(
+            "macOS speech synthesizer could not start",
+        ));
+    }
+    active.store(true, Ordering::Release);
+    let _active_guard = ActiveSpeechGuard(active);
+    let mut paused = false;
+    while synthesizer.isSpeaking() {
+        if cancelled.load(Ordering::Acquire) {
+            synthesizer.stopSpeaking();
+            return Ok(());
+        }
+        let requested_pause = *pause_rx.borrow_and_update();
+        if requested_pause != paused {
+            if requested_pause {
+                synthesizer.pauseSpeakingAtBoundary(NSSpeechBoundary::ImmediateBoundary);
+            } else {
+                synthesizer.continueSpeaking();
+            }
+            paused = requested_pause;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    Ok(())
 }
 
 async fn speak_spoken_text(
     spoken: String,
     pause_rx: tokio::sync::watch::Receiver<bool>,
     active: Arc<AtomicBool>,
+    cancelled: Arc<AtomicBool>,
 ) -> std::io::Result<()> {
-    // Deliver audio from stdin, never command arguments or application logs.
-    let mut child = tokio::process::Command::new("/usr/bin/say")
-        .arg("-f")
-        .arg("-")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .spawn()?;
-    let mut input = child
-        .stdin
-        .take()
-        .ok_or_else(|| std::io::Error::other("macOS speech synthesizer has no input stream"))?;
-    // Writing concurrently allows pause/resume even for long spoken messages
-    // whose content would otherwise fill the synthesizer's stdin pipe.
-    let writer = tokio::spawn(async move { input.write_all(spoken.as_bytes()).await });
-    let status = wait_for_speech_process(child, pause_rx, active).await?;
-    writer.await.map_err(std::io::Error::other)??;
-    if !status.success() {
-        return Err(std::io::Error::other(format!(
-            "macOS speech synthesizer exited with {status}"
-        )));
-    }
-    Ok(())
+    // Native AppKit synthesizers are managed on their owning thread.
+    // Cancellation remains cooperative even when the queue task is aborted.
+    tokio::task::spawn_blocking(move || {
+        speak_spoken_text_blocking(spoken, pause_rx, active, cancelled)
+    })
+    .await
+    .map_err(std::io::Error::other)?
 }
 
 /// A single consumer ensures FIFO playback and prevents later messages from
@@ -205,7 +267,9 @@ impl ChatWidget {
 
     pub(crate) fn cancel_verbatim_speech(&mut self) {
         self.realtime_conversation.verbatim_speech_sender.take();
-        self.realtime_conversation.verbatim_speech_control.take();
+        if let Some(control) = self.realtime_conversation.verbatim_speech_control.take() {
+            control.cancel();
+        }
         if let Some(task) = self.realtime_conversation.verbatim_speech_task.take() {
             task.abort();
         }
@@ -262,17 +326,24 @@ impl ChatWidget {
             .map_err(|_| std::io::Error::other("Unable to queue macOS speech"))?;
         let (pause_sender, pause_receiver) = tokio::sync::watch::channel(false);
         let active = Arc::new(AtomicBool::new(false));
+        let cancelled = Arc::new(AtomicBool::new(false));
         self.realtime_conversation.verbatim_speech_sender = Some(sender);
         self.realtime_conversation.verbatim_speech_control = Some(SpeechPlaybackControl {
             paused: pause_sender.clone(),
             active: Arc::clone(&active),
+            cancelled: Arc::clone(&cancelled),
         });
         self.realtime_conversation.verbatim_speech_task =
             Some(tokio::spawn(drain_speech_queue(receiver, move |spoken| {
                 // Each new spoken item starts unpaused. All queued items retain
                 // their original FIFO order during an earlier item's pause.
                 pause_sender.send_replace(false);
-                speak_spoken_text(spoken, pause_receiver.clone(), Arc::clone(&active))
+                speak_spoken_text(
+                    spoken,
+                    pause_receiver.clone(),
+                    Arc::clone(&active),
+                    Arc::clone(&cancelled),
+                )
             })));
         Ok(())
     }
@@ -294,10 +365,53 @@ mod tests {
     use super::drain_speech_queue;
     use super::markdown_to_spoken_text;
     use super::should_narrate_visible_agent_message;
-    use super::wait_for_speech_process;
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
     use std::sync::atomic::Ordering;
+
+    #[test]
+    fn detects_german_prose_and_technical_terms() {
+        assert_eq!(
+            super::detect_speech_language(
+                "Bitte erkläre, wie wir den Pydantic Validator mit Git rebase testen können."
+            ),
+            super::SpeechLanguage::German
+        );
+        assert_eq!(
+            super::detect_speech_language("Die Funktion ist für diese API nicht verfügbar."),
+            super::SpeechLanguage::German
+        );
+        assert_eq!(
+            super::detect_speech_language("Guten Morgen, wie geht es dir heute?"),
+            super::SpeechLanguage::German
+        );
+        assert_eq!(
+            super::detect_speech_language("Hallo, kannst du mir helfen?"),
+            super::SpeechLanguage::German
+        );
+    }
+
+    #[test]
+    fn detects_english_prose_and_technical_terms() {
+        assert_eq!(
+            super::detect_speech_language(
+                "Please explain how we can test the Pydantic validator with Git rebase."
+            ),
+            super::SpeechLanguage::English
+        );
+        assert_eq!(
+            super::detect_speech_language("The function is not available for this API."),
+            super::SpeechLanguage::English
+        );
+    }
+
+    #[test]
+    fn defaults_to_english_for_code_only_or_ambiguous_text() {
+        assert_eq!(
+            super::detect_speech_language("git switch feature; cargo test"),
+            super::SpeechLanguage::English
+        );
+    }
 
     #[test]
     fn code_and_explanation_are_spoken_once_and_in_order() {
@@ -381,9 +495,11 @@ mod tests {
     fn space_toggles_only_when_a_speech_process_is_active() {
         let (paused, _receiver) = tokio::sync::watch::channel(false);
         let active = Arc::new(AtomicBool::new(false));
+        let cancelled = Arc::new(AtomicBool::new(false));
         let control = SpeechPlaybackControl {
             paused,
             active: Arc::clone(&active),
+            cancelled,
         };
         assert_eq!(control.toggle_pause(), None);
         active.store(true, Ordering::Release);
@@ -393,65 +509,21 @@ mod tests {
         assert_eq!(control.toggle_pause(), None);
     }
 
-    #[tokio::test]
-    async fn pause_and_resume_suspend_one_running_child_without_dropping_its_queue() {
-        let child = tokio::process::Command::new("/bin/sleep")
-            .arg("30")
-            .kill_on_drop(true)
-            .spawn()
-            .expect("start a harmless stand-in for speech");
-        let pid = child.id().expect("process PID");
-        // Ownership transfers to the worker that is allowed to signal it.
-        let (paused, receiver) = tokio::sync::watch::channel(false);
-        let active = Arc::new(AtomicBool::new(false));
+    #[test]
+    fn cancellation_reaches_a_paused_native_speech_worker() {
+        let (paused, _receiver) = tokio::sync::watch::channel(false);
+        let active = Arc::new(AtomicBool::new(true));
+        let cancelled = Arc::new(AtomicBool::new(false));
         let control = SpeechPlaybackControl {
             paused,
-            active: Arc::clone(&active),
+            active,
+            cancelled: Arc::clone(&cancelled),
         };
-        let worker = tokio::spawn(wait_for_speech_process(
-            child,
-            receiver,
-            Arc::clone(&active),
-        ));
-        for _ in 0..50 {
-            if control.is_active() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        assert!(control.is_active());
         assert_eq!(control.toggle_pause(), Some(true));
-
-        let state = || {
-            let output = std::process::Command::new("/bin/ps")
-                .args(["-o", "state=", "-p", &pid.to_string()])
-                .output()
-                .expect("inspect child state");
-            String::from_utf8_lossy(&output.stdout).trim().to_string()
-        };
-        let mut stopped = false;
-        for _ in 0..50 {
-            if state().starts_with('T') {
-                stopped = true;
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        assert!(stopped, "speech process did not enter the stopped state");
+        control.cancel();
+        assert!(cancelled.load(Ordering::Acquire));
+        // The native speech worker notices cancellation even while paused.
         assert_eq!(control.toggle_pause(), Some(false));
-        let mut resumed = false;
-        for _ in 0..50 {
-            let status = state();
-            if !status.is_empty() && !status.starts_with('T') {
-                resumed = true;
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        assert!(resumed, "speech process did not resume");
-        worker.abort();
-        let _ = worker.await;
-        assert!(!control.is_active());
     }
 
     #[test]
