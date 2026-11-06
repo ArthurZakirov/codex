@@ -143,28 +143,36 @@ fn detect_speech_language(text: &str) -> SpeechLanguage {
 
 #[allow(deprecated)]
 fn choose_speech_voice(language: SpeechLanguage) -> Option<String> {
+    if language == SpeechLanguage::English {
+        // Preserve the macOS system default, just as /usr/bin/say did before.
+        // Explicitly selecting compact Samantha changes the English voice.
+        return None;
+    }
     let voices = NSSpeechSynthesizer::availableVoices();
     let candidates: Vec<String> = voices.iter().map(|voice| voice.to_string()).collect();
-    let locale = match language {
-        SpeechLanguage::German => "de-de",
-        SpeechLanguage::English => "en-us",
-    };
-    let preferred = match language {
-        SpeechLanguage::German => "anna",
-        SpeechLanguage::English => "samantha",
-    };
-    candidates
+    let german_voices: Vec<&String> = candidates
         .iter()
-        .find(|voice| {
-            let name = voice.to_ascii_lowercase();
-            name.contains(locale) && name.ends_with(&format!(".{preferred}"))
-        })
-        .or_else(|| {
-            candidates
-                .iter()
-                .find(|voice| voice.to_ascii_lowercase().contains(locale))
-        })
-        .cloned()
+        .filter(|voice| voice.to_ascii_lowercase().contains("de-de"))
+        .collect();
+    if let Ok(requested) = std::env::var("CODEX_REALTIME_GERMAN_VOICE") {
+        if let Some(voice) = german_voices.iter().find(|voice| {
+            voice.eq_ignore_ascii_case(&requested)
+                || voice
+                    .rsplit('.')
+                    .next()
+                    .is_some_and(|name| name.eq_ignore_ascii_case(&requested))
+        }) {
+            return Some((*voice).clone());
+        }
+        tracing::warn!(
+            "German speech voice {requested:?} is not installed; using a German system voice"
+        );
+    }
+    german_voices
+        .iter()
+        .find(|voice| voice.to_ascii_lowercase().ends_with(".anna"))
+        .or_else(|| german_voices.first())
+        .map(|voice| (*voice).clone())
 }
 
 /// The speech engine, not its process, owns the playback position.
@@ -368,6 +376,14 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
     use std::sync::atomic::Ordering;
+
+    #[test]
+    fn english_narration_preserves_the_original_mac_system_voice() {
+        assert_eq!(
+            super::choose_speech_voice(super::SpeechLanguage::English),
+            None
+        );
+    }
 
     #[test]
     fn detects_german_prose_and_technical_terms() {
