@@ -12,6 +12,7 @@ use pulldown_cmark::Tag;
 use pulldown_cmark::TagEnd;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
@@ -23,6 +24,7 @@ pub(super) struct SpeechPlaybackControl {
     paused: tokio::sync::watch::Sender<bool>,
     active: Arc<AtomicBool>,
     cancelled: Arc<AtomicBool>,
+    interruption_generation: Arc<AtomicU64>,
 }
 
 impl SpeechPlaybackControl {
@@ -39,9 +41,24 @@ impl SpeechPlaybackControl {
         Some(next)
     }
 
+    fn interrupt_current(&self) {
+        if self.is_active() {
+            self.interruption_generation.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
     fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
     }
+}
+
+fn speech_should_stop(
+    cancelled: &AtomicBool,
+    interruption_generation: &AtomicU64,
+    utterance_generation: u64,
+) -> bool {
+    cancelled.load(Ordering::Acquire)
+        || interruption_generation.load(Ordering::Acquire) != utterance_generation
 }
 
 struct ActiveSpeechGuard(Arc<AtomicBool>);
@@ -185,8 +202,10 @@ fn speak_spoken_text_blocking(
     mut pause_rx: tokio::sync::watch::Receiver<bool>,
     active: Arc<AtomicBool>,
     cancelled: Arc<AtomicBool>,
+    interruption_generation: Arc<AtomicU64>,
 ) -> std::io::Result<()> {
-    if cancelled.load(Ordering::Acquire) {
+    let utterance_generation = interruption_generation.load(Ordering::Acquire);
+    if speech_should_stop(&cancelled, &interruption_generation, utterance_generation) {
         return Ok(());
     }
     let synthesizer = NSSpeechSynthesizer::new();
@@ -204,7 +223,7 @@ fn speak_spoken_text_blocking(
     let _active_guard = ActiveSpeechGuard(active);
     let mut paused = false;
     while synthesizer.isSpeaking() {
-        if cancelled.load(Ordering::Acquire) {
+        if speech_should_stop(&cancelled, &interruption_generation, utterance_generation) {
             synthesizer.stopSpeaking();
             return Ok(());
         }
@@ -227,11 +246,12 @@ async fn speak_spoken_text(
     pause_rx: tokio::sync::watch::Receiver<bool>,
     active: Arc<AtomicBool>,
     cancelled: Arc<AtomicBool>,
+    interruption_generation: Arc<AtomicU64>,
 ) -> std::io::Result<()> {
     // Native AppKit synthesizers are managed on their owning thread.
     // Cancellation remains cooperative even when the queue task is aborted.
     tokio::task::spawn_blocking(move || {
-        speak_spoken_text_blocking(spoken, pause_rx, active, cancelled)
+        speak_spoken_text_blocking(spoken, pause_rx, active, cancelled, interruption_generation)
     })
     .await
     .map_err(std::io::Error::other)?
@@ -273,6 +293,15 @@ impl ChatWidget {
             .and_then(SpeechPlaybackControl::toggle_pause)
     }
 
+    /// A new user input interrupts only the current utterance. The existing
+    /// sender and queue worker remain alive to narrate pending replies in FIFO order.
+    pub(crate) fn interrupt_current_verbatim_speech(&mut self) {
+        if let Some(control) = self.realtime_conversation.verbatim_speech_control.as_ref() {
+            control.interrupt_current();
+        }
+    }
+
+    /// End the entire voice session, including its queued narrations.
     pub(crate) fn cancel_verbatim_speech(&mut self) {
         self.realtime_conversation.verbatim_speech_sender.take();
         if let Some(control) = self.realtime_conversation.verbatim_speech_control.take() {
@@ -335,11 +364,13 @@ impl ChatWidget {
         let (pause_sender, pause_receiver) = tokio::sync::watch::channel(false);
         let active = Arc::new(AtomicBool::new(false));
         let cancelled = Arc::new(AtomicBool::new(false));
+        let interruption_generation = Arc::new(AtomicU64::new(0));
         self.realtime_conversation.verbatim_speech_sender = Some(sender);
         self.realtime_conversation.verbatim_speech_control = Some(SpeechPlaybackControl {
             paused: pause_sender.clone(),
             active: Arc::clone(&active),
             cancelled: Arc::clone(&cancelled),
+            interruption_generation: Arc::clone(&interruption_generation),
         });
         self.realtime_conversation.verbatim_speech_task =
             Some(tokio::spawn(drain_speech_queue(receiver, move |spoken| {
@@ -351,6 +382,7 @@ impl ChatWidget {
                     pause_receiver.clone(),
                     Arc::clone(&active),
                     Arc::clone(&cancelled),
+                    Arc::clone(&interruption_generation),
                 )
             })));
         Ok(())
@@ -375,6 +407,7 @@ mod tests {
     use super::should_narrate_visible_agent_message;
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::AtomicU64;
     use std::sync::atomic::Ordering;
 
     #[test]
@@ -507,6 +540,95 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn interrupting_one_utterance_keeps_pending_narrations_in_fifo_order() {
+        use std::sync::Mutex;
+
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (paused, _pause_receiver) = tokio::sync::watch::channel(false);
+        let active = Arc::new(AtomicBool::new(false));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let interruption_generation = Arc::new(AtomicU64::new(0));
+        let control = SpeechPlaybackControl {
+            paused,
+            active: Arc::clone(&active),
+            cancelled: Arc::clone(&cancelled),
+            interruption_generation: Arc::clone(&interruption_generation),
+        };
+        let started = Arc::new(tokio::sync::Notify::new());
+        let allow_first_to_end = Arc::new(tokio::sync::Notify::new());
+        let narrated = Arc::new(Mutex::new(Vec::new()));
+
+        let worker = tokio::spawn(drain_speech_queue(receiver, {
+            let started = Arc::clone(&started);
+            let allow_first_to_end = Arc::clone(&allow_first_to_end);
+            let active = Arc::clone(&active);
+            let cancelled = Arc::clone(&cancelled);
+            let interruption_generation = Arc::clone(&interruption_generation);
+            let narrated = Arc::clone(&narrated);
+            move |message| {
+                let started = Arc::clone(&started);
+                let allow_first_to_end = Arc::clone(&allow_first_to_end);
+                let active = Arc::clone(&active);
+                let cancelled = Arc::clone(&cancelled);
+                let interruption_generation = Arc::clone(&interruption_generation);
+                let narrated = Arc::clone(&narrated);
+                async move {
+                    let start_generation = interruption_generation.load(Ordering::Acquire);
+                    if message == "Current" {
+                        active.store(true, Ordering::Release);
+                        started.notify_one();
+                        allow_first_to_end.notified().await;
+                        active.store(false, Ordering::Release);
+                    }
+                    if !super::speech_should_stop(
+                        &cancelled,
+                        &interruption_generation,
+                        start_generation,
+                    ) {
+                        narrated.lock().unwrap().push(message);
+                    }
+                    Ok(())
+                }
+            }
+        }));
+
+        sender.send("Current".to_string()).unwrap();
+        started.notified().await;
+        sender.send("Queued commentary".to_string()).unwrap();
+        sender.send("Queued final".to_string()).unwrap();
+        assert_eq!(control.toggle_pause(), Some(true));
+        control.interrupt_current();
+
+        assert!(!cancelled.load(Ordering::Acquire));
+        assert_eq!(interruption_generation.load(Ordering::Acquire), 1);
+        allow_first_to_end.notify_one();
+        drop(sender);
+        tokio::time::timeout(std::time::Duration::from_secs(3), worker)
+            .await
+            .expect("speech queue should drain")
+            .expect("speech worker should succeed");
+        assert_eq!(
+            *narrated.lock().unwrap(),
+            ["Queued commentary", "Queued final"]
+        );
+        assert_eq!(control.toggle_pause(), None);
+    }
+
+    #[test]
+    fn interruption_is_ignored_when_no_speech_is_active() {
+        let (paused, _receiver) = tokio::sync::watch::channel(false);
+        let interruption_generation = Arc::new(AtomicU64::new(0));
+        let control = SpeechPlaybackControl {
+            paused,
+            active: Arc::new(AtomicBool::new(false)),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            interruption_generation: Arc::clone(&interruption_generation),
+        };
+        control.interrupt_current();
+        assert_eq!(interruption_generation.load(Ordering::Acquire), 0);
+    }
+
     #[test]
     fn space_toggles_only_when_a_speech_process_is_active() {
         let (paused, _receiver) = tokio::sync::watch::channel(false);
@@ -516,6 +638,7 @@ mod tests {
             paused,
             active: Arc::clone(&active),
             cancelled,
+            interruption_generation: Arc::new(AtomicU64::new(0)),
         };
         assert_eq!(control.toggle_pause(), None);
         active.store(true, Ordering::Release);
@@ -534,6 +657,7 @@ mod tests {
             paused,
             active,
             cancelled: Arc::clone(&cancelled),
+            interruption_generation: Arc::new(AtomicU64::new(0)),
         };
         assert_eq!(control.toggle_pause(), Some(true));
         control.cancel();

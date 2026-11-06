@@ -611,7 +611,7 @@ impl ChatWidget {
 
     pub(super) fn note_realtime_typed_input(&mut self, text: &str) {
         #[cfg(target_os = "macos")]
-        self.cancel_verbatim_speech();
+        self.interrupt_current_verbatim_speech();
         self.invalidate_realtime_voice_input();
         if self.realtime_conversation.phase == RealtimeConversationPhase::Active {
             self.realtime_conversation.pending_typed_input = Some(text.to_string());
@@ -1333,7 +1333,7 @@ impl ChatWidget {
         // before the user finishes the utterance or says "go".
         #[cfg(target_os = "macos")]
         if active && role == "user" && !delta.trim().is_empty() {
-            self.cancel_verbatim_speech();
+            self.interrupt_current_verbatim_speech();
         }
         // Duplex transcript chunks can interleave. Display role changes are not input boundaries.
         if active
@@ -1570,7 +1570,7 @@ impl ChatWidget {
         // Some providers deliver a completed caption without partial deltas.
         #[cfg(target_os = "macos")]
         if role == "user" && has_text {
-            self.cancel_verbatim_speech();
+            self.interrupt_current_verbatim_speech();
         }
         if role == "assistant" && has_text {
             // appendSpeech's RPC acknowledgement only means the request was
