@@ -602,8 +602,6 @@ impl App {
                             _ => None,
                         },
                     );
-                    #[cfg(target_os = "macos")]
-                    self.chat_widget.restore_unanswered_voice_turn();
                     return Ok(());
                 }
                 return Err(error);

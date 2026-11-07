@@ -1646,9 +1646,6 @@ pub(crate) async fn build_realtime_session_config(
         .or(config_voice)
         .unwrap_or_else(|| default_realtime_voice(version));
     validate_realtime_voice(version, voice)?;
-    // The realtime model receives the same instructions as standard Codex.
-    // In verbatim mode, the client separately owns spoken "go" submission and
-    // output suppression; changing model instructions can affect V3 transcription.
     Ok(RealtimeSessionConfig {
         instructions: prompt,
         initial_items: params.initial_items.clone(),
@@ -1850,12 +1847,7 @@ async fn handle_start_inner(
                 ),
                 _ => None,
             };
-            // With local explicit voice turns the client routes the finalized
-            // transcript. Ignore model-originated handoffs to avoid a duplicate
-            // request racing the spoken 'go' submission.
-            let locally_routed = cfg!(target_os = "macos")
-                && std::env::var("CODEX_REALTIME_VERBATIM_SPEECH").is_ok_and(|value| value == "1");
-            if let Some(text) = maybe_routed_text.filter(|_| !locally_routed) {
+            if let Some(text) = maybe_routed_text {
                 // The routed text can contain spoken prompts or workspace secrets.
                 debug!("[realtime-text] realtime conversation text output");
                 handoff_error = route_handoffs.route(&sess_clone, text).await.err();
