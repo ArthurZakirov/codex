@@ -8,7 +8,7 @@ import sys
 import time
 
 
-def run_case(binary: str, sentence: str, *, pause: bool = False, voice: str = "") -> list[str]:
+def run_case(binary: str, sentence: str, *, pause: bool = False, voice: str = "", rate: float = 1.8) -> list[str]:
     process = subprocess.Popen(
         [binary],
         stdin=subprocess.PIPE,
@@ -19,7 +19,7 @@ def run_case(binary: str, sentence: str, *, pause: bool = False, voice: str = ""
     )
     assert process.stdin is not None and process.stdout is not None
     encoded = base64.b64encode(sentence.encode("utf-8")).decode("ascii")
-    process.stdin.write(f"SPEAK\t{encoded}\t{voice}\n")
+    process.stdin.write(f"SPEAK\t{encoded}\t{voice}\t{rate}\n")
     process.stdin.flush()
     lines: list[str] = []
     deadline = time.monotonic() + 20
@@ -63,7 +63,7 @@ def test_barge_in(binary: str) -> None:
     assert process.stdin is not None and process.stdout is not None
     sentence = "Interrupt this long speech immediately. " * 12
     encoded = base64.b64encode(sentence.encode("utf-8")).decode("ascii")
-    process.stdin.write(f"SPEAK\t{encoded}\t\n")
+    process.stdin.write(f"SPEAK\t{encoded}\t\t1.8\n")
     process.stdin.flush()
     deadline = time.monotonic() + 8
     while time.monotonic() < deadline:

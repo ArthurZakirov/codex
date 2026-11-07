@@ -1,5 +1,5 @@
 // Word-position-aware macOS speech worker. All AppKit calls stay on the process main thread.
-// stdin: SPEAK<TAB>base64(UTF-8)<TAB>voice-id, PAUSE, RESUME, STOP, RATE<TAB>words-per-minute
+// stdin: SPEAK<TAB>base64(UTF-8)<TAB>voice-id<TAB>rate-multiplier, PAUSE, RESUME, STOP
 // stdout: WORD<TAB>utf16-start<TAB>utf16-length, DONE, ERROR<TAB>reason
 import AppKit
 import Foundation
@@ -18,7 +18,9 @@ private final class SpeechService: NSObject, NSSpeechSynthesizerDelegate {
         guard let verb = fields.first else { return }
         switch verb {
         case "SPEAK":
-            guard !started, fields.count == 3,
+            guard !started, fields.count == 4,
+                  let multiplier = Float(fields[3]),
+                  multiplier.isFinite, (0.5...2.0).contains(multiplier),
                   let payload = Data(base64Encoded: fields[1]),
                   let message = String(data: payload, encoding: .utf8) else {
                 emit("ERROR\tinvalid speech payload")
@@ -34,6 +36,9 @@ private final class SpeechService: NSObject, NSSpeechSynthesizerDelegate {
                     emit("WARN\trequested voice unavailable; using system default")
                 }
             }
+            // NSSpeechSynthesizer ignores rate updates during an active
+            // utterance; set it after voice selection but before playback.
+            synthesizer.rate *= multiplier
             if !synthesizer.startSpeaking(message) {
                 emit("ERROR\tfailed to start speech")
                 exit(1)

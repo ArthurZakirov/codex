@@ -137,8 +137,11 @@ async fn speak_with_word_positions(
     let markdown_source: Arc<str> = Arc::from(item.markdown.as_str());
     let spoken_source: Arc<str> = Arc::from(item.spoken.as_str());
     let payload = base64::engine::general_purpose::STANDARD.encode(item.spoken.as_bytes());
+    // The native helper (used for highlighting) must honor the same per-utterance
+    // configuration as the in-process synthesizer fallback.
+    let rate = configured_speech_rate_multiplier();
     stdin
-        .write_all(format!("SPEAK\t{payload}\t{voice}\n").as_bytes())
+        .write_all(format!("SPEAK\t{payload}\t{voice}\t{rate}\n").as_bytes())
         .await?;
     stdin.flush().await?;
     active.store(true, Ordering::Release);
