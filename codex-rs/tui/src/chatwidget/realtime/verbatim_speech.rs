@@ -158,6 +158,17 @@ fn detect_speech_language(text: &str) -> SpeechLanguage {
     }
 }
 
+fn speech_voice_quality_rank(voice: &str) -> u8 {
+    let name = voice.to_ascii_lowercase();
+    if name.contains(".premium.") {
+        3
+    } else if name.contains(".enhanced.") {
+        2
+    } else {
+        1
+    }
+}
+
 #[allow(deprecated)]
 fn choose_speech_voice(language: SpeechLanguage) -> Option<String> {
     if language == SpeechLanguage::English {
@@ -172,13 +183,17 @@ fn choose_speech_voice(language: SpeechLanguage) -> Option<String> {
         .filter(|voice| voice.to_ascii_lowercase().contains("de-de"))
         .collect();
     if let Ok(requested) = std::env::var("CODEX_REALTIME_GERMAN_VOICE") {
-        if let Some(voice) = german_voices.iter().find(|voice| {
-            voice.eq_ignore_ascii_case(&requested)
-                || voice
-                    .rsplit('.')
-                    .next()
-                    .is_some_and(|name| name.eq_ignore_ascii_case(&requested))
-        }) {
+        if let Some(voice) = german_voices
+            .iter()
+            .filter(|voice| {
+                voice.eq_ignore_ascii_case(&requested)
+                    || voice
+                        .rsplit('.')
+                        .next()
+                        .is_some_and(|name| name.eq_ignore_ascii_case(&requested))
+            })
+            .max_by_key(|voice| speech_voice_quality_rank(voice))
+        {
             return Some((*voice).clone());
         }
         tracing::warn!(
@@ -187,8 +202,13 @@ fn choose_speech_voice(language: SpeechLanguage) -> Option<String> {
     }
     german_voices
         .iter()
-        .find(|voice| voice.to_ascii_lowercase().ends_with(".anna"))
-        .or_else(|| german_voices.first())
+        .filter(|voice| voice.to_ascii_lowercase().ends_with(".anna"))
+        .max_by_key(|voice| speech_voice_quality_rank(voice))
+        .or_else(|| {
+            german_voices
+                .iter()
+                .max_by_key(|voice| speech_voice_quality_rank(voice))
+        })
         .map(|voice| (*voice).clone())
 }
 
@@ -409,6 +429,22 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use std::sync::atomic::AtomicU64;
     use std::sync::atomic::Ordering;
+
+    #[test]
+    fn german_premium_voice_outranks_compact_and_enhanced() {
+        assert_eq!(
+            super::speech_voice_quality_rank("com.apple.voice.compact.de-DE.Anna"),
+            1
+        );
+        assert_eq!(
+            super::speech_voice_quality_rank("com.apple.voice.enhanced.de-DE.Anna"),
+            2
+        );
+        assert_eq!(
+            super::speech_voice_quality_rank("com.apple.voice.premium.de-DE.Anna"),
+            3
+        );
+    }
 
     #[test]
     fn english_narration_preserves_the_original_mac_system_voice() {
