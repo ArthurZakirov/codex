@@ -73,11 +73,76 @@ pub(crate) fn enabled() -> bool {
     std::env::var("CODEX_REALTIME_VERBATIM_SPEECH").is_ok_and(|value| value == "1")
 }
 
+/// Read one nonblank line backward, retaining the byte offset in the original
+/// Markdown. This recognizes the presentation-only footer without rewriting
+/// the message that the TUI displays and exposes for copy/paste.
+fn previous_nonblank_line<'a>(markdown: &'a str, cursor: &mut usize) -> Option<(usize, &'a str)> {
+    while *cursor > 0 {
+        let mut end = *cursor;
+        if markdown.as_bytes()[end - 1] == b'\n' {
+            end -= 1;
+        }
+        let start = markdown[..end].rfind('\n').map_or(0, |pos| pos + 1);
+        *cursor = start;
+        let line = markdown[start..end].trim();
+        if !line.is_empty() {
+            return Some((start, line));
+        }
+    }
+    None
+}
+
+/// Recognize only the canonical *terminal* checkout review presentation.
+/// In particular, body code examples, paths and branch names still speak.
+fn trailing_checkout_footer_start(markdown: &str) -> Option<usize> {
+    let mut cursor = markdown.len();
+    let (_, branch_line) = previous_nonblank_line(markdown, &mut cursor)?;
+    let branch = branch_line.strip_prefix("**Branch:**")?.trim();
+    let branch = branch.strip_prefix('`')?.strip_suffix('`')?;
+    if branch.is_empty() || branch.contains('`') {
+        return None;
+    }
+
+    let (_, closing_fence) = previous_nonblank_line(markdown, &mut cursor)?;
+    if closing_fence != "```" {
+        return None;
+    }
+    let (_, checkout_path) = previous_nonblank_line(markdown, &mut cursor)?;
+    if !checkout_path.starts_with('/') || checkout_path.len() == 1 {
+        return None;
+    }
+    let (fence_start, opening_fence) = previous_nonblank_line(markdown, &mut cursor)?;
+    if opening_fence != "```bash" {
+        return None;
+    }
+    let (start, heading) = previous_nonblank_line(markdown, &mut cursor)?;
+    if heading != "**Checkout path (copy for VS Code):**" {
+        return None;
+    }
+
+    // A similar sequence shown *inside* a larger code sample is not a footer.
+    // The fenced path must really be a Markdown code block in the full message.
+    let is_actual_code_block = Parser::new(markdown)
+        .into_offset_iter()
+        .any(|(event, range)| {
+            range.start == fence_start && matches!(event, Event::Start(Tag::CodeBlock(_)))
+        });
+    is_actual_code_block.then_some(start)
+}
+
+fn spoken_markdown_without_checkout_footers(mut markdown: &str) -> &str {
+    // Multiple changed checkouts can each have their own final review block.
+    while let Some(start) = trailing_checkout_footer_start(markdown) {
+        markdown = &markdown[..start];
+    }
+    markdown
+}
+
 /// Convert Markdown presentation into the same ordered words for the speech engine.
 /// The original Markdown remains unchanged in the chat history.
 fn markdown_to_spoken_text(markdown: &str) -> String {
     let mut spoken = String::new();
-    for event in Parser::new(markdown) {
+    for event in Parser::new(spoken_markdown_without_checkout_footers(markdown)) {
         match event {
             Event::Text(text) | Event::Code(text) => spoken.push_str(&text),
             Event::SoftBreak | Event::HardBreak | Event::Rule => spoken.push('\n'),
@@ -514,6 +579,120 @@ mod tests {
         assert_eq!(
             speech,
             "Pydantic v2:\nclass User(BaseModel):\n    age: int = Field(ge=18)\nRequired: age must be present.\nConstraint: age >= 18."
+        );
+    }
+
+    #[test]
+    fn terminal_checkout_footer_is_visual_only_in_english_and_german() {
+        for explanation in [
+            "The relevant file is `/tmp/project/src/main.rs`. Review it first.",
+            "Die Datei `/tmp/project/src/main.rs` ist relevant. Bitte prüfen.",
+        ] {
+            let markdown = format!(
+                "{explanation}\n\n**Checkout path (copy for VS Code):**\n\n```bash\n/Users/example/Repos/codex.worktrees/feature\n```\n\n**Branch:** `feat/feature`\n"
+            );
+            assert_eq!(
+                markdown_to_spoken_text(&markdown),
+                super::markdown_to_spoken_text(explanation)
+            );
+            assert!(markdown.contains("/Users/example/Repos/codex.worktrees/feature"));
+            assert!(markdown.contains("**Branch:** `feat/feature`"));
+        }
+    }
+
+    #[test]
+    fn terminal_footer_supports_whitespace_crlf_and_multiple_checkouts() {
+        let heading = "**Checkout path (copy for VS Code):**";
+        let first = format!(
+            "{heading}\r\n\r\n```bash\r\n/Users/example/Repos/first\r\n```\r\n\r\n**Branch:** `feat/one`"
+        );
+        let second = format!(
+            "{heading}\n\n```bash\n/Users/example/Repos/second\n```\n\n**Branch:** `feat/two`"
+        );
+        let markdown = format!("All checks passed.\n\n{first}\n \n{second}\n  ");
+        assert_eq!(markdown_to_spoken_text(&markdown), "All checks passed.");
+    }
+
+    #[test]
+    fn paths_and_code_in_the_body_remain_spoken_without_complete_footer() {
+        let samples = [
+            "Run `git switch feat/fix` inside `/Users/example/Repos/code`.",
+            "**Checkout path (copy for VS Code):**\n\n```bash\n/Users/example/Repos/code\n```",
+            "**Checkout path (copy for VS Code):**\n\n```bash\n/Users/example/Repos/code\n```\n\n**Branch:** `feat/fix`\n\nThis is an explanation after the footer.",
+            "**Checkout path (copy for VS Code):**\n\n```bash\nrelative/path\n```\n\n**Branch:** `feat/fix`",
+            "**Checkout path (copy for VS Code):**\n\n```bash\n/Users/example/Repos/code\n```\n\n**Branch:** feat/fix",
+        ];
+        for markdown in samples {
+            assert_eq!(
+                super::spoken_markdown_without_checkout_footers(markdown),
+                markdown,
+                "ordinary Markdown must not be stripped: {markdown:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn footer_example_inside_outer_code_fence_is_still_spoken() {
+        let markdown = "Example:\n\n~~~~text\n**Checkout path (copy for VS Code):**\n\n```bash\n/Users/example/Repos/demo\n```\n\n**Branch:** `feat/demo`\n~~~~";
+        assert_eq!(
+            super::spoken_markdown_without_checkout_footers(markdown),
+            markdown
+        );
+        assert!(markdown_to_spoken_text(markdown).contains("/Users/example/Repos/demo"));
+    }
+
+    #[test]
+    fn footer_only_message_has_no_speech_but_is_preserved_visually() {
+        let markdown = "**Checkout path (copy for VS Code):**\n\n```bash\n/Users/example/Repos/code\n```\n\n**Branch:** `detached HEAD`";
+        assert_eq!(markdown_to_spoken_text(markdown), "");
+        assert!(super::should_narrate_visible_agent_message(
+            true, false, markdown
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_later_completed_footer_is_filtered_while_earlier_speech_is_playing() {
+        use std::sync::Mutex;
+
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let spoken = Arc::new(Mutex::new(Vec::new()));
+        let speaking = Arc::new(tokio::sync::Notify::new());
+        let resume = Arc::new(tokio::sync::Notify::new());
+        let worker = tokio::spawn(drain_speech_queue(receiver, {
+            let spoken = Arc::clone(&spoken);
+            let speaking = Arc::clone(&speaking);
+            let resume = Arc::clone(&resume);
+            move |message| {
+                let spoken = Arc::clone(&spoken);
+                let speaking = Arc::clone(&speaking);
+                let resume = Arc::clone(&resume);
+                async move {
+                    if message == "First complete message." {
+                        speaking.notify_one();
+                        resume.notified().await;
+                    }
+                    spoken.lock().unwrap().push(message);
+                    Ok(())
+                }
+            }
+        }));
+
+        sender
+            .send(markdown_to_spoken_text("First complete message."))
+            .unwrap();
+        speaking.notified().await;
+        let second = "Zweite abgeschlossene Nachricht.\n\n**Checkout path (copy for VS Code):**\n\n```bash\n/Users/example/Repos/code\n```\n\n**Branch:** `feat/foo`";
+        sender.send(markdown_to_spoken_text(second)).unwrap();
+        assert!(spoken.lock().unwrap().is_empty());
+        resume.notify_one();
+        drop(sender);
+        worker.await.unwrap();
+        assert_eq!(
+            *spoken.lock().unwrap(),
+            [
+                "First complete message.",
+                "Zweite abgeschlossene Nachricht."
+            ]
         );
     }
 
