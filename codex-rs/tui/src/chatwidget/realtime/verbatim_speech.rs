@@ -2,6 +2,13 @@
 //! The realtime model still handles listening and delegation, but never rewrites speech.
 
 use super::*;
+use crate::transcript_view::SpokenLine;
+use crate::tui::FrameRequester;
+use base64::Engine as _;
+use std::process::Stdio;
+use std::sync::Mutex;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
 use objc2_app_kit::NSSpeechBoundary;
 #[allow(deprecated)]
 use objc2_app_kit::NSSpeechSynthesizer;
@@ -61,6 +68,138 @@ fn speech_should_stop(
         || interruption_generation.load(Ordering::Acquire) != utterance_generation
 }
 
+pub(super) struct SpeechQueueItem {
+    markdown: String,
+    spoken: String,
+}
+
+struct SpokenHighlightGuard {
+    position: Arc<Mutex<Option<SpokenLine>>>,
+    frames: FrameRequester,
+}
+
+impl Drop for SpokenHighlightGuard {
+    fn drop(&mut self) {
+        *self.position.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        self.frames.schedule_frame();
+    }
+}
+
+fn speech_helper_path() -> Option<std::path::PathBuf> {
+    if let Some(override_path) = std::env::var_os("CODEX_VOICE_SPEECH_HELPER") {
+        let path = std::path::PathBuf::from(override_path);
+        return path.is_file().then_some(path);
+    }
+    let path = std::env::current_exe()
+        .ok()?
+        .parent()?
+        .parent()?
+        .join("codex-resources/voice/bin/codex-voice-speech-helper");
+    path.is_file().then_some(path)
+}
+
+/// The small Swift worker runs AppKit on its own main thread and emits real
+/// NSSpeechSynthesizer word callbacks. No synthesized timestamp is substituted.
+async fn speak_with_word_positions(
+    item: SpeechQueueItem,
+    mut pause_rx: tokio::sync::watch::Receiver<bool>,
+    active: Arc<AtomicBool>,
+    cancelled: Arc<AtomicBool>,
+    interruption_generation: Arc<AtomicU64>,
+    position: Arc<Mutex<Option<SpokenLine>>>,
+    frames: FrameRequester,
+    helper: std::path::PathBuf,
+) -> std::io::Result<()> {
+    let generation = interruption_generation.load(Ordering::Acquire);
+    if speech_should_stop(&cancelled, &interruption_generation, generation) {
+        return Ok(());
+    }
+    let _highlight_guard = SpokenHighlightGuard {
+        position: Arc::clone(&position),
+        frames: frames.clone(),
+    };
+    let voice = choose_speech_voice(detect_speech_language(&item.spoken)).unwrap_or_default();
+    let mut child = tokio::process::Command::new(helper)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| std::io::Error::other("speech helper stdin unavailable"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| std::io::Error::other("speech helper stdout unavailable"))?;
+    let mut words = BufReader::new(stdout).lines();
+    let markdown_source: Arc<str> = Arc::from(item.markdown.as_str());
+    let spoken_source: Arc<str> = Arc::from(item.spoken.as_str());
+    let payload = base64::engine::general_purpose::STANDARD.encode(item.spoken.as_bytes());
+    // The native helper (used for highlighting) must honor the same per-utterance
+    // configuration as the in-process synthesizer fallback.
+    let rate = configured_speech_rate_multiplier();
+    stdin
+        .write_all(format!("SPEAK\t{payload}\t{voice}\t{rate}\n").as_bytes())
+        .await?;
+    stdin.flush().await?;
+    active.store(true, Ordering::Release);
+    let _active_guard = ActiveSpeechGuard(active);
+    let mut paused = false;
+    let result = loop {
+        tokio::select! {
+            line = words.next_line() => {
+                let line = match line? {
+                    Some(line) => line,
+                    None => break Err(std::io::Error::other("speech helper closed without completion")),
+                };
+                if let Some(position_text) = line.strip_prefix("WORD\t") {
+                    let mut parts = position_text.split('\t');
+                    if let (Some(start), Some(len)) = (parts.next(), parts.next())
+                        && let (Ok(utf16_start), Ok(utf16_len)) =
+                            (start.parse::<usize>(), len.parse::<usize>())
+                        && parts.next().is_none()
+                    {
+                        *position.lock().unwrap_or_else(|e| e.into_inner()) =
+                            Some(SpokenLine {
+                                markdown: Arc::clone(&markdown_source),
+                                spoken: Arc::clone(&spoken_source),
+                                utf16_start,
+                                utf16_len,
+                            });
+                        frames.schedule_frame();
+                    }
+                } else if line == "DONE\ttrue" {
+                    break Ok(());
+                } else if let Some(warning) = line.strip_prefix("WARN\t") {
+                    tracing::warn!("macOS word-position speech helper: {warning}");
+                } else if let Some(error) = line.strip_prefix("ERROR\t") {
+                    break Err(std::io::Error::other(error.to_string()));
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_millis(20)) => {
+                if speech_should_stop(&cancelled, &interruption_generation, generation) {
+                    let _ = stdin.write_all(b"STOP\n").await;
+                    break Ok(());
+                }
+                let requested_pause = *pause_rx.borrow_and_update();
+                if paused != requested_pause {
+                    stdin.write_all(if requested_pause { b"PAUSE\n" } else { b"RESUME\n" }).await?;
+                    stdin.flush().await?;
+                    paused = requested_pause;
+                }
+            }
+        }
+    };
+    // Killing an interrupted utterance cannot block the following FIFO item.
+    if result.is_err() {
+        let _ = child.start_kill();
+    }
+    let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+    result
+}
+
 struct ActiveSpeechGuard(Arc<AtomicBool>);
 
 impl Drop for ActiveSpeechGuard {
@@ -73,11 +212,110 @@ pub(crate) fn enabled() -> bool {
     std::env::var("CODEX_REALTIME_VERBATIM_SPEECH").is_ok_and(|value| value == "1")
 }
 
+/// Read one nonblank line backward, retaining the byte offset in the original
+/// Markdown. This recognizes the presentation-only footer without rewriting
+/// the message that the TUI displays and exposes for copy/paste.
+fn previous_nonblank_line<'a>(markdown: &'a str, cursor: &mut usize) -> Option<(usize, &'a str)> {
+    while *cursor > 0 {
+        let mut end = *cursor;
+        if markdown.as_bytes()[end - 1] == b'\n' {
+            end -= 1;
+        }
+        let start = markdown[..end].rfind('\n').map_or(0, |pos| pos + 1);
+        *cursor = start;
+        let line = markdown[start..end].trim();
+        if !line.is_empty() {
+            return Some((start, line));
+        }
+    }
+    None
+}
+
+/// Recognize only the canonical *terminal* checkout review presentation.
+/// In particular, body code examples, paths and branch names still speak.
+fn trailing_checkout_footer_start(markdown: &str) -> Option<usize> {
+    let mut cursor = markdown.len();
+    let (_, branch_line) = previous_nonblank_line(markdown, &mut cursor)?;
+    let branch = branch_line.strip_prefix("**Branch:**")?.trim();
+    let branch = branch.strip_prefix('`')?.strip_suffix('`')?;
+    if branch.is_empty() || branch.contains('`') {
+        return None;
+    }
+
+    let (_, closing_fence) = previous_nonblank_line(markdown, &mut cursor)?;
+    if closing_fence != "```" {
+        return None;
+    }
+    let (_, checkout_path) = previous_nonblank_line(markdown, &mut cursor)?;
+    if !checkout_path.starts_with('/') || checkout_path.len() == 1 {
+        return None;
+    }
+    let (fence_start, opening_fence) = previous_nonblank_line(markdown, &mut cursor)?;
+    if opening_fence != "```bash" {
+        return None;
+    }
+    let (start, heading) = previous_nonblank_line(markdown, &mut cursor)?;
+    if heading != "**Checkout path (copy for VS Code):**" {
+        return None;
+    }
+
+    // A similar sequence shown *inside* a larger code sample is not a footer.
+    // The fenced path must really be a Markdown code block in the full message.
+    let is_actual_code_block = Parser::new(markdown)
+        .into_offset_iter()
+        .any(|(event, range)| {
+            range.start == fence_start && matches!(event, Event::Start(Tag::CodeBlock(_)))
+        });
+    is_actual_code_block.then_some(start)
+}
+
+fn spoken_markdown_without_checkout_footers(mut markdown: &str) -> &str {
+    // Multiple changed checkouts can each have their own final review block.
+    while let Some(start) = trailing_checkout_footer_start(markdown) {
+        markdown = &markdown[..start];
+    }
+    markdown
+}
+
+/// Chezmoi creates this file on first apply. Missing or invalid configuration
+/// does not prevent voice playback on a machine that has not been provisioned.
+const DEFAULT_SPEECH_RATE_MULTIPLIER: f32 = 1.8;
+
+fn speech_rate_multiplier_from_json(json: &str) -> Option<f32> {
+    let config: serde_json::Value = serde_json::from_str(json).ok()?;
+    let rate = config.get("speech_rate")?.as_f64()?;
+    (0.5..=2.0).contains(&rate).then_some(rate as f32)
+}
+
+fn speech_rate_multiplier_from_path(path: &std::path::Path) -> f32 {
+    match std::fs::read_to_string(path) {
+        Ok(json) => speech_rate_multiplier_from_json(&json).unwrap_or_else(|| {
+            tracing::warn!(path = %path.display(), "invalid Codex Voice speech rate; using default");
+            DEFAULT_SPEECH_RATE_MULTIPLIER
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            DEFAULT_SPEECH_RATE_MULTIPLIER
+        }
+        Err(error) => {
+            tracing::warn!(path = %path.display(), %error, "cannot read Codex Voice speech rate; using default");
+            DEFAULT_SPEECH_RATE_MULTIPLIER
+        }
+    }
+}
+
+fn configured_speech_rate_multiplier() -> f32 {
+    let Some(home) = std::env::var_os("HOME") else {
+        return DEFAULT_SPEECH_RATE_MULTIPLIER;
+    };
+    let path = std::path::PathBuf::from(home).join(".config/codex-voice/config.json");
+    speech_rate_multiplier_from_path(&path)
+}
+
 /// Convert Markdown presentation into the same ordered words for the speech engine.
 /// The original Markdown remains unchanged in the chat history.
 fn markdown_to_spoken_text(markdown: &str) -> String {
     let mut spoken = String::new();
-    for event in Parser::new(markdown) {
+    for event in Parser::new(spoken_markdown_without_checkout_footers(markdown)) {
         match event {
             Event::Text(text) | Event::Code(text) => spoken.push_str(&text),
             Event::SoftBreak | Event::HardBreak | Event::Rule => spoken.push('\n'),
@@ -234,6 +472,9 @@ fn speak_spoken_text_blocking(
             tracing::warn!("macOS speech voice {voice} was unavailable; using system default");
         }
     }
+    // Set the per-voice rate *before* starting each utterance. Changing
+    // NSSpeechSynthesizer.rate during an utterance has no audible effect.
+    synthesizer.setRate(synthesizer.rate() * configured_speech_rate_multiplier());
     if !synthesizer.startSpeakingString(&NSString::from_str(&spoken)) {
         return Err(std::io::Error::other(
             "macOS speech synthesizer could not start",
@@ -279,11 +520,11 @@ async fn speak_spoken_text(
 
 /// A single consumer ensures FIFO playback and prevents later messages from
 /// interrupting an earlier one even when the agent emits them rapidly.
-async fn drain_speech_queue<F, Fut>(
-    mut receiver: tokio::sync::mpsc::UnboundedReceiver<String>,
+async fn drain_speech_queue<F, Fut, T>(
+    mut receiver: tokio::sync::mpsc::UnboundedReceiver<T>,
     mut synthesize: F,
 ) where
-    F: FnMut(String) -> Fut,
+    F: FnMut(T) -> Fut,
     Fut: std::future::Future<Output = std::io::Result<()>>,
 {
     while let Some(spoken) = receiver.recv().await {
@@ -294,6 +535,14 @@ async fn drain_speech_queue<F, Fut>(
 }
 
 impl ChatWidget {
+    pub(crate) fn spoken_line_highlight(&self) -> Option<SpokenLine> {
+        self.realtime_conversation
+            .spoken_line_progress
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
     pub(crate) fn realtime_verbatim_speech_enabled(&self) -> bool {
         enabled()
     }
@@ -318,11 +567,23 @@ impl ChatWidget {
     pub(crate) fn interrupt_current_verbatim_speech(&mut self) {
         if let Some(control) = self.realtime_conversation.verbatim_speech_control.as_ref() {
             control.interrupt_current();
+            *self
+                .realtime_conversation
+                .spoken_line_progress
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = None;
+            self.frame_requester.schedule_frame();
         }
     }
 
     /// End the entire voice session, including its queued narrations.
     pub(crate) fn cancel_verbatim_speech(&mut self) {
+        *self
+            .realtime_conversation
+            .spoken_line_progress
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+        self.frame_requester.schedule_frame();
         self.realtime_conversation.verbatim_speech_sender.take();
         if let Some(control) = self.realtime_conversation.verbatim_speech_control.take() {
             control.cancel();
@@ -373,13 +634,21 @@ impl ChatWidget {
             return Ok(());
         }
         if let Some(sender) = &self.realtime_conversation.verbatim_speech_sender
-            && sender.send(spoken.clone()).is_ok()
+            && sender
+                .send(SpeechQueueItem {
+                    markdown: markdown.to_owned(),
+                    spoken: spoken.clone(),
+                })
+                .is_ok()
         {
             return Ok(());
         }
-        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel::<SpeechQueueItem>();
         sender
-            .send(spoken)
+            .send(SpeechQueueItem {
+                markdown: markdown.to_owned(),
+                spoken,
+            })
             .map_err(|_| std::io::Error::other("Unable to queue macOS speech"))?;
         let (pause_sender, pause_receiver) = tokio::sync::watch::channel(false);
         let active = Arc::new(AtomicBool::new(false));
@@ -392,18 +661,38 @@ impl ChatWidget {
             cancelled: Arc::clone(&cancelled),
             interruption_generation: Arc::clone(&interruption_generation),
         });
+        let progress = Arc::clone(&self.realtime_conversation.spoken_line_progress);
+        let frames = self.frame_requester.clone();
         self.realtime_conversation.verbatim_speech_task =
-            Some(tokio::spawn(drain_speech_queue(receiver, move |spoken| {
+            Some(tokio::spawn(drain_speech_queue(receiver, move |item| {
                 // Each new spoken item starts unpaused. All queued items retain
                 // their original FIFO order during an earlier item's pause.
                 pause_sender.send_replace(false);
-                speak_spoken_text(
-                    spoken,
-                    pause_receiver.clone(),
-                    Arc::clone(&active),
-                    Arc::clone(&cancelled),
-                    Arc::clone(&interruption_generation),
-                )
+                let pause_rx = pause_receiver.clone();
+                let active = Arc::clone(&active);
+                let cancelled = Arc::clone(&cancelled);
+                let interrupted = Arc::clone(&interruption_generation);
+                let progress = Arc::clone(&progress);
+                let frames = frames.clone();
+                async move {
+                    if let Some(helper) = speech_helper_path() {
+                        speak_with_word_positions(
+                            item,
+                            pause_rx,
+                            active,
+                            cancelled,
+                            interrupted,
+                            progress,
+                            frames,
+                            helper,
+                        )
+                        .await
+                    } else {
+                        // Preserve old voice behavior for a plain development build.
+                        speak_spoken_text(item.spoken, pause_rx, active, cancelled, interrupted)
+                            .await
+                    }
+                }
             })));
         Ok(())
     }
@@ -429,6 +718,49 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use std::sync::atomic::AtomicU64;
     use std::sync::atomic::Ordering;
+
+    #[test]
+    fn voice_speed_configuration_uses_valid_json_and_rejects_bad_rates() {
+        use super::speech_rate_multiplier_from_json;
+        assert!(
+            (speech_rate_multiplier_from_json(r#"{"speech_rate":1.8}"#).unwrap() - 1.8).abs()
+                < 0.0001
+        );
+        assert_eq!(
+            speech_rate_multiplier_from_json(r#"{"speech_rate":0.5}"#),
+            Some(0.5)
+        );
+        assert_eq!(
+            speech_rate_multiplier_from_json(r#"{"speech_rate":2.0}"#),
+            Some(2.0)
+        );
+        for invalid in [
+            "",
+            "not JSON",
+            r#"{}"#,
+            r#"{"speech_rate":"fast"}"#,
+            r#"{"speech_rate":0.1}"#,
+            r#"{"speech_rate":3.0}"#,
+            r#"{"speech_rate":null}"#,
+        ] {
+            assert_eq!(speech_rate_multiplier_from_json(invalid), None);
+        }
+    }
+
+    #[test]
+    fn rate_file_is_reread_for_each_utterance_and_missing_file_is_safe() {
+        let folder = tempfile::tempdir().unwrap();
+        let config = folder.path().join("config.json");
+        assert_eq!(super::speech_rate_multiplier_from_path(&config), 1.8);
+        std::fs::write(&config, r#"{"speech_rate":1.4}"#).unwrap();
+        assert!((super::speech_rate_multiplier_from_path(&config) - 1.4).abs() < 0.0001);
+        std::fs::write(&config, r#"{"speech_rate":2.0}"#).unwrap();
+        assert_eq!(super::speech_rate_multiplier_from_path(&config), 2.0);
+        std::fs::write(&config, r#"{"speech_rate":0}"#).unwrap();
+        assert_eq!(super::speech_rate_multiplier_from_path(&config), 1.8);
+        std::fs::remove_file(&config).unwrap();
+        assert_eq!(super::speech_rate_multiplier_from_path(&config), 1.8);
+    }
 
     #[test]
     fn german_premium_voice_outranks_compact_and_enhanced() {
@@ -514,6 +846,120 @@ mod tests {
         assert_eq!(
             speech,
             "Pydantic v2:\nclass User(BaseModel):\n    age: int = Field(ge=18)\nRequired: age must be present.\nConstraint: age >= 18."
+        );
+    }
+
+    #[test]
+    fn terminal_checkout_footer_is_visual_only_in_english_and_german() {
+        for explanation in [
+            "The relevant file is `/tmp/project/src/main.rs`. Review it first.",
+            "Die Datei `/tmp/project/src/main.rs` ist relevant. Bitte prüfen.",
+        ] {
+            let markdown = format!(
+                "{explanation}\n\n**Checkout path (copy for VS Code):**\n\n```bash\n/Users/example/Repos/codex.worktrees/feature\n```\n\n**Branch:** `feat/feature`\n"
+            );
+            assert_eq!(
+                markdown_to_spoken_text(&markdown),
+                super::markdown_to_spoken_text(explanation)
+            );
+            assert!(markdown.contains("/Users/example/Repos/codex.worktrees/feature"));
+            assert!(markdown.contains("**Branch:** `feat/feature`"));
+        }
+    }
+
+    #[test]
+    fn terminal_footer_supports_whitespace_crlf_and_multiple_checkouts() {
+        let heading = "**Checkout path (copy for VS Code):**";
+        let first = format!(
+            "{heading}\r\n\r\n```bash\r\n/Users/example/Repos/first\r\n```\r\n\r\n**Branch:** `feat/one`"
+        );
+        let second = format!(
+            "{heading}\n\n```bash\n/Users/example/Repos/second\n```\n\n**Branch:** `feat/two`"
+        );
+        let markdown = format!("All checks passed.\n\n{first}\n \n{second}\n  ");
+        assert_eq!(markdown_to_spoken_text(&markdown), "All checks passed.");
+    }
+
+    #[test]
+    fn paths_and_code_in_the_body_remain_spoken_without_complete_footer() {
+        let samples = [
+            "Run `git switch feat/fix` inside `/Users/example/Repos/code`.",
+            "**Checkout path (copy for VS Code):**\n\n```bash\n/Users/example/Repos/code\n```",
+            "**Checkout path (copy for VS Code):**\n\n```bash\n/Users/example/Repos/code\n```\n\n**Branch:** `feat/fix`\n\nThis is an explanation after the footer.",
+            "**Checkout path (copy for VS Code):**\n\n```bash\nrelative/path\n```\n\n**Branch:** `feat/fix`",
+            "**Checkout path (copy for VS Code):**\n\n```bash\n/Users/example/Repos/code\n```\n\n**Branch:** feat/fix",
+        ];
+        for markdown in samples {
+            assert_eq!(
+                super::spoken_markdown_without_checkout_footers(markdown),
+                markdown,
+                "ordinary Markdown must not be stripped: {markdown:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn footer_example_inside_outer_code_fence_is_still_spoken() {
+        let markdown = "Example:\n\n~~~~text\n**Checkout path (copy for VS Code):**\n\n```bash\n/Users/example/Repos/demo\n```\n\n**Branch:** `feat/demo`\n~~~~";
+        assert_eq!(
+            super::spoken_markdown_without_checkout_footers(markdown),
+            markdown
+        );
+        assert!(markdown_to_spoken_text(markdown).contains("/Users/example/Repos/demo"));
+    }
+
+    #[test]
+    fn footer_only_message_has_no_speech_but_is_preserved_visually() {
+        let markdown = "**Checkout path (copy for VS Code):**\n\n```bash\n/Users/example/Repos/code\n```\n\n**Branch:** `detached HEAD`";
+        assert_eq!(markdown_to_spoken_text(markdown), "");
+        assert!(super::should_narrate_visible_agent_message(
+            true, false, markdown
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_later_completed_footer_is_filtered_while_earlier_speech_is_playing() {
+        use std::sync::Mutex;
+
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let spoken = Arc::new(Mutex::new(Vec::new()));
+        let speaking = Arc::new(tokio::sync::Notify::new());
+        let resume = Arc::new(tokio::sync::Notify::new());
+        let worker = tokio::spawn(drain_speech_queue(receiver, {
+            let spoken = Arc::clone(&spoken);
+            let speaking = Arc::clone(&speaking);
+            let resume = Arc::clone(&resume);
+            move |message| {
+                let spoken = Arc::clone(&spoken);
+                let speaking = Arc::clone(&speaking);
+                let resume = Arc::clone(&resume);
+                async move {
+                    if message == "First complete message." {
+                        speaking.notify_one();
+                        resume.notified().await;
+                    }
+                    spoken.lock().unwrap().push(message);
+                    Ok(())
+                }
+            }
+        }));
+
+        sender
+            .send(markdown_to_spoken_text("First complete message."))
+            .unwrap();
+        speaking.notified().await;
+        let second = "Zweite abgeschlossene Nachricht.\n\n**Checkout path (copy for VS Code):**\n\n```bash\n/Users/example/Repos/code\n```\n\n**Branch:** `feat/foo`";
+        sender.send(markdown_to_spoken_text(second)).unwrap();
+        assert!(spoken.lock().unwrap().is_empty());
+        resume.notify_one();
+        drop(sender);
+        worker.await.unwrap();
+        assert_eq!(
+            *spoken.lock().unwrap(),
+            [
+                "First complete message.",
+                "Zweite abgeschlossene Nachricht."
+            ]
         );
     }
 

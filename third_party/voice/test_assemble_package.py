@@ -75,6 +75,49 @@ class AssembleTests(unittest.TestCase):
         (root / "runtime.json").write_text(json.dumps(manifest))
         return root, manifest
 
+    def test_macos_word_position_helper_is_copied_and_hashed(self):
+        target = "aarch64-apple-darwin"
+        self.metadata["target"] = target
+        (self.package / "codex-package.json").write_text(json.dumps(self.metadata))
+        runtime, _ = self.make_runtime(target, "plugins/libgst{}.dylib")
+        word_helper = self.root / "codex-voice-speech-helper"
+        word_helper.write_bytes(b"native signed speech executable")
+        word_helper.chmod(0o755)
+
+        assemble(
+            self.package,
+            self.helper,
+            target,
+            self.commit,
+            self.output,
+            runtime=runtime,
+            speech_helper=word_helper,
+        )
+        relative = "codex-resources/voice/bin/codex-voice-speech-helper"
+        output_helper = self.output / relative
+        self.assertEqual(output_helper.read_bytes(), word_helper.read_bytes())
+        manifest = json.loads(
+            (self.output / "codex-resources/voice/manifest.json").read_text()
+        )
+        self.assertEqual(manifest["sha256"][relative], digest(word_helper))
+
+    def test_word_position_helper_is_rejected_for_linux(self):
+        target = "aarch64-unknown-linux-gnu"
+        self.metadata["target"] = target
+        (self.package / "codex-package.json").write_text(json.dumps(self.metadata))
+        runtime, _ = self.make_runtime(target)
+        with self.assertRaisesRegex(ValueError, "macOS-only"):
+            assemble(
+                self.package,
+                self.helper,
+                target,
+                self.commit,
+                self.output,
+                runtime=runtime,
+                speech_helper=self.helper,
+            )
+        self.assertFalse(self.output.exists())
+
     def test_cli_packages_each_runtime_layout_without_changing_bytes(self):
         for target, plugin in (
             ("aarch64-unknown-linux-gnu", "lib/gstreamer-1.0/libgst{}.so"),

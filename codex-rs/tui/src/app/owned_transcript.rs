@@ -268,6 +268,10 @@ impl App {
         };
         let now = Instant::now();
         let turn_tip = self.turn_tip(transcript_width, now, frames);
+        #[cfg(target_os = "macos")]
+        {
+            self.transcript_view.spoken_line = self.chat_widget.spoken_line_highlight();
+        }
         let view = &mut self.transcript_view;
         view.sync_history_tail(&self.transcript_cells);
         view.prepare_width(transcript_width);
