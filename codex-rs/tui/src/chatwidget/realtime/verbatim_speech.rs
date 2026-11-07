@@ -73,6 +73,40 @@ pub(crate) fn enabled() -> bool {
     std::env::var("CODEX_REALTIME_VERBATIM_SPEECH").is_ok_and(|value| value == "1")
 }
 
+/// Chezmoi creates this file on first apply. Missing or invalid configuration
+/// does not prevent voice playback on a machine that has not been provisioned.
+const DEFAULT_SPEECH_RATE_MULTIPLIER: f32 = 1.8;
+
+fn speech_rate_multiplier_from_json(json: &str) -> Option<f32> {
+    let config: serde_json::Value = serde_json::from_str(json).ok()?;
+    let rate = config.get("speech_rate")?.as_f64()?;
+    (0.5..=2.0).contains(&rate).then_some(rate as f32)
+}
+
+fn speech_rate_multiplier_from_path(path: &std::path::Path) -> f32 {
+    match std::fs::read_to_string(path) {
+        Ok(json) => speech_rate_multiplier_from_json(&json).unwrap_or_else(|| {
+            tracing::warn!(path = %path.display(), "invalid Codex Voice speech rate; using default");
+            DEFAULT_SPEECH_RATE_MULTIPLIER
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            DEFAULT_SPEECH_RATE_MULTIPLIER
+        }
+        Err(error) => {
+            tracing::warn!(path = %path.display(), %error, "cannot read Codex Voice speech rate; using default");
+            DEFAULT_SPEECH_RATE_MULTIPLIER
+        }
+    }
+}
+
+fn configured_speech_rate_multiplier() -> f32 {
+    let Some(home) = std::env::var_os("HOME") else {
+        return DEFAULT_SPEECH_RATE_MULTIPLIER;
+    };
+    let path = std::path::PathBuf::from(home).join(".config/codex-voice/config.json");
+    speech_rate_multiplier_from_path(&path)
+}
+
 /// Convert Markdown presentation into the same ordered words for the speech engine.
 /// The original Markdown remains unchanged in the chat history.
 fn markdown_to_spoken_text(markdown: &str) -> String {
@@ -234,6 +268,9 @@ fn speak_spoken_text_blocking(
             tracing::warn!("macOS speech voice {voice} was unavailable; using system default");
         }
     }
+    // Set the per-voice rate *before* starting each utterance. Changing
+    // NSSpeechSynthesizer.rate during an utterance has no audible effect.
+    synthesizer.setRate(synthesizer.rate() * configured_speech_rate_multiplier());
     if !synthesizer.startSpeakingString(&NSString::from_str(&spoken)) {
         return Err(std::io::Error::other(
             "macOS speech synthesizer could not start",
@@ -429,6 +466,49 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use std::sync::atomic::AtomicU64;
     use std::sync::atomic::Ordering;
+
+    #[test]
+    fn voice_speed_configuration_uses_valid_json_and_rejects_bad_rates() {
+        use super::speech_rate_multiplier_from_json;
+        assert!(
+            (speech_rate_multiplier_from_json(r#"{"speech_rate":1.8}"#).unwrap() - 1.8).abs()
+                < 0.0001
+        );
+        assert_eq!(
+            speech_rate_multiplier_from_json(r#"{"speech_rate":0.5}"#),
+            Some(0.5)
+        );
+        assert_eq!(
+            speech_rate_multiplier_from_json(r#"{"speech_rate":2.0}"#),
+            Some(2.0)
+        );
+        for invalid in [
+            "",
+            "not JSON",
+            r#"{}"#,
+            r#"{"speech_rate":"fast"}"#,
+            r#"{"speech_rate":0.1}"#,
+            r#"{"speech_rate":3.0}"#,
+            r#"{"speech_rate":null}"#,
+        ] {
+            assert_eq!(speech_rate_multiplier_from_json(invalid), None);
+        }
+    }
+
+    #[test]
+    fn rate_file_is_reread_for_each_utterance_and_missing_file_is_safe() {
+        let folder = tempfile::tempdir().unwrap();
+        let config = folder.path().join("config.json");
+        assert_eq!(super::speech_rate_multiplier_from_path(&config), 1.8);
+        std::fs::write(&config, r#"{"speech_rate":1.4}"#).unwrap();
+        assert!((super::speech_rate_multiplier_from_path(&config) - 1.4).abs() < 0.0001);
+        std::fs::write(&config, r#"{"speech_rate":2.0}"#).unwrap();
+        assert_eq!(super::speech_rate_multiplier_from_path(&config), 2.0);
+        std::fs::write(&config, r#"{"speech_rate":0}"#).unwrap();
+        assert_eq!(super::speech_rate_multiplier_from_path(&config), 1.8);
+        std::fs::remove_file(&config).unwrap();
+        assert_eq!(super::speech_rate_multiplier_from_path(&config), 1.8);
+    }
 
     #[test]
     fn german_premium_voice_outranks_compact_and_enhanced() {
