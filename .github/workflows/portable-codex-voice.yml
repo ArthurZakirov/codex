@@ -138,6 +138,13 @@ jobs:
           # These are unsigned personal preview builds, not Apple-notarized releases.
           codesign --force --sign - --timestamp=none \
             "$RUNNER_TEMP/voice-input/codex-voice-host"
+      - name: Build native word-position speech helper
+        shell: bash
+        run: |
+          set -euo pipefail
+          swiftc -suppress-warnings -O -target arm64-apple-macos14.0 -framework AppKit codex-rs/tui/native/voice_speech_helper.swift -o "$RUNNER_TEMP/voice-input/codex-voice-speech-helper"
+          test -x "$RUNNER_TEMP/voice-input/codex-voice-speech-helper"
+          codesign --force --sign - --timestamp=none "$RUNNER_TEMP/voice-input/codex-voice-speech-helper"
       - name: Assemble and verify relocatable voice package
         shell: bash
         env:
@@ -147,6 +154,7 @@ jobs:
           python3 third_party/voice/assemble_package.py \
             --package "$RUNNER_TEMP/standard-package" \
             --helper "$RUNNER_TEMP/voice-input/codex-voice-host" \
+            --speech-helper "$RUNNER_TEMP/voice-input/codex-voice-speech-helper" \
             --voice-target "$TARGET" --build-commit "$GITHUB_SHA" \
             --release-version "$VOICE_VERSION" \
             --runtime "$RUNNER_TEMP/voice-input/runtime" \

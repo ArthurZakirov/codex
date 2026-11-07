@@ -1361,3 +1361,76 @@ fn spoken_prompt_selection_keeps_its_fallback_contrast() {
         },
     );
 }
+
+#[test]
+fn spoken_position_maps_wrapped_markdown_and_code() {
+    use super::spoken_word_display_offset;
+    use crate::history_cell::AgentMarkdownCell;
+    let markdown = "**Hallo**, die erste Zeile umbricht wegen des schmalen Fensters.\n\n```bash\ngit status\n```\n\nNoch eine zweite Zeile.";
+    let spoken = "Hallo, die erste Zeile umbricht wegen des schmalen Fensters.\ngit status\nNoch eine zweite Zeile.";
+    let cell = AgentMarkdownCell::new(markdown.to_owned(), std::path::Path::new("/tmp"));
+    let layout = TextLayout::new(cell.display_hyperlink_lines(26), 26);
+    for term in ["erste", "Fensters", "git", "status", "zweite"] {
+        let start = spoken.find(term).unwrap();
+        let utf16_offset = spoken[..start].encode_utf16().count();
+        let rendered_offset = spoken_word_display_offset(spoken, layout.text(), utf16_offset)
+            .unwrap_or_else(|| panic!("mapping failed for {term}: {:?}", layout.text()));
+        assert!(layout.text()[rendered_offset..].starts_with(term));
+    }
+    let first = spoken.find("erste").unwrap();
+    let last = spoken.find("zweite").unwrap();
+    let first_row = layout.row_for_offset(
+        spoken_word_display_offset(
+            spoken,
+            layout.text(),
+            spoken[..first].encode_utf16().count(),
+        )
+        .unwrap(),
+    );
+    let last_row = layout.row_for_offset(
+        spoken_word_display_offset(spoken, layout.text(), spoken[..last].encode_utf16().count())
+            .unwrap(),
+    );
+    assert!(last_row > first_row);
+}
+
+#[test]
+fn spoken_line_background_preserves_foreground_and_scroll() {
+    use super::SpokenLine;
+    use crate::history_cell::AgentMarkdownCell;
+    let markdown = "**Hallo** welt. Noch ein längerer Satz. Zeile zwei.".to_string();
+    let spoken = "Hallo welt. Noch ein längerer Satz. Zeile zwei.".to_string();
+    let cells: Vec<Arc<dyn HistoryCell>> = vec![
+        cell("An earlier message"),
+        Arc::new(AgentMarkdownCell::new(
+            markdown.clone(),
+            std::path::Path::new("/tmp"),
+        )),
+        cell("A later message"),
+    ];
+    let mut view = TranscriptView::default();
+    let before = render(&mut view, &cells, 40, 12);
+    let previous_position = view.position;
+    let offset = spoken.find("Zeile").unwrap();
+    view.spoken_line = Some(SpokenLine {
+        markdown: Arc::from(markdown),
+        spoken: Arc::from(spoken.as_str()),
+        utf16_start: spoken[..offset].encode_utf16().count(),
+    });
+    let after = render(&mut view, &cells, 40, 12);
+    assert_eq!(view.position, previous_position);
+    let mut backgrounds = 0;
+    for y in before.area.top()..before.area.bottom() {
+        for x in before.area.left()..before.area.right() {
+            assert_eq!(before[(x, y)].symbol(), after[(x, y)].symbol());
+            assert_eq!(before[(x, y)].fg, after[(x, y)].fg);
+            if after[(x, y)].bg == ratatui::style::Color::DarkGray {
+                backgrounds += 1;
+            }
+        }
+    }
+    assert!(backgrounds > 0);
+    view.spoken_line = None;
+    let cleared = render(&mut view, &cells, 40, 12);
+    assert_eq!(before, cleared);
+}

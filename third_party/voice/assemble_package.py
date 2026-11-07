@@ -23,6 +23,7 @@ def assemble(
     *,
     runtime: Path,
     release_version: str | None = None,
+    speech_helper: Path | None = None,
 ):
     package, helper = package.resolve(strict=True), helper.resolve(strict=True)
     output = output.absolute()
@@ -103,6 +104,15 @@ def assemble(
         destination = output / relative_helper
         destination.parent.mkdir(parents=True)
         shutil.copy2(helper, destination)
+        relative_speech_helper = None
+        if speech_helper is not None:
+            if not voice_target.endswith("apple-darwin"):
+                raise ValueError("speech helper is macOS-only")
+            speech_helper = speech_helper.resolve(strict=True)
+            if not speech_helper.is_file() or not speech_helper.stat().st_mode & 0o111:
+                raise ValueError("speech helper must be an executable file")
+            relative_speech_helper = "codex-resources/voice/bin/codex-voice-speech-helper"
+            shutil.copy2(speech_helper, output / relative_speech_helper)
         for relative, expected_digest in inputs.items():
             copied = output / "codex-resources/voice" / relative
             copied.parent.mkdir(parents=True, exist_ok=True)
@@ -128,7 +138,7 @@ def assemble(
                 shutil.copy2(source_dir / relative, destination_file)
                 inputs[relative] = digest(destination_file)
         digests = {}
-        for relative in (entrypoint, relative_helper):
+        for relative in (entrypoint, relative_helper, *((relative_speech_helper,) if relative_speech_helper else ())):
             with (output / relative).open("rb") as source:
                 digests[relative] = hashlib.file_digest(source, "sha256").hexdigest()
         digests.update(
@@ -154,6 +164,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--package", type=Path, required=True)
     parser.add_argument("--helper", type=Path, required=True)
+    parser.add_argument("--speech-helper", type=Path)
     parser.add_argument("--voice-target", required=True)
     parser.add_argument("--build-commit", required=True)
     parser.add_argument(
@@ -175,4 +186,5 @@ if __name__ == "__main__":
         args.output,
         runtime=args.runtime,
         release_version=args.release_version,
+        speech_helper=args.speech_helper,
     )

@@ -189,7 +189,11 @@ pub(super) struct RealtimeConversationUiState {
     #[cfg(target_os = "macos")]
     verbatim_speech_task: Option<tokio::task::JoinHandle<()>>,
     #[cfg(target_os = "macos")]
-    verbatim_speech_sender: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+    verbatim_speech_sender:
+        Option<tokio::sync::mpsc::UnboundedSender<verbatim_speech::SpeechQueueItem>>,
+    #[cfg(target_os = "macos")]
+    spoken_line_progress:
+        std::sync::Arc<std::sync::Mutex<Option<crate::transcript_view::SpokenLine>>>,
     #[cfg(target_os = "macos")]
     verbatim_speech_control: Option<verbatim_speech::SpeechPlaybackControl>,
     #[cfg(target_os = "macos")]
