@@ -23,7 +23,11 @@ mod snapshot;
 mod text;
 mod turn_tip;
 
+use crate::history_cell::AgentMarkdownCell;
+use ratatui::style::{Color, Style};
+use std::ops::Range;
 use std::sync::Arc;
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::chatwidget::ActiveCellTranscriptKey;
 use crate::history_cell::HistoryCell;
@@ -79,6 +83,79 @@ enum Position {
     Reading(Anchor),
 }
 
+/// A word-position report tied to one exact completed assistant message.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SpokenLine {
+    pub(crate) markdown: Arc<str>,
+    pub(crate) spoken: Arc<str>,
+    pub(crate) utf16_start: usize,
+    pub(crate) utf16_len: usize,
+}
+
+/// Resolve an AppKit UTF-16 callback boundary to a Rust UTF-8 byte boundary.
+/// An offset in the middle of a surrogate pair is deliberately rejected.
+fn utf16_byte_offset(text: &str, target: usize) -> Option<usize> {
+    let mut utf16 = 0usize;
+    for (offset, ch) in text.char_indices() {
+        if utf16 == target {
+            return Some(offset);
+        }
+        utf16 += ch.len_utf16();
+    }
+    (utf16 == target).then_some(text.len())
+}
+
+/// The speech callback reports UTF-16 offsets in spoken text. Match actual
+/// lexical tokens in the rendered transcript, ignoring Markdown decoration
+/// while refusing to invent a position when the token order diverges.
+fn spoken_word_display_offset(spoken: &str, display: &str, utf16_start: usize) -> Option<usize> {
+    let target = utf16_byte_offset(spoken, utf16_start)?;
+    let words: Vec<_> = spoken.unicode_word_indices().collect();
+    let target_word = words
+        .iter()
+        .position(|(start, word)| *start <= target && target < start + word.len())?;
+    let visible: Vec<_> = display.unicode_word_indices().collect();
+    let mut cursor = 0usize;
+    for (index, (_, expected)) in words.iter().enumerate() {
+        // Permit a small amount of rendered-only text, e.g. code language labels.
+        let found = visible
+            .iter()
+            .enumerate()
+            .skip(cursor)
+            .take(4)
+            .find(|(_, (_, actual))| actual.to_lowercase() == expected.to_lowercase())?;
+        cursor = found.0 + 1;
+        if index == target_word {
+            return Some(found.1.0);
+        }
+    }
+    None
+}
+
+/// Prefer the exact visible word only when the native callback length identifies
+/// the same lexical token. A mismatch falls back to the already located line.
+fn spoken_word_display_range(
+    spoken: &str,
+    display: &str,
+    utf16_start: usize,
+    utf16_len: usize,
+    display_start: usize,
+) -> Option<Range<usize>> {
+    if utf16_len == 0 {
+        return None;
+    }
+    let start = utf16_byte_offset(spoken, utf16_start)?;
+    let end = utf16_byte_offset(spoken, utf16_start.checked_add(utf16_len)?)?;
+    let mut spoken_words = spoken.get(start..end)?.unicode_words();
+    let spoken_word = spoken_words.next()?;
+    if spoken_words.next().is_some() {
+        return None;
+    }
+    let visible_word = display.get(display_start..)?.unicode_words().next()?;
+    (spoken_word.to_lowercase() == visible_word.to_lowercase())
+        .then_some(display_start..display_start + visible_word.len())
+}
+
 struct VisibleRow {
     index: usize,
     row: usize,
@@ -118,6 +195,7 @@ pub(crate) struct TranscriptView {
     mode: HistoryRenderMode,
     pub(crate) history: TranscriptHistoryState,
     highlight: Option<usize>,
+    pub(crate) spoken_line: Option<SpokenLine>,
     saved_position: Option<Position>,
     unseen_activity: bool,
     tail_visible: bool,
@@ -158,6 +236,7 @@ impl Default for TranscriptView {
             mode: HistoryRenderMode::Rich,
             history: TranscriptHistoryState::Idle,
             highlight: None,
+            spoken_line: None,
             saved_position: None,
             unseen_activity: false,
             tail_visible: true,
@@ -248,6 +327,43 @@ impl TranscriptView {
             }
         }
         let area = body;
+        // Resolve the narrated word to a wrapped row once per frame. Repeating
+        // the Markdown/token search for every painted row would be expensive
+        // for long messages and large transcripts.
+        let spoken_highlight = if self.selection.is_none()
+            && self.highlight.is_none()
+            && !self.search.is_active()
+        {
+            self.spoken_line.clone().and_then(|progress| {
+                let mut matches = cells.iter().enumerate().filter_map(|(index, cell)| {
+                    cell.as_any()
+                        .downcast_ref::<AgentMarkdownCell>()
+                        .filter(|message| message.markdown_source() == progress.markdown.as_ref())
+                        .map(|_| index)
+                });
+                let target = matches.next()?;
+                if matches.next().is_some() {
+                    // Identical messages cannot be disambiguated from text alone.
+                    return None;
+                }
+                let layout = self.layout(cells, target)?;
+                let offset = spoken_word_display_offset(
+                    &progress.spoken,
+                    layout.text(),
+                    progress.utf16_start,
+                )?;
+                let word_range = spoken_word_display_range(
+                    &progress.spoken,
+                    layout.text(),
+                    progress.utf16_start,
+                    progress.utf16_len,
+                    offset,
+                );
+                Some((target, layout.row_for_offset(offset), word_range))
+            })
+        } else {
+            None
+        };
         let (mut index, mut row) = start;
         let mut entry_activity_ids: Option<(usize, Arc<[String]>)> = None;
         for y in area.top()..area.bottom() {
@@ -277,6 +393,18 @@ impl TranscriptView {
             };
             let row_area = Rect::new(area.x, y, area.width, /*height*/ 1);
             layout.render(row_area, buf, row);
+            // Only the spoken word receives a background. If its callback span
+            // cannot be mapped confidently, highlight the resolved line instead.
+            // Existing foreground colors and text remain untouched.
+            if let Some((target, fallback_row, word_range)) = &spoken_highlight
+                && *target == index
+            {
+                if let Some(range) = word_range {
+                    layout.paint_spoken_word(range.clone(), row_area, buf, row);
+                } else if *fallback_row == row {
+                    buf.set_style(row_area, Style::default().bg(Color::DarkGray));
+                }
+            }
             self.render_disclosure(&activity_ids, &layout, row, row_area, buf);
             if self.highlight == Some(index) && self.selection.is_none() && !self.search.is_active()
             {
