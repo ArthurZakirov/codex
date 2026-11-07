@@ -75,6 +75,19 @@ class AssembleTests(unittest.TestCase):
         (root / "runtime.json").write_text(json.dumps(manifest))
         return root, manifest
 
+    def test_tool_sidecars_and_ripgrep_are_included_in_integrity_manifest(self):
+        relatives = ("bin/codex-code-mode-host", "bin/codex-exec-server", "codex-path/rg")
+        for relative in relatives:
+            (self.package / relative).write_bytes(b"packaged tool")
+        runtime, _ = self.make_runtime()
+
+        assemble(self.package, self.helper, "aarch64-unknown-linux-gnu", self.commit,
+                 self.output, runtime=runtime)
+
+        manifest = json.loads((self.output / "codex-resources/voice/manifest.json").read_text())
+        for relative in relatives:
+            self.assertEqual(manifest["sha256"][relative], digest(self.output / relative))
+
     def test_macos_word_position_helper_is_copied_and_hashed(self):
         target = "aarch64-apple-darwin"
         self.metadata["target"] = target

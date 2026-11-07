@@ -172,6 +172,9 @@ jobs:
           assert manifest["appTarget"] == target
           assert (voice / "bin/codex-voice-host").is_file()
           PY
+          # Exercise the exact assembled package, including both tool sidecars.
+          python3 -m pip install 'pydantic>=2.12,<3' 'packaging>=26.2' 'pytest>=8' 'zstandard>=0.23'
+          python3 scripts/codex_package/smoke_tests/verify_voice_package.py "$RUNNER_TEMP/voice-package"
           # The helper needs its sibling ../lib runtime to resolve libffi at startup.
           # Verify the installed layout, not the unpackaged Bazel executable.
           [[ "$("$RUNNER_TEMP/voice-package/codex-resources/voice/bin/codex-voice-host" --build-commit)" == "$GITHUB_SHA" ]]
