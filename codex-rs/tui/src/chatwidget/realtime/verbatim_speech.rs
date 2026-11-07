@@ -2,6 +2,13 @@
 //! The realtime model still handles listening and delegation, but never rewrites speech.
 
 use super::*;
+use crate::transcript_view::SpokenLine;
+use crate::tui::FrameRequester;
+use base64::Engine as _;
+use std::process::Stdio;
+use std::sync::Mutex;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
 use objc2_app_kit::NSSpeechBoundary;
 #[allow(deprecated)]
 use objc2_app_kit::NSSpeechSynthesizer;
@@ -59,6 +66,132 @@ fn speech_should_stop(
 ) -> bool {
     cancelled.load(Ordering::Acquire)
         || interruption_generation.load(Ordering::Acquire) != utterance_generation
+}
+
+pub(super) struct SpeechQueueItem {
+    markdown: String,
+    spoken: String,
+}
+
+struct SpokenHighlightGuard {
+    position: Arc<Mutex<Option<SpokenLine>>>,
+    frames: FrameRequester,
+}
+
+impl Drop for SpokenHighlightGuard {
+    fn drop(&mut self) {
+        *self.position.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        self.frames.schedule_frame();
+    }
+}
+
+fn speech_helper_path() -> Option<std::path::PathBuf> {
+    if let Some(override_path) = std::env::var_os("CODEX_VOICE_SPEECH_HELPER") {
+        let path = std::path::PathBuf::from(override_path);
+        return path.is_file().then_some(path);
+    }
+    let path = std::env::current_exe()
+        .ok()?
+        .parent()?
+        .parent()?
+        .join("codex-resources/voice/bin/codex-voice-speech-helper");
+    path.is_file().then_some(path)
+}
+
+/// The small Swift worker runs AppKit on its own main thread and emits real
+/// NSSpeechSynthesizer word callbacks. No synthesized timestamp is substituted.
+async fn speak_with_word_positions(
+    item: SpeechQueueItem,
+    mut pause_rx: tokio::sync::watch::Receiver<bool>,
+    active: Arc<AtomicBool>,
+    cancelled: Arc<AtomicBool>,
+    interruption_generation: Arc<AtomicU64>,
+    position: Arc<Mutex<Option<SpokenLine>>>,
+    frames: FrameRequester,
+    helper: std::path::PathBuf,
+) -> std::io::Result<()> {
+    let generation = interruption_generation.load(Ordering::Acquire);
+    if speech_should_stop(&cancelled, &interruption_generation, generation) {
+        return Ok(());
+    }
+    let _highlight_guard = SpokenHighlightGuard {
+        position: Arc::clone(&position),
+        frames: frames.clone(),
+    };
+    let voice = choose_speech_voice(detect_speech_language(&item.spoken)).unwrap_or_default();
+    let mut child = tokio::process::Command::new(helper)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| std::io::Error::other("speech helper stdin unavailable"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| std::io::Error::other("speech helper stdout unavailable"))?;
+    let mut words = BufReader::new(stdout).lines();
+    let markdown_source: Arc<str> = Arc::from(item.markdown.as_str());
+    let spoken_source: Arc<str> = Arc::from(item.spoken.as_str());
+    let payload = base64::engine::general_purpose::STANDARD.encode(item.spoken.as_bytes());
+    stdin
+        .write_all(format!("SPEAK\t{payload}\t{voice}\n").as_bytes())
+        .await?;
+    stdin.flush().await?;
+    active.store(true, Ordering::Release);
+    let _active_guard = ActiveSpeechGuard(active);
+    let mut paused = false;
+    let result = loop {
+        tokio::select! {
+            line = words.next_line() => {
+                let line = match line? {
+                    Some(line) => line,
+                    None => break Err(std::io::Error::other("speech helper closed without completion")),
+                };
+                if let Some(position_text) = line.strip_prefix("WORD\t") {
+                    let mut parts = position_text.split('\t');
+                    if let (Some(start), Some(_len)) = (parts.next(), parts.next())
+                        && let Ok(utf16_start) = start.parse::<usize>()
+                    {
+                        *position.lock().unwrap_or_else(|e| e.into_inner()) =
+                            Some(SpokenLine {
+                                markdown: Arc::clone(&markdown_source),
+                                spoken: Arc::clone(&spoken_source),
+                                utf16_start,
+                            });
+                        frames.schedule_frame();
+                    }
+                } else if line == "DONE\ttrue" {
+                    break Ok(());
+                } else if let Some(warning) = line.strip_prefix("WARN\t") {
+                    tracing::warn!("macOS word-position speech helper: {warning}");
+                } else if let Some(error) = line.strip_prefix("ERROR\t") {
+                    break Err(std::io::Error::other(error.to_string()));
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_millis(20)) => {
+                if speech_should_stop(&cancelled, &interruption_generation, generation) {
+                    let _ = stdin.write_all(b"STOP\n").await;
+                    break Ok(());
+                }
+                let requested_pause = *pause_rx.borrow_and_update();
+                if paused != requested_pause {
+                    stdin.write_all(if requested_pause { b"PAUSE\n" } else { b"RESUME\n" }).await?;
+                    stdin.flush().await?;
+                    paused = requested_pause;
+                }
+            }
+        }
+    };
+    // Killing an interrupted utterance cannot block the following FIFO item.
+    if result.is_err() {
+        let _ = child.start_kill();
+    }
+    let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+    result
 }
 
 struct ActiveSpeechGuard(Arc<AtomicBool>);
@@ -381,11 +514,11 @@ async fn speak_spoken_text(
 
 /// A single consumer ensures FIFO playback and prevents later messages from
 /// interrupting an earlier one even when the agent emits them rapidly.
-async fn drain_speech_queue<F, Fut>(
-    mut receiver: tokio::sync::mpsc::UnboundedReceiver<String>,
+async fn drain_speech_queue<F, Fut, T>(
+    mut receiver: tokio::sync::mpsc::UnboundedReceiver<T>,
     mut synthesize: F,
 ) where
-    F: FnMut(String) -> Fut,
+    F: FnMut(T) -> Fut,
     Fut: std::future::Future<Output = std::io::Result<()>>,
 {
     while let Some(spoken) = receiver.recv().await {
@@ -396,6 +529,14 @@ async fn drain_speech_queue<F, Fut>(
 }
 
 impl ChatWidget {
+    pub(crate) fn spoken_line_highlight(&self) -> Option<SpokenLine> {
+        self.realtime_conversation
+            .spoken_line_progress
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
     pub(crate) fn realtime_verbatim_speech_enabled(&self) -> bool {
         enabled()
     }
@@ -420,11 +561,23 @@ impl ChatWidget {
     pub(crate) fn interrupt_current_verbatim_speech(&mut self) {
         if let Some(control) = self.realtime_conversation.verbatim_speech_control.as_ref() {
             control.interrupt_current();
+            *self
+                .realtime_conversation
+                .spoken_line_progress
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = None;
+            self.frame_requester.schedule_frame();
         }
     }
 
     /// End the entire voice session, including its queued narrations.
     pub(crate) fn cancel_verbatim_speech(&mut self) {
+        *self
+            .realtime_conversation
+            .spoken_line_progress
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+        self.frame_requester.schedule_frame();
         self.realtime_conversation.verbatim_speech_sender.take();
         if let Some(control) = self.realtime_conversation.verbatim_speech_control.take() {
             control.cancel();
@@ -475,13 +628,21 @@ impl ChatWidget {
             return Ok(());
         }
         if let Some(sender) = &self.realtime_conversation.verbatim_speech_sender
-            && sender.send(spoken.clone()).is_ok()
+            && sender
+                .send(SpeechQueueItem {
+                    markdown: markdown.to_owned(),
+                    spoken: spoken.clone(),
+                })
+                .is_ok()
         {
             return Ok(());
         }
-        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel::<SpeechQueueItem>();
         sender
-            .send(spoken)
+            .send(SpeechQueueItem {
+                markdown: markdown.to_owned(),
+                spoken,
+            })
             .map_err(|_| std::io::Error::other("Unable to queue macOS speech"))?;
         let (pause_sender, pause_receiver) = tokio::sync::watch::channel(false);
         let active = Arc::new(AtomicBool::new(false));
@@ -494,18 +655,38 @@ impl ChatWidget {
             cancelled: Arc::clone(&cancelled),
             interruption_generation: Arc::clone(&interruption_generation),
         });
+        let progress = Arc::clone(&self.realtime_conversation.spoken_line_progress);
+        let frames = self.frame_requester.clone();
         self.realtime_conversation.verbatim_speech_task =
-            Some(tokio::spawn(drain_speech_queue(receiver, move |spoken| {
+            Some(tokio::spawn(drain_speech_queue(receiver, move |item| {
                 // Each new spoken item starts unpaused. All queued items retain
                 // their original FIFO order during an earlier item's pause.
                 pause_sender.send_replace(false);
-                speak_spoken_text(
-                    spoken,
-                    pause_receiver.clone(),
-                    Arc::clone(&active),
-                    Arc::clone(&cancelled),
-                    Arc::clone(&interruption_generation),
-                )
+                let pause_rx = pause_receiver.clone();
+                let active = Arc::clone(&active);
+                let cancelled = Arc::clone(&cancelled);
+                let interrupted = Arc::clone(&interruption_generation);
+                let progress = Arc::clone(&progress);
+                let frames = frames.clone();
+                async move {
+                    if let Some(helper) = speech_helper_path() {
+                        speak_with_word_positions(
+                            item,
+                            pause_rx,
+                            active,
+                            cancelled,
+                            interrupted,
+                            progress,
+                            frames,
+                            helper,
+                        )
+                        .await
+                    } else {
+                        // Preserve old voice behavior for a plain development build.
+                        speak_spoken_text(item.spoken, pause_rx, active, cancelled, interrupted)
+                            .await
+                    }
+                }
             })));
         Ok(())
     }

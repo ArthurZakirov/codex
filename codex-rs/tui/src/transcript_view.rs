@@ -23,7 +23,10 @@ mod snapshot;
 mod text;
 mod turn_tip;
 
+use crate::history_cell::AgentMarkdownCell;
+use ratatui::style::{Color, Style};
 use std::sync::Arc;
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::chatwidget::ActiveCellTranscriptKey;
 use crate::history_cell::HistoryCell;
@@ -79,6 +82,53 @@ enum Position {
     Reading(Anchor),
 }
 
+/// A word-position report tied to one exact completed assistant message.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SpokenLine {
+    pub(crate) markdown: Arc<str>,
+    pub(crate) spoken: Arc<str>,
+    pub(crate) utf16_start: usize,
+}
+
+/// The speech callback reports UTF-16 offsets in spoken text. Match actual
+/// lexical tokens in the rendered transcript, ignoring Markdown decoration
+/// while refusing to invent a position when the token order diverges.
+fn spoken_word_display_offset(spoken: &str, display: &str, utf16_start: usize) -> Option<usize> {
+    let mut utf16 = 0usize;
+    let mut byte = None;
+    for (offset, ch) in spoken.char_indices() {
+        if utf16 == utf16_start {
+            byte = Some(offset);
+            break;
+        }
+        utf16 += ch.len_utf16();
+    }
+    if utf16 == utf16_start {
+        byte.get_or_insert(spoken.len());
+    }
+    let target = byte?;
+    let words: Vec<_> = spoken.unicode_word_indices().collect();
+    let target_word = words
+        .iter()
+        .position(|(start, word)| *start <= target && target <= start + word.len())?;
+    let visible: Vec<_> = display.unicode_word_indices().collect();
+    let mut cursor = 0usize;
+    for (index, (_, expected)) in words.iter().enumerate() {
+        // Permit a small amount of rendered-only text, e.g. code language labels.
+        let found = visible
+            .iter()
+            .enumerate()
+            .skip(cursor)
+            .take(4)
+            .find(|(_, (_, actual))| actual.to_lowercase() == expected.to_lowercase())?;
+        cursor = found.0 + 1;
+        if index == target_word {
+            return Some(found.1.0);
+        }
+    }
+    None
+}
+
 struct VisibleRow {
     index: usize,
     row: usize,
@@ -118,6 +168,7 @@ pub(crate) struct TranscriptView {
     mode: HistoryRenderMode,
     pub(crate) history: TranscriptHistoryState,
     highlight: Option<usize>,
+    pub(crate) spoken_line: Option<SpokenLine>,
     saved_position: Option<Position>,
     unseen_activity: bool,
     tail_visible: bool,
@@ -158,6 +209,7 @@ impl Default for TranscriptView {
             mode: HistoryRenderMode::Rich,
             history: TranscriptHistoryState::Idle,
             highlight: None,
+            spoken_line: None,
             saved_position: None,
             unseen_activity: false,
             tail_visible: true,
@@ -248,6 +300,36 @@ impl TranscriptView {
             }
         }
         let area = body;
+        // Resolve the narrated word to a wrapped row once per frame. Repeating
+        // the Markdown/token search for every painted row would be expensive
+        // for long messages and large transcripts.
+        let spoken_row = if self.selection.is_none()
+            && self.highlight.is_none()
+            && !self.search.is_active()
+        {
+            self.spoken_line.clone().and_then(|progress| {
+                let mut matches = cells.iter().enumerate().filter_map(|(index, cell)| {
+                    cell.as_any()
+                        .downcast_ref::<AgentMarkdownCell>()
+                        .filter(|message| message.markdown_source() == progress.markdown.as_ref())
+                        .map(|_| index)
+                });
+                let target = matches.next()?;
+                if matches.next().is_some() {
+                    // Identical messages cannot be disambiguated from text alone.
+                    return None;
+                }
+                let layout = self.layout(cells, target)?;
+                let offset = spoken_word_display_offset(
+                    &progress.spoken,
+                    layout.text(),
+                    progress.utf16_start,
+                )?;
+                Some((target, layout.row_for_offset(offset)))
+            })
+        } else {
+            None
+        };
         let (mut index, mut row) = start;
         let mut entry_activity_ids: Option<(usize, Arc<[String]>)> = None;
         for y in area.top()..area.bottom() {
@@ -277,6 +359,10 @@ impl TranscriptView {
             };
             let row_area = Rect::new(area.x, y, area.width, /*height*/ 1);
             layout.render(row_area, buf, row);
+            // Background-only patch retains syntax colors, content and selection.
+            if spoken_row == Some((index, row)) {
+                buf.set_style(row_area, Style::default().bg(Color::DarkGray));
+            }
             self.render_disclosure(&activity_ids, &layout, row, row_area, buf);
             if self.highlight == Some(index) && self.selection.is_none() && !self.search.is_active()
             {
