@@ -124,7 +124,10 @@ int main(void) {
                     "sha256": {
                         name: hashlib.sha256(contents).hexdigest()
                         for name, contents in files.items()
-                        if name == "bin/codex.exe"
+                        if name in {
+                            "bin/codex.exe", "bin/codex-code-mode-host.exe",
+                            "bin/codex-exec-server.exe", "codex-path/rg.exe",
+                        }
                         or name.startswith("codex-resources/voice/")
                     },
                 }
@@ -154,6 +157,9 @@ int main(void) {
                 metadata["entrypoint"] = entrypoint
                 self.assertEqual(actual_metadata, metadata)
                 manifest["sha256"][entrypoint] = manifest["sha256"].pop("bin/codex.exe")
+                manifest["sha256"]["codex-code-mode-host.exe"] = manifest["sha256"].pop(
+                    "bin/codex-code-mode-host.exe"
+                )
                 self.assertEqual(actual_manifest, manifest)
                 for name, digest in actual_manifest["sha256"].items():
                     self.assertEqual(hashlib.sha256(actual[name]).hexdigest(), digest)
