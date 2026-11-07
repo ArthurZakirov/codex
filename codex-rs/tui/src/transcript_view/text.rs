@@ -494,6 +494,37 @@ impl TextLayout {
         }
     }
 
+    /// Background-paint only the source graphemes making up a narrated word.
+    /// Use the same grapheme widths and tab stops as rendering/selection, so
+    /// wrapped words, wide Unicode glyphs and tabs never shift the paint.
+    pub(super) fn paint_spoken_word(
+        &self,
+        range: Range<usize>,
+        area: Rect,
+        buf: &mut Buffer,
+        row_index: usize,
+    ) {
+        let Some(row) = self.rows.get(row_index) else {
+            return;
+        };
+        let mut column = row.first_column;
+        for (offset, grapheme) in self.text[row.source.clone()].grapheme_indices(true) {
+            let start = row.source.start + offset;
+            let width = row.tabs.grapheme_width(offset, grapheme);
+            if start < range.end && start + grapheme.len() > range.start {
+                for selected_column in column
+                    ..(column + width)
+                        .min(usize::from(row.content_width))
+                        .min(usize::from(area.width))
+                {
+                    buf[(area.x + selected_column as u16, area.y)]
+                        .set_style(Style::default().bg(ratatui::style::Color::DarkGray));
+                }
+            }
+            column += width;
+        }
+    }
+
     /// Mark selected hard breaks on nonempty rows, including a copied separator to `next`.
     pub(super) fn highlight_selection(
         &self,
