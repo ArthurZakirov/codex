@@ -8,8 +8,6 @@ mod recording_controls;
 mod transcript_replay;
 #[cfg(target_os = "macos")]
 mod verbatim_speech;
-#[cfg(target_os = "macos")]
-mod voice_turn;
 
 pub(crate) use failure_metrics::RealtimeFailureCause;
 
@@ -198,8 +196,6 @@ pub(super) struct RealtimeConversationUiState {
     verbatim_speech_control: Option<verbatim_speech::SpeechPlaybackControl>,
     #[cfg(target_os = "macos")]
     narrated_agent_items: VecDeque<(String, String)>,
-    #[cfg(target_os = "macos")]
-    voice_turn: voice_turn::VoiceTurnBuffer,
 }
 
 impl RealtimeConversationUiState {
@@ -385,8 +381,6 @@ impl ChatWidget {
 
         // Stopping may prevent final transcript events from arriving.
         self.finish_realtime_partial_transcripts();
-        #[cfg(target_os = "macos")]
-        self.realtime_conversation.voice_turn.clear();
 
         if let Some(handle) = self.realtime_conversation.handle.take() {
             handle.close();
@@ -679,8 +673,6 @@ impl ChatWidget {
         if let Some(input) = realtime_delegation_input(items)
             && !matches_local_typed_input
         {
-            #[cfg(target_os = "macos")]
-            self.signal_confirmed_spoken_turn_start(input);
             let transcript_tail_flush = items.iter().any(|item| {
                 matches!(item, UserInput::Text { text, .. }
                     if text.contains("<source>transcript_tail_flush</source>"))
@@ -1334,7 +1326,7 @@ impl ChatWidget {
             RealtimeConversationPhase::Starting | RealtimeConversationPhase::Active
         );
         // A new spoken request supersedes local narration immediately, even
-        // before the user finishes the utterance or says "go".
+        // before the user finishes the utterance.
         #[cfg(target_os = "macos")]
         if active && role == "user" && !delta.trim().is_empty() {
             self.interrupt_current_verbatim_speech();
@@ -1708,10 +1700,6 @@ impl ChatWidget {
                 .push_back(cell);
             self.bump_active_cell_revision();
             self.flush_realtime_transcript_history();
-            #[cfg(target_os = "macos")]
-            if role == "user" && verbatim_speech::enabled() {
-                self.on_client_managed_voice_transcript(&text);
-            }
         }
     }
 
@@ -1886,10 +1874,7 @@ impl ChatWidget {
 
     pub(crate) fn reset_realtime_conversation(&mut self) -> Option<ThreadId> {
         #[cfg(target_os = "macos")]
-        {
-            self.cancel_verbatim_speech();
-            self.realtime_conversation.voice_turn.clear();
-        }
+        self.cancel_verbatim_speech();
         if self.realtime_conversation_is_running() {
             self.app_event_tx
                 .send(AppEvent::RealtimeConversationStateChanged);
