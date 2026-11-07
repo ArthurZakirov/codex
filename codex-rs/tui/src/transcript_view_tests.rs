@@ -1416,6 +1416,7 @@ fn spoken_line_background_preserves_foreground_and_scroll() {
         markdown: Arc::from(markdown),
         spoken: Arc::from(spoken.as_str()),
         utf16_start: spoken[..offset].encode_utf16().count(),
+        utf16_len: "Zeile".encode_utf16().count(),
     });
     let after = render(&mut view, &cells, 40, 12);
     assert_eq!(view.position, previous_position);
@@ -1429,8 +1430,84 @@ fn spoken_line_background_preserves_foreground_and_scroll() {
             }
         }
     }
-    assert!(backgrounds > 0);
+    assert_eq!(
+        backgrounds,
+        "Zeile".len(),
+        "only the spoken word is painted"
+    );
+    // A malformed callback length must fall back to the existing whole-line
+    // highlight instead of highlighting an arbitrary neighboring word.
+    view.spoken_line.as_mut().unwrap().utf16_len = 1;
+    let fallback = render(&mut view, &cells, 40, 12);
+    let fallback_cells = (fallback.area.top()..fallback.area.bottom())
+        .flat_map(|y| (fallback.area.left()..fallback.area.right()).map(move |x| (x, y)))
+        .filter(|&(x, y)| {
+            fallback[(x, y)].bg == Color::DarkGray && before[(x, y)].bg != Color::DarkGray
+        })
+        .count();
+    assert!(
+        fallback_cells > backgrounds,
+        "uncertain words fall back to a line"
+    );
     view.spoken_line = None;
     let cleared = render(&mut view, &cells, 40, 12);
     assert_eq!(before, cleared);
+}
+
+#[test]
+fn spoken_word_matches_unicode_and_rejects_invalid_utf16_spans() {
+    use super::spoken_word_display_offset;
+    use super::spoken_word_display_range;
+    use super::utf16_byte_offset;
+
+    let spoken = "Hallo 👨‍💻 Übergröße und Ende.";
+    let offset = spoken.find("Übergröße").unwrap();
+    let utf16_start = spoken[..offset].encode_utf16().count();
+    let display_start = spoken_word_display_offset(spoken, spoken, utf16_start).unwrap();
+    assert_eq!(
+        spoken_word_display_range(
+            spoken,
+            spoken,
+            utf16_start,
+            "Übergröße".encode_utf16().count(),
+            display_start,
+        ),
+        Some(offset..offset + "Übergröße".len())
+    );
+    assert_eq!(
+        spoken_word_display_range(spoken, spoken, utf16_start, 1, display_start),
+        None,
+    );
+    // A UTF-16 boundary inside the emoji surrogate pair is not a Rust char boundary.
+    let emoji_start = spoken[..spoken.find('👨').unwrap()].encode_utf16().count();
+    assert_eq!(utf16_byte_offset(spoken, emoji_start + 1), None);
+}
+
+#[test]
+fn spoken_word_background_handles_wrapped_multibyte_text() {
+    use super::spoken_word_display_range;
+    let spoken = "Vorher Überraschungslänge Nachher";
+    let layout = TextLayout::new(vec![spoken.into()], 12);
+    let start = spoken.find("Überraschungslänge").unwrap();
+    let utf16_start = spoken[..start].encode_utf16().count();
+    let range = spoken_word_display_range(
+        spoken,
+        layout.text(),
+        utf16_start,
+        "Überraschungslänge".encode_utf16().count(),
+        start,
+    )
+    .unwrap();
+    let height = u16::try_from(layout.row_count()).unwrap();
+    let mut buf = Buffer::empty(Rect::new(0, 0, 12, height));
+    let mut colored_rows = 0;
+    for row in 0..layout.row_count() {
+        let area = Rect::new(0, row as u16, 12, 1);
+        layout.render(area, &mut buf, row);
+        layout.paint_spoken_word(range.clone(), area, &mut buf, row);
+        if (0..12).any(|x| buf[(x, row as u16)].bg == Color::DarkGray) {
+            colored_rows += 1;
+        }
+    }
+    assert!(colored_rows >= 2, "long spoken word must span wrapped rows");
 }

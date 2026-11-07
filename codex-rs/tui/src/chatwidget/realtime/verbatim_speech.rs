@@ -153,14 +153,17 @@ async fn speak_with_word_positions(
                 };
                 if let Some(position_text) = line.strip_prefix("WORD\t") {
                     let mut parts = position_text.split('\t');
-                    if let (Some(start), Some(_len)) = (parts.next(), parts.next())
-                        && let Ok(utf16_start) = start.parse::<usize>()
+                    if let (Some(start), Some(len)) = (parts.next(), parts.next())
+                        && let (Ok(utf16_start), Ok(utf16_len)) =
+                            (start.parse::<usize>(), len.parse::<usize>())
+                        && parts.next().is_none()
                     {
                         *position.lock().unwrap_or_else(|e| e.into_inner()) =
                             Some(SpokenLine {
                                 markdown: Arc::clone(&markdown_source),
                                 spoken: Arc::clone(&spoken_source),
                                 utf16_start,
+                                utf16_len,
                             });
                         frames.schedule_frame();
                     }
