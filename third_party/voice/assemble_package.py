@@ -138,7 +138,14 @@ def assemble(
                 shutil.copy2(source_dir / relative, destination_file)
                 inputs[relative] = digest(destination_file)
         digests = {}
-        for relative in (entrypoint, relative_helper, *((relative_speech_helper,) if relative_speech_helper else ())):
+        package_executables = (entrypoint, *(
+            relative for relative in (
+                f"bin/codex-code-mode-host{suffix}",
+                f"bin/codex-exec-server{suffix}",
+                f"{metadata['pathDir']}/rg{suffix}",
+            ) if (output / relative).is_file()
+        ))
+        for relative in (*package_executables, relative_helper, *((relative_speech_helper,) if relative_speech_helper else ())):
             with (output / relative).open("rb") as source:
                 digests[relative] = hashlib.file_digest(source, "sha256").hexdigest()
         digests.update(
