@@ -3,7 +3,11 @@
 //! Interleaved speakers retain separate displays so settled caption text never reanimates.
 //! Speech recovery suppresses stale queued answers while preserving unspoken text fallbacks.
 
+#[cfg(target_os = "macos")]
+mod audio_lease;
 mod failure_metrics;
+#[cfg(target_os = "macos")]
+mod focus;
 mod recording_controls;
 mod transcript_replay;
 #[cfg(target_os = "macos")]
@@ -275,6 +279,14 @@ impl ChatWidget {
     }
 
     pub(crate) fn toggle_realtime_conversation(&mut self) {
+        #[cfg(target_os = "macos")]
+        {
+            self.voice_focus_start = None;
+        }
+        self.toggle_realtime_conversation_inner();
+    }
+
+    fn toggle_realtime_conversation_inner(&mut self) {
         if self.realtime_conversation.phase == RealtimeConversationPhase::Stopping {
             self.realtime_conversation.startup_retry = StartupRetry::Used;
             self.add_info_message(
@@ -329,6 +341,20 @@ impl ChatWidget {
         let Some(audio) = self.realtime_audio_settings() else {
             return;
         };
+        #[cfg(target_os = "macos")]
+        let lease = if verbatim_speech::enabled() {
+            match audio_lease::acquire() {
+                Ok(lease) => Some(lease),
+                Err(error) => {
+                    self.add_error_message(format!("Unable to start Voice: {error}"));
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        #[cfg(not(target_os = "macos"))]
+        let lease = None;
         self.realtime_conversation.recover_late_transcripts = false;
         self.realtime_conversation.attempt_id =
             NEXT_REALTIME_ATTEMPT_ID.fetch_add(1, Ordering::Relaxed);
@@ -348,15 +374,14 @@ impl ChatWidget {
         };
         std::thread::spawn(move || {
             let result =
-                RealtimeWebrtcSession::start(abort_registration, selection).map_err(|error| {
-                    RealtimeWebrtcStartupFailure {
+                RealtimeWebrtcSession::start_with_audio_lease(abort_registration, selection, lease)
+                    .map_err(|error| RealtimeWebrtcStartupFailure {
                         cause: error
                             .downcast_ref::<codex_realtime_webrtc::ConnectionError>()
                             .copied()
                             .unwrap_or(codex_realtime_webrtc::ConnectionError::Failed),
                         message: error.to_string(),
-                    }
-                });
+                    });
             app_event_tx.send(AppEvent::RealtimeWebrtcOfferCreated {
                 thread_id,
                 attempt_id,
@@ -364,6 +389,79 @@ impl ChatWidget {
             });
         });
         self.request_redraw();
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn handle_voice_focus_event(
+        &mut self,
+        event: &crate::tui::TuiEvent,
+        allow_auto_start: bool,
+    ) {
+        use crate::tui::TuiEvent;
+
+        if !verbatim_speech::enabled() {
+            return;
+        }
+        match event {
+            TuiEvent::FocusLost => {
+                self.voice_focus_start = None;
+                let mode = focus::read(self.config.codex_home.as_path());
+                self.voice_focus_allows_playback = mode == focus::Mode::Manual;
+                if !self.voice_focus_allows_playback {
+                    self.stop_realtime_conversation();
+                }
+            }
+            TuiEvent::FocusGained => {
+                self.voice_focus_allows_playback = true;
+                if allow_auto_start
+                    && focus::read(self.config.codex_home.as_path()) == focus::Mode::FollowFocus
+                    && let Some(thread_id) = self.thread_id()
+                {
+                    self.voice_focus_start =
+                        Some((thread_id, Instant::now() + Duration::from_secs(3)));
+                    self.request_redraw();
+                }
+            }
+            TuiEvent::Draw => {
+                let Some((thread_id, deadline)) = self.voice_focus_start else {
+                    return;
+                };
+                if Instant::now() >= deadline
+                    || self.thread_id() != Some(thread_id)
+                    || !allow_auto_start
+                    || self.has_active_modal()
+                    || self.side_conversation_active()
+                    || self.blocks_direct_input
+                    || focus::read(self.config.codex_home.as_path()) != focus::Mode::FollowFocus
+                {
+                    self.voice_focus_start = None;
+                    return;
+                }
+                match self.realtime_conversation.phase {
+                    RealtimeConversationPhase::Inactive => match audio_lease::acquire() {
+                        Ok(_lease) => {
+                            self.voice_focus_start = None;
+                            self.toggle_realtime_conversation_inner();
+                            return;
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                        Err(error) => {
+                            self.voice_focus_start = None;
+                            self.add_error_message(format!("Unable to start Voice: {error}"));
+                            return;
+                        }
+                    },
+                    RealtimeConversationPhase::Stopping => {}
+                    _ => {
+                        self.voice_focus_start = None;
+                        return;
+                    }
+                }
+                self.frame_requester
+                    .schedule_frame_in(Duration::from_millis(100));
+            }
+            _ => {}
+        }
     }
 
     pub(crate) fn stop_realtime_conversation(&mut self) {

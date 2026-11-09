@@ -869,6 +869,9 @@ impl App {
         app_server: &mut AppServerSession,
         event: TuiEvent,
     ) -> Result<AppRunControl> {
+        #[cfg(target_os = "macos")]
+        self.chat_widget
+            .handle_voice_focus_event(&event, self.overlay.is_none());
         self.transcript_view
             .sync_patch_approval(self.chat_widget.current_patch_approval());
         tui.link_hover.observe(&event);

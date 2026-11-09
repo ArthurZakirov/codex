@@ -171,6 +171,14 @@ impl VoiceHost {
     }
 
     pub async fn connect(package: &CodexPackageLayout, build_commit: &str) -> Result<Self> {
+        Self::connect_with_audio_lease(package, build_commit, None).await
+    }
+
+    pub(crate) async fn connect_with_audio_lease(
+        package: &CodexPackageLayout,
+        build_commit: &str,
+        lease: Option<std::sync::Arc<std::fs::File>>,
+    ) -> Result<Self> {
         let root = package.package_dir.as_path().canonicalize()?;
         let name = if cfg!(windows) {
             "codex-voice-host.exe"
@@ -193,6 +201,12 @@ impl VoiceHost {
             }
             environment
         };
+        #[cfg(unix)]
+        let lease_fd = lease.as_deref().map(std::os::fd::AsRawFd::as_raw_fd);
+        #[cfg(unix)]
+        let inherited_fds = lease_fd.as_slice();
+        #[cfg(not(unix))]
+        let inherited_fds = &[];
         let SpawnedProcess {
             session,
             stdout_rx,
@@ -204,10 +218,25 @@ impl VoiceHost {
             &root,
             &environment,
             /*arg0*/ &None,
-            &[],
+            inherited_fds,
         )
         .await?;
         drop(stderr_rx); // Drain and discard diagnostics rather than logging untyped child output.
+        let exit_rx = if let Some(lease) = lease {
+            // The session can be aborted before the helper exits. Only its
+            // process waiter can tell us that it no longer owns the devices.
+            let (exit_tx, forwarded_exit) = oneshot::channel();
+            tokio::spawn(async move {
+                let code = exit_rx.await;
+                drop(lease);
+                if let Ok(code) = code {
+                    let _ = exit_tx.send(code);
+                }
+            });
+            forwarded_exit
+        } else {
+            exit_rx
+        };
         let mut host = Self {
             process: session,
             output: MessageReader::new(stdout_rx),
