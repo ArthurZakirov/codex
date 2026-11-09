@@ -125,6 +125,7 @@ async fn speak_with_word_positions(
         .stderr(Stdio::null())
         .kill_on_drop(true)
         .spawn()?;
+    let result = async {
     let mut stdin = child
         .stdin
         .take()
@@ -147,7 +148,7 @@ async fn speak_with_word_positions(
     active.store(true, Ordering::Release);
     let _active_guard = ActiveSpeechGuard(active);
     let mut paused = false;
-    let result = loop {
+    loop {
         tokio::select! {
             line = words.next_line() => {
                 let line = match line? {
@@ -191,12 +192,19 @@ async fn speak_with_word_positions(
                 }
             }
         }
-    };
-    // Killing an interrupted utterance cannot block the following FIFO item.
+    }
+    }
+    .await;
+    // Retain the audio lease through child exit, even after a broken pipe.
     if result.is_err() {
         let _ = child.start_kill();
     }
-    let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+    if tokio::time::timeout(Duration::from_secs(2), child.wait())
+        .await
+        .is_err()
+    {
+        child.kill().await?;
+    }
     result
 }
 
@@ -508,10 +516,12 @@ async fn speak_spoken_text(
     active: Arc<AtomicBool>,
     cancelled: Arc<AtomicBool>,
     interruption_generation: Arc<AtomicU64>,
+    lease: Arc<std::fs::File>,
 ) -> std::io::Result<()> {
     // Native AppKit synthesizers are managed on their owning thread.
     // Cancellation remains cooperative even when the queue task is aborted.
     tokio::task::spawn_blocking(move || {
+        let _lease = lease;
         speak_spoken_text_blocking(spoken, pause_rx, active, cancelled, interruption_generation)
     })
     .await
@@ -585,10 +595,12 @@ impl ChatWidget {
             .unwrap_or_else(|e| e.into_inner()) = None;
         self.frame_requester.schedule_frame();
         self.realtime_conversation.verbatim_speech_sender.take();
-        if let Some(control) = self.realtime_conversation.verbatim_speech_control.take() {
+        let control = self.realtime_conversation.verbatim_speech_control.take();
+        let task = self.realtime_conversation.verbatim_speech_task.take();
+        if let Some(control) = control {
+            // The worker releases its lease only after the synthesizer stops.
             control.cancel();
-        }
-        if let Some(task) = self.realtime_conversation.verbatim_speech_task.take() {
+        } else if let Some(task) = task {
             task.abort();
         }
     }
@@ -603,7 +615,8 @@ impl ChatWidget {
         markdown: &str,
         from_replay: bool,
     ) {
-        if !should_narrate_visible_agent_message(enabled(), from_replay, markdown)
+        if !self.voice_focus_allows_playback
+            || !should_narrate_visible_agent_message(enabled(), from_replay, markdown)
             || self
                 .realtime_conversation
                 .narrated_agent_items
@@ -675,7 +688,19 @@ impl ChatWidget {
                 let progress = Arc::clone(&progress);
                 let frames = frames.clone();
                 async move {
+                    if cancelled.load(Ordering::Acquire) {
+                        return Ok(());
+                    }
+                    let lease = match super::audio_lease::acquire() {
+                        Ok(lease) => lease,
+                        // Keep the reply visible without narrating over the other tab.
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            return Ok(());
+                        }
+                        Err(error) => return Err(error),
+                    };
                     if let Some(helper) = speech_helper_path() {
+                        let _lease = lease;
                         speak_with_word_positions(
                             item,
                             pause_rx,
@@ -689,8 +714,15 @@ impl ChatWidget {
                         .await
                     } else {
                         // Preserve old voice behavior for a plain development build.
-                        speak_spoken_text(item.spoken, pause_rx, active, cancelled, interrupted)
-                            .await
+                        speak_spoken_text(
+                            item.spoken,
+                            pause_rx,
+                            active,
+                            cancelled,
+                            interrupted,
+                            lease,
+                        )
+                        .await
                     }
                 }
             })));

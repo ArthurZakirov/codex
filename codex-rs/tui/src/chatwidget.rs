@@ -625,6 +625,10 @@ pub(crate) struct ChatWidget {
     turn_lifecycle: TurnLifecycleState,
     safety_recourse: Option<safety_recourse::PendingRecourse>,
     realtime_conversation: RealtimeConversationUiState,
+    #[cfg(target_os = "macos")]
+    voice_focus_start: Option<(ThreadId, std::time::Instant)>,
+    #[cfg(target_os = "macos")]
+    voice_focus_allows_playback: bool,
     realtime_conversation_available_for_thread: bool,
     safety_buffering: SafetyBufferingState,
     task_complete_pending: bool,

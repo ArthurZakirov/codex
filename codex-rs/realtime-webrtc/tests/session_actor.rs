@@ -202,3 +202,30 @@ async fn device_discovery_does_not_start_capture() -> Result<()> {
     assert!(!root.join("initializing").exists());
     Ok(())
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn audio_lease_stays_with_helper_until_exit() -> Result<()> {
+    let Some(root) = common::package("audio_lease_stays_with_helper_until_exit")? else {
+        return Ok(());
+    };
+    let path = root.join("voice-audio.lock");
+    let lease = fs::File::create(&path)?;
+    lease.try_lock()?;
+    let contender = fs::OpenOptions::new().write(true).open(&path)?;
+    let (_abort, registration) = AbortHandle::new_pair();
+    let started = RealtimeWebrtcSession::start_with_audio_lease(
+        registration,
+        AudioDeviceSelection::default(),
+        Some(std::sync::Arc::new(lease)),
+    )?;
+    assert!(matches!(
+        contender.try_lock(),
+        Err(std::fs::TryLockError::WouldBlock)
+    ));
+
+    started.handle.close();
+    common::wait_for_helper_reaped(&root)?;
+    common::wait_for(|| contender.try_lock().is_ok())?;
+    Ok(())
+}
