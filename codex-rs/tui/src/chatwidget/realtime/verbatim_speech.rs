@@ -244,7 +244,10 @@ fn previous_nonblank_line<'a>(markdown: &'a str, cursor: &mut usize) -> Option<(
 fn trailing_checkout_footer_start(markdown: &str) -> Option<usize> {
     let mut cursor = markdown.len();
     let (_, branch_line) = previous_nonblank_line(markdown, &mut cursor)?;
-    let branch = branch_line.strip_prefix("**Branch:**")?.trim();
+    let branch = ["**Branch:**", "**Branch**:", "**Zweig:**", "**Zweig**:"]
+        .into_iter()
+        .find_map(|label| branch_line.strip_prefix(label))?
+        .trim();
     let branch = branch.strip_prefix('`')?.strip_suffix('`')?;
     if branch.is_empty() || branch.contains('`') {
         return None;
@@ -263,7 +266,15 @@ fn trailing_checkout_footer_start(markdown: &str) -> Option<usize> {
         return None;
     }
     let (start, heading) = previous_nonblank_line(markdown, &mut cursor)?;
-    if heading != "**Checkout path (copy for VS Code):**" {
+    let heading = heading
+        .strip_prefix("**")
+        .and_then(|text| text.strip_suffix("**"))
+        .unwrap_or_else(|| heading.trim_start_matches('#').trim_start())
+        .trim_end_matches(':');
+    if !matches!(
+        heading,
+        "Checkout path (copy for VS Code)" | "Checkout path" | "Checkout-Pfad" | "Worktree-Pfad"
+    ) {
         return None;
     }
 
@@ -896,6 +907,31 @@ mod tests {
             );
             assert!(markdown.contains("/Users/example/Repos/codex.worktrees/feature"));
             assert!(markdown.contains("**Branch:** `feat/feature`"));
+        }
+    }
+
+    #[test]
+    fn localized_checkout_footer_is_visual_only() {
+        for heading in [
+            "**Checkout-Pfad**",
+            "### Checkout-Pfad",
+            "**Worktree-Pfad:**",
+        ] {
+            let markdown = format!(
+                "Änderung geprüft.
+
+{heading}
+
+```bash
+/Users/example/Repos/demo
+```
+
+**Branch:** `fix/voice`"
+            );
+            assert_eq!(
+                super::markdown_to_spoken_text(&markdown),
+                "Änderung geprüft."
+            );
         }
     }
 

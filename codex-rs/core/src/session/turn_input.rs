@@ -816,7 +816,29 @@ impl Session {
     pub(crate) async fn route_realtime_text_input(
         self: &Arc<Self>,
         text: String,
+        interrupt_running_turn: bool,
     ) -> Result<(), &'static str> {
+        if interrupt_running_turn {
+            let active_turn_id = self
+                .active_turn
+                .lock()
+                .await
+                .as_ref()
+                .and_then(|turn| turn.task.as_ref())
+                .filter(|task| task.kind == crate::state::TaskKind::Regular)
+                .map(|task| task.turn_context.sub_id.clone());
+            if let Some(turn_id) = active_turn_id {
+                // Use the normal cancellation path and target only the turn we
+                // observed. Replaced keeps an automatic wake from racing the
+                // explicit spoken request during the handoff.
+                self.abort_turn_if_active(
+                    &turn_id,
+                    codex_protocol::protocol::TurnAbortReason::Replaced,
+                    /*error*/ None,
+                )
+                .await;
+            }
+        }
         let submission_id = Uuid::now_v7().to_string();
         let submission = handle(
             self,
