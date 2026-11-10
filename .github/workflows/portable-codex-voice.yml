@@ -109,7 +109,8 @@ jobs:
           CARGO_BUILD_JOBS: "2"
         run: |
           set -euo pipefail
-          python3 scripts/build_codex_package.py --target "$TARGET" \
+          CODEX_VOICE_RELEASE_TAG="$VOICE_RELEASE_TAG" \
+            python3 scripts/build_codex_package.py --target "$TARGET" \
             --package-version "$VOICE_VERSION" --cargo-profile release \
             --package-dir "$RUNNER_TEMP/standard-package"
           "$RUNNER_TEMP/standard-package/bin/codex" --version

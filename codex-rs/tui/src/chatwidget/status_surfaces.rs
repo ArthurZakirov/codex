@@ -482,7 +482,8 @@ impl ChatWidget {
     }
 
     pub(super) fn configured_status_line_items(&self) -> Vec<String> {
-        self.local_settings
+        let mut items = self
+            .local_settings
             .tui
             .status_line
             .clone()
@@ -491,7 +492,14 @@ impl ChatWidget {
                     .iter()
                     .map(ToString::to_string)
                     .collect()
-            })
+            });
+        if codex_build_info::BuildInfo::voice_release_tag().is_some() && !items.is_empty() {
+            let version = StatusLineItem::CodexVersion.to_string();
+            if !items.contains(&version) {
+                items.insert(0, version);
+            }
+        }
+        items
     }
 
     /// Parses configured terminal-title ids into known items and collects unknown ids.
@@ -807,7 +815,12 @@ impl ChatWidget {
                 let label = limit_label_for_window(window.window_minutes, is_secondary);
                 self.status_line_limit_display(Some(window), &label)
             }
-            StatusLineItem::CodexVersion => Some(CODEX_CLI_VERSION.to_string()),
+            StatusLineItem::CodexVersion => Some(
+                codex_build_info::BuildInfo::voice_release_tag().map_or_else(
+                    || CODEX_CLI_VERSION.to_string(),
+                    |tag| format!("Codex Voice Fork {tag}"),
+                ),
+            ),
             StatusLineItem::ContextWindowSize => self
                 .status_line_context_window_size()
                 .map(|cws| format!("{} window", format_tokens_compact(cws))),
