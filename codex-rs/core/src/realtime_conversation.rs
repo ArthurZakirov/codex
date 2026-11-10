@@ -155,7 +155,9 @@ impl RealtimeHandoffAdmission {
         };
         if !self.retired.load(Ordering::Acquire) {
             // Bound the layout of the handoff future while retaining the admission permit.
-            Box::pin(session.route_realtime_text_input(text)).await?;
+            let interrupt_running_turn = cfg!(target_os = "macos")
+                && std::env::var("CODEX_REALTIME_VERBATIM_SPEECH").is_ok_and(|value| value == "1");
+            Box::pin(session.route_realtime_text_input(text, interrupt_running_turn)).await?;
         }
         Ok(())
     }

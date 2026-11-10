@@ -1238,3 +1238,36 @@ async fn scored_prompt_keeps_its_submission_item_id() {
     assert_eq!(ui_ids.len(), 3);
     session.abort_all_tasks(TurnAbortReason::Interrupted).await;
 }
+
+#[tokio::test]
+async fn portable_voice_replaces_a_running_regular_turn() {
+    let (session, turn, events) = make_session_and_context_with_rx().await;
+    session
+        .spawn_task(
+            Arc::clone(&turn),
+            Vec::new(),
+            NeverEndingTask {
+                kind: TaskKind::Regular,
+                listen_to_cancellation_token: true,
+            },
+        )
+        .await;
+
+    session
+        .route_realtime_text_input(
+            "Change direction now.".into(),
+            /*interrupt_running_turn*/ true,
+        )
+        .await
+        .unwrap();
+
+    assert!(std::iter::from_fn(|| events.try_recv().ok()).any(|event| {
+        matches!(
+            event.msg,
+            EventMsg::TurnAborted(aborted)
+                if aborted.turn_id.as_deref() == Some(turn.sub_id.as_str())
+                    && aborted.reason == TurnAbortReason::Replaced
+        )
+    }));
+    session.abort_all_tasks(TurnAbortReason::Interrupted).await;
+}
