@@ -1413,6 +1413,24 @@ fn sanitize_project_config(
             });
         }
     }
+    // Status providers execute outside the Codex sandbox as the local user.
+    // A repository may neither define providers nor enable a user-defined one.
+    if let Some(tui) = table.get_mut("tui").and_then(TomlValue::as_table_mut) {
+        if tui.remove("status_line_commands").is_some() {
+            ignored_keys.push("tui.status_line_commands".to_string());
+        }
+        if let Some(items) = tui.get_mut("status_line").and_then(TomlValue::as_array_mut) {
+            let original_len = items.len();
+            items.retain(|item| item.as_str() != Some("custom-commands"));
+            if items.len() != original_len {
+                ignored_keys.push("tui.status_line.custom-commands".to_string());
+                if items.is_empty() {
+                    tui.remove("status_line");
+                }
+            }
+        }
+    }
+
     // Repository contents must not turn an ordinary key into a permission increase.
     if let Some(chat) = table
         .get_mut("tui")

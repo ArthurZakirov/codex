@@ -281,6 +281,9 @@ impl ChatWidget {
         if had_refreshing_status_outputs {
             self.request_redraw();
         }
+        self.status_line_command_values.clear();
+        self.status_line_command_pending_request_id = None;
+        self.status_line_command_last_requested_at = None;
         self.status_line_workspace_headline = None;
         self.status_line_workspace_headline_pending_request_id = None;
         self.status_line_workspace_headline_last_requested_at = None;
