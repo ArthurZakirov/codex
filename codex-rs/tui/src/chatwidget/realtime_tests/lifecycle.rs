@@ -4,6 +4,33 @@ use super::*;
 use crate::app_event::RealtimeWebrtcStartupFailure;
 use pretty_assertions::assert_eq;
 
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn dictation_focus_modes_release_or_keep_the_owning_session() {
+    use super::super::focus::Mode;
+    use crate::tui::TuiEvent;
+
+    let (mut chat, _, _, _) = make_chatwidget_manual_with_sender().await;
+    let thread = activate_voice(&mut chat);
+    chat.realtime_conversation.dictation = true;
+
+    chat.handle_voice_focus_mode(&TuiEvent::FocusLost, true, Mode::Manual);
+    assert!(chat.realtime_dictation_is_running());
+    assert!(chat.voice_focus_start.is_none());
+
+    chat.handle_voice_focus_mode(&TuiEvent::FocusLost, true, Mode::FollowFocus);
+    assert!(!chat.realtime_dictation_is_running());
+    assert!(chat.voice_focus_start.is_none());
+
+    chat.handle_voice_focus_mode(&TuiEvent::FocusGained, true, Mode::FollowFocus);
+    assert_eq!(
+        chat.voice_focus_start.map(|(thread, _)| thread),
+        Some(thread)
+    );
+    chat.handle_voice_focus_mode(&TuiEvent::FocusLost, true, Mode::FollowFocus);
+    assert!(chat.voice_focus_start.is_none());
+}
+
 #[tokio::test]
 async fn enter_sends_a_finished_voice_call_caption_as_a_user_turn() {
     let (mut chat, _sender, _events, mut ops) = make_chatwidget_manual_with_sender().await;

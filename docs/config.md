@@ -39,11 +39,11 @@ composer can send the recognized user caption through the normal chat input.
 If recognition is still processing, Enter waits for the pending speech segment.
 Press Enter again to submit the available text if recognition stalls.
 
-With dictation disabled, `focus_mode` controls how the Voice Call responds to terminal focus.
+The `focus_mode` setting controls the microphone in both Dictation and Voice Call.
 
 | Mode | Behavior |
 | --- | --- |
-| `manual` (default) | Start and stop Voice yourself. The audio slot still prevents overlap. |
+| `lock` (default) | Keep the microphone in its owning chat until you stop Voice. Other tabs cannot start Voice while the slot is held. |
 | `stop_on_blur` | Stop Voice and local narration when the terminal loses focus. Start Voice manually when you return. |
 | `follow_focus` | Stop on focus loss and start Voice when a terminal with an existing conversation gains focus and the slot is available. |
 
@@ -52,3 +52,9 @@ focus reports. For Warp, enable
 [focus reporting](https://docs.warp.dev/terminal/settings/all-settings/) and use
 Codex's alternate screen. Focus can also change when switching windows or
 applications.
+
+The JSON includes a `_help` section with the available settings. Type `/voice`
+and press Enter to select an action from the Voice menu. Replay defaults to
+`F10` and appears in the `?` shortcut overlay. Set `replay_shortcut` in the
+Voice JSON and restart Codex to change it. Use `super-r` for Command+R when the
+terminal forwards that key, or `null` to disable the shortcut.

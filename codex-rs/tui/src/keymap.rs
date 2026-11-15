@@ -2762,7 +2762,7 @@ See the Codex keymap documentation for supported actions and examples.",
 ///
 /// Specs are expected to be normalized by config deserialization, but this
 /// parser remains strict to keep runtime error messages precise.
-fn parse_keybinding(spec: &str) -> Option<KeyBinding> {
+pub(crate) fn parse_keybinding(spec: &str) -> Option<KeyBinding> {
     let mut parts = spec.split('-');
     let mut modifiers = KeyModifiers::NONE;
     let mut key_name = None;

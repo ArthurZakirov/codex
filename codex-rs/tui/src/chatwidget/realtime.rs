@@ -290,6 +290,36 @@ fn voice_config_path() -> Option<std::path::PathBuf> {
     Some(std::path::PathBuf::from(home).join(".config/codex-voice/config.json"))
 }
 
+#[cfg(target_os = "macos")]
+pub(crate) fn voice_replay_shortcut() -> Option<crate::key_hint::KeyBinding> {
+    static SHORTCUT: std::sync::OnceLock<Option<crate::key_hint::KeyBinding>> =
+        std::sync::OnceLock::new();
+    *SHORTCUT.get_or_init(|| {
+        let settings = voice_config_path()
+            .and_then(|path| std::fs::read(path).ok())
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+        match settings
+            .as_ref()
+            .and_then(|settings| settings.get("replay_shortcut"))
+        {
+            Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::String(key)) => {
+                crate::keymap::parse_keybinding(&key.to_ascii_lowercase()).filter(|binding| {
+                    let (code, modifiers) = binding.parts();
+                    matches!(code, crossterm::event::KeyCode::F(_))
+                        || (matches!(code, crossterm::event::KeyCode::Char(_))
+                            && modifiers.intersects(
+                                crossterm::event::KeyModifiers::CONTROL
+                                    | crossterm::event::KeyModifiers::ALT
+                                    | crossterm::event::KeyModifiers::SUPER,
+                            ))
+                })
+            }
+            _ => Some(crate::key_hint::plain(crossterm::event::KeyCode::F(10))),
+        }
+    })
+}
+
 fn prepare_voice_config(
     path: &std::path::Path,
     codex_home: &std::path::Path,
@@ -313,6 +343,19 @@ fn prepare_voice_config(
     };
     let existing_keys = settings.len();
     settings
+        .entry("replay_shortcut")
+        .or_insert(serde_json::json!("f10"));
+    settings.entry("_help").or_insert_with(|| serde_json::json!({
+        "focus_mode": {
+            "follow_focus": "Stop listening when this terminal loses focus and start in the newly focused Codex tab. Requires terminal focus reporting.",
+            "lock": "Keep listening in the owning chat until you stop it. Other Codex tabs cannot start voice.",
+            "stop_on_blur": "Stop listening when the terminal loses focus. Start again manually."
+        },
+        "dictation": "enabled selects Dictation for F8. auto_start also starts it on launch; follow_focus starts it on focus gain.",
+        "replay_shortcut": "Single shortcut, for example f10, ctrl-shift-r or super-r (Command+R if passed through by the terminal). Use null to disable. Restart after changing it.",
+        "commands": "Type /voice and press Enter for the Voice menu. Press ? for keyboard shortcuts."
+    }));
+    settings
         .entry("speech_rate")
         .or_insert(serde_json::json!(1.8));
     settings
@@ -325,7 +368,7 @@ fn prepare_voice_config(
         #[cfg(not(target_os = "macos"))]
         let focus_mode = {
             let _ = codex_home;
-            serde_json::json!("manual")
+            serde_json::json!("lock")
         };
         settings.insert("focus_mode".into(), focus_mode);
     }
@@ -370,10 +413,10 @@ fn opening_config_migrates_focus_without_losing_other_settings() {
     prepare_voice_config(&config, home.path()).unwrap();
     let settings: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&config).unwrap()).unwrap();
-    assert_eq!(
-        settings,
-        serde_json::json!({"speech_rate": 1.4, "dictation": {"enabled": true}, "focus_mode": "follow_focus"})
-    );
+    assert_eq!(settings["speech_rate"], 1.4);
+    assert_eq!(settings["dictation"]["enabled"], true);
+    assert_eq!(settings["focus_mode"], "follow_focus");
+    assert!(settings["_help"]["focus_mode"]["lock"].is_string());
     std::fs::remove_file(home.path().join("voice-focus.json")).unwrap();
     assert!(focus::read(Some(&config), home.path()) == focus::Mode::FollowFocus);
 }
@@ -496,6 +539,11 @@ impl ChatWidget {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    pub(crate) fn voice_replay_shortcut_available(&self) -> bool {
+        self.realtime_conversation_available_for_thread && !self.side_conversation_active()
+    }
+
     pub(crate) fn realtime_conversation_is_running(&self) -> bool {
         self.realtime_conversation.phase != RealtimeConversationPhase::Inactive
     }
@@ -515,9 +563,15 @@ impl ChatWidget {
     }
 
     pub(crate) fn maybe_auto_start_dictation(&mut self) {
-        if Self::dictation_auto_start_enabled() && !self.realtime_conversation_is_running() {
-            self.toggle_realtime_conversation_inner();
+        if !Self::dictation_auto_start_enabled() || self.realtime_conversation_is_running() {
+            return;
         }
+        #[cfg(target_os = "macos")]
+        if self.voice_focus_mode() == focus::Mode::FollowFocus {
+            self.schedule_voice_focus_start();
+            return;
+        }
+        self.toggle_realtime_conversation_inner();
     }
 
     pub(crate) fn toggle_realtime_conversation(&mut self) {
@@ -635,6 +689,22 @@ impl ChatWidget {
     }
 
     #[cfg(target_os = "macos")]
+    fn voice_focus_mode(&self) -> focus::Mode {
+        focus::read(
+            voice_config_path().as_deref(),
+            self.config.codex_home.as_path(),
+        )
+    }
+
+    #[cfg(target_os = "macos")]
+    fn schedule_voice_focus_start(&mut self) {
+        if let Some(thread_id) = self.thread_id() {
+            self.voice_focus_start = Some((thread_id, Instant::now() + Duration::from_secs(5)));
+            self.frame_requester.schedule_frame();
+        }
+    }
+
+    #[cfg(target_os = "macos")]
     pub(crate) fn handle_voice_focus_event(
         &mut self,
         event: &crate::tui::TuiEvent,
@@ -642,16 +712,31 @@ impl ChatWidget {
     ) {
         use crate::tui::TuiEvent;
 
-        if !verbatim_speech::enabled() || self.realtime_dictation_is_running() {
+        if !matches!(event, TuiEvent::FocusGained | TuiEvent::FocusLost)
+            && !(matches!(event, TuiEvent::Draw) && self.voice_focus_start.is_some())
+        {
             return;
         }
+        if verbatim_speech::enabled()
+            || self.realtime_dictation_is_running()
+            || dictation_settings().enabled
+        {
+            self.handle_voice_focus_mode(event, allow_auto_start, self.voice_focus_mode());
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn handle_voice_focus_mode(
+        &mut self,
+        event: &crate::tui::TuiEvent,
+        allow_auto_start: bool,
+        mode: focus::Mode,
+    ) {
+        use crate::tui::TuiEvent;
+
         match event {
             TuiEvent::FocusLost => {
                 self.voice_focus_start = None;
-                let mode = focus::read(
-                    voice_config_path().as_deref(),
-                    self.config.codex_home.as_path(),
-                );
                 self.voice_focus_allows_playback = mode == focus::Mode::Manual;
                 if !self.voice_focus_allows_playback {
                     self.stop_realtime_conversation();
@@ -659,36 +744,30 @@ impl ChatWidget {
             }
             TuiEvent::FocusGained => {
                 self.voice_focus_allows_playback = true;
-                if allow_auto_start
-                    && !dictation_settings().enabled
-                    && focus::read(
-                        voice_config_path().as_deref(),
-                        self.config.codex_home.as_path(),
-                    ) == focus::Mode::FollowFocus
-                    && let Some(thread_id) = self.thread_id()
-                {
-                    self.voice_focus_start =
-                        Some((thread_id, Instant::now() + Duration::from_secs(3)));
-                    self.request_redraw();
+                if allow_auto_start && mode == focus::Mode::FollowFocus {
+                    self.schedule_voice_focus_start();
                 }
             }
             TuiEvent::Draw => {
                 let Some((thread_id, deadline)) = self.voice_focus_start else {
                     return;
                 };
-                if Instant::now() >= deadline
-                    || self.thread_id() != Some(thread_id)
+                if self.thread_id() != Some(thread_id)
                     || !allow_auto_start
                     || self.has_active_modal()
                     || self.side_conversation_active()
                     || self.blocks_direct_input
-                    || dictation_settings().enabled
-                    || focus::read(
-                        voice_config_path().as_deref(),
-                        self.config.codex_home.as_path(),
-                    ) != focus::Mode::FollowFocus
+                    || !self.voice_focus_allows_playback
+                    || mode != focus::Mode::FollowFocus
                 {
                     self.voice_focus_start = None;
+                    return;
+                }
+                if Instant::now() >= deadline {
+                    self.voice_focus_start = None;
+                    self.add_error_message(
+                        "Voice Follow Focus is still waiting for the microphone. Check terminal focus reporting and close any older Voice session.".into(),
+                    );
                     return;
                 }
                 match self.realtime_conversation.phase {
@@ -950,7 +1029,9 @@ impl ChatWidget {
         }
         self.add_info_message(
             "Voice conversation started.".to_string(),
-            Some("Press Enter to send the latest spoken input. Use /voice to stop.".to_string()),
+            Some(
+                "Press Enter to send the latest spoken input. Use /voice stop to stop.".to_string(),
+            ),
         );
     }
 
