@@ -2740,6 +2740,7 @@ impl App {
                 self.chat_widget.on_plugin_mentions_loaded(plugins);
             }
             AppEvent::OpenRealtimeSettings => self.chat_widget.open_realtime_settings(),
+            AppEvent::OpenVoiceConfig => self.chat_widget.open_voice_config(),
             AppEvent::ReplayLastVoiceReply { thread_id } => {
                 if self.chat_widget.thread_id() == Some(thread_id) {
                     self.replay_last_voice_reply();

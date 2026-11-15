@@ -14,20 +14,32 @@ still allowing managed hooks from requirements and managed config layers. This
 setting is only supported in `requirements.toml`; putting it in `config.toml`
 does not enable managed-hooks-only mode.
 
-## Portable macOS Voice focus
+## Portable macOS Voice
 
 Portable Codex Voice tabs share one audio slot per macOS user. Starting a call
 while another updated tab owns the slot displays a message. Stop Voice in the
 owning tab to release it. Replies stay visible when the slot is busy.
 
-Set the focus policy in `~/.codex/voice-focus.json` (or in the session's Codex
-home if configured). For example:
+Run `/voice config` to open `~/.config/codex-voice/config.json` in VS Code.
+The command fills in missing settings and imports the previous focus mode the
+first time it opens a config without `focus_mode`.
+
+The following example enables dictation for F8 and leaves automatic startup off.
 
 ```json
-{"mode":"stop_on_blur"}
+{
+  "dictation": { "enabled": true, "auto_start": false },
+  "focus_mode": "stop_on_blur",
+  "speech_rate": 1.8
+}
 ```
 
-Choose the policy for focus changes:
+Enter submits dictated input. During a Voice Call, Enter with an empty
+composer can send the recognized user caption through the normal chat input.
+If recognition is still processing, Enter waits for the pending speech segment.
+Press Enter again to submit the available text if recognition stalls.
+
+With dictation disabled, `focus_mode` controls how the Voice Call responds to terminal focus.
 
 | Mode | Behavior |
 | --- | --- |

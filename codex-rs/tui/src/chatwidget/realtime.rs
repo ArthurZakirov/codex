@@ -149,6 +149,9 @@ pub(super) struct RealtimeConversationUiState {
     recover_late_transcripts: bool,
     attempt_id: u64,
     dictation: bool,
+    pending_voice_message: String,
+    voice_segment_pending: bool,
+    submit_voice_when_ready: bool,
     thread_id: Option<ThreadId>,
     pub(super) handle: Option<RealtimeWebrtcSessionHandle>,
     startup_abort: Option<AbortHandle>,
@@ -287,6 +290,94 @@ fn voice_config_path() -> Option<std::path::PathBuf> {
     Some(std::path::PathBuf::from(home).join(".config/codex-voice/config.json"))
 }
 
+fn prepare_voice_config(
+    path: &std::path::Path,
+    codex_home: &std::path::Path,
+) -> std::io::Result<()> {
+    let original = match std::fs::read(path) {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+    let mut value = if let Some(bytes) = &original {
+        let Ok(value) = serde_json::from_slice(bytes) else {
+            // Open invalid JSON as-is so it can be repaired in the editor.
+            return Ok(());
+        };
+        value
+    } else {
+        serde_json::json!({})
+    };
+    let Some(settings) = value.as_object_mut() else {
+        return Ok(());
+    };
+    let existing_keys = settings.len();
+    settings
+        .entry("speech_rate")
+        .or_insert(serde_json::json!(1.8));
+    settings
+        .entry("dictation")
+        .or_insert_with(|| serde_json::json!({"enabled": false, "auto_start": false}));
+    if !settings.contains_key("focus_mode") {
+        #[cfg(target_os = "macos")]
+        let focus_mode =
+            serde_json::to_value(focus::legacy_mode(codex_home)).map_err(std::io::Error::other)?;
+        #[cfg(not(target_os = "macos"))]
+        let focus_mode = {
+            let _ = codex_home;
+            serde_json::json!("manual")
+        };
+        settings.insert("focus_mode".into(), focus_mode);
+    }
+    if settings.len() == existing_keys {
+        return Ok(());
+    }
+    let directory = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("missing config directory"))?;
+    std::fs::create_dir_all(directory)?;
+    let mut file = tempfile::NamedTempFile::new_in(directory)?;
+    serde_json::to_writer_pretty(&mut file, &value).map_err(std::io::Error::other)?;
+    std::io::Write::write_all(&mut file, b"\n")?;
+    if let Some(original) = original {
+        if std::fs::read(path)? == original {
+            file.persist(path).map_err(|error| error.error)?;
+        }
+    } else if let Err(error) = file.persist_noclobber(path)
+        && error.error.kind() != std::io::ErrorKind::AlreadyExists
+    {
+        return Err(error.error);
+    }
+    Ok(())
+}
+
+#[cfg(all(test, target_os = "macos"))]
+#[test]
+fn opening_config_migrates_focus_without_losing_other_settings() {
+    let home = tempfile::tempdir().unwrap();
+    let config = home.path().join("config.json");
+    std::fs::write(
+        &config,
+        r#"{"speech_rate":1.4,"dictation":{"enabled":true}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        home.path().join("voice-focus.json"),
+        r#"{"mode":"follow_focus"}"#,
+    )
+    .unwrap();
+
+    prepare_voice_config(&config, home.path()).unwrap();
+    let settings: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&config).unwrap()).unwrap();
+    assert_eq!(
+        settings,
+        serde_json::json!({"speech_rate": 1.4, "dictation": {"enabled": true}, "focus_mode": "follow_focus"})
+    );
+    std::fs::remove_file(home.path().join("voice-focus.json")).unwrap();
+    assert!(focus::read(Some(&config), home.path()) == focus::Mode::FollowFocus);
+}
+
 fn dictation_settings() -> DictationSettings {
     voice_config_path()
         .and_then(|path| std::fs::read(path).ok())
@@ -296,25 +387,113 @@ fn dictation_settings() -> DictationSettings {
 }
 
 impl ChatWidget {
-    pub(super) fn show_voice_config_path(&mut self) {
+    pub(crate) fn open_voice_config(&mut self) {
         let Some(path) = voice_config_path() else {
-            self.add_error_message(
-                "Unable to locate the Voice settings without a home directory.".into(),
-            );
+            self.add_error_message("Unable to locate Voice configuration.".into());
             return;
         };
-        self.add_info_message(
-            format!("Voice configuration: {}", path.display()),
-            Some(r#"Open in the default text editor with open -t "$HOME/.config/codex-voice/config.json""#.into()),
-        );
-        #[cfg(target_os = "macos")]
-        self.add_info_message(
-            format!(
-                "Voice Call focus settings: {}",
-                self.config.codex_home.join("voice-focus.json").display()
-            ),
-            Some("Terminal focus controls the Voice Call when dictation is disabled.".into()),
-        );
+        let result = prepare_voice_config(&path, self.config.codex_home.as_path()).and_then(|()| {
+            #[cfg(target_os = "macos")]
+            let mut command = {
+                let mut command = std::process::Command::new("/usr/bin/open");
+                command.args(["-b", "com.microsoft.VSCode"]);
+                command
+            };
+            #[cfg(not(target_os = "macos"))]
+            let mut command = std::process::Command::new("code");
+            let status = command
+                .arg(&path)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()?;
+            if status.success() {
+                Ok(())
+            } else {
+                Err(std::io::Error::other(
+                    "Visual Studio Code did not open the file",
+                ))
+            }
+        });
+        if let Err(error) = result {
+            self.add_error_message(format!(
+                "Unable to open {} in VS Code: {error}",
+                path.display()
+            ));
+        }
+    }
+
+    pub(super) fn note_voice_input_started(&mut self) {
+        if self.realtime_conversation.phase == RealtimeConversationPhase::Active {
+            self.realtime_conversation.voice_segment_pending = true;
+        }
+    }
+
+    /// Prepare an explicit Enter submission using the ordinary composer path.
+    pub(super) fn prepare_voice_submit(&mut self) -> bool {
+        if self.realtime_conversation.phase != RealtimeConversationPhase::Active {
+            return false;
+        }
+        let has_draft = !self.bottom_pane.composer_text().is_empty();
+        if !self.realtime_conversation.dictation && has_draft {
+            return false;
+        }
+        if self.realtime_conversation.voice_segment_pending {
+            if !self.realtime_conversation.submit_voice_when_ready {
+                self.realtime_conversation.submit_voice_when_ready = true;
+                return true;
+            }
+            // A second Enter sends the text already available if recognition stalls.
+            self.cancel_pending_voice_submit();
+            self.realtime_conversation.voice_segment_pending = false;
+        }
+        let text = std::mem::take(&mut self.realtime_conversation.pending_voice_message);
+        if !text.is_empty() {
+            self.bottom_pane.append_dictated_text(&text);
+        }
+        false
+    }
+
+    pub(crate) fn voice_has_pending_input(&self) -> bool {
+        self.realtime_conversation.phase == RealtimeConversationPhase::Active
+            && (self.realtime_conversation.voice_segment_pending
+                || !self.realtime_conversation.pending_voice_message.is_empty())
+    }
+
+    pub(super) fn cancel_pending_voice_submit(&mut self) {
+        self.realtime_conversation.submit_voice_when_ready = false;
+    }
+
+    fn finish_voice_input_segment(&mut self, text: &str) -> bool {
+        let state = &mut self.realtime_conversation;
+        if state.phase != RealtimeConversationPhase::Active {
+            return false;
+        }
+        state.voice_segment_pending = false;
+        let text = text.trim();
+        if state.dictation {
+            if !text.is_empty() {
+                self.bottom_pane.append_dictated_text(text);
+            }
+        } else if !text.is_empty() && text.len() <= MAX_TRANSCRIPT_BYTES {
+            if state.pending_voice_message.len() + text.len() + 1 > MAX_TRANSCRIPT_BYTES {
+                state.pending_voice_message.clear();
+            }
+            if !state.pending_voice_message.is_empty() {
+                state.pending_voice_message.push(' ');
+            }
+            state.pending_voice_message.push_str(text);
+        }
+        std::mem::take(&mut state.submit_voice_when_ready)
+    }
+
+    fn submit_completed_voice_input(&mut self) {
+        if self.bottom_pane.no_modal_or_popup_active() && !self.shortcut_overlay_visible() {
+            self.handle_key_event_with_activation_key(
+                crossterm::event::KeyCode::Enter.into(),
+                /*activation_key*/ None,
+            );
+        }
     }
 
     pub(crate) fn realtime_conversation_is_running(&self) -> bool {
@@ -469,7 +648,10 @@ impl ChatWidget {
         match event {
             TuiEvent::FocusLost => {
                 self.voice_focus_start = None;
-                let mode = focus::read(self.config.codex_home.as_path());
+                let mode = focus::read(
+                    voice_config_path().as_deref(),
+                    self.config.codex_home.as_path(),
+                );
                 self.voice_focus_allows_playback = mode == focus::Mode::Manual;
                 if !self.voice_focus_allows_playback {
                     self.stop_realtime_conversation();
@@ -479,7 +661,10 @@ impl ChatWidget {
                 self.voice_focus_allows_playback = true;
                 if allow_auto_start
                     && !dictation_settings().enabled
-                    && focus::read(self.config.codex_home.as_path()) == focus::Mode::FollowFocus
+                    && focus::read(
+                        voice_config_path().as_deref(),
+                        self.config.codex_home.as_path(),
+                    ) == focus::Mode::FollowFocus
                     && let Some(thread_id) = self.thread_id()
                 {
                     self.voice_focus_start =
@@ -498,7 +683,10 @@ impl ChatWidget {
                     || self.side_conversation_active()
                     || self.blocks_direct_input
                     || dictation_settings().enabled
-                    || focus::read(self.config.codex_home.as_path()) != focus::Mode::FollowFocus
+                    || focus::read(
+                        voice_config_path().as_deref(),
+                        self.config.codex_home.as_path(),
+                    ) != focus::Mode::FollowFocus
                 {
                     self.voice_focus_start = None;
                     return;
@@ -762,7 +950,7 @@ impl ChatWidget {
         }
         self.add_info_message(
             "Voice conversation started.".to_string(),
-            Some("Use /voice mute to mute or /voice to stop.".to_string()),
+            Some("Press Enter to send the latest spoken input. Use /voice to stop.".to_string()),
         );
     }
 
@@ -845,6 +1033,14 @@ impl ChatWidget {
         if let Some(input) = realtime_delegation_input(items)
             && !matches_local_typed_input
         {
+            // The conversational service can also hand the same caption to Codex.
+            // Once that arrives, Enter should not send that caption again.
+            let pending = &mut self.realtime_conversation.pending_voice_message;
+            if !pending.is_empty() && pending.split_whitespace().eq(input.split_whitespace()) {
+                pending.clear();
+                self.realtime_conversation.submit_voice_when_ready = false;
+            }
+
             let transcript_tail_flush = items.iter().any(|item| {
                 matches!(item, UserInput::Text { text, .. }
                     if text.contains("<source>transcript_tail_flush</source>"))
@@ -1484,6 +1680,9 @@ impl ChatWidget {
     }
 
     pub(super) fn on_realtime_transcript_delta(&mut self, role: String, delta: String) {
+        if role == "user" && !delta.trim().is_empty() {
+            self.note_voice_input_started();
+        }
         if self.realtime_conversation.dictation {
             return;
         }
@@ -1641,11 +1840,8 @@ impl ChatWidget {
 
     pub(super) fn on_realtime_transcript_done(&mut self, role: String, mut text: String) {
         if self.realtime_conversation.dictation {
-            if role == "user"
-                && self.realtime_conversation.phase == RealtimeConversationPhase::Active
-                && !text.trim().is_empty()
-            {
-                self.bottom_pane.append_dictated_text(text.trim());
+            if role == "user" && self.finish_voice_input_segment(&text) {
+                self.submit_completed_voice_input();
             }
             return;
         }
@@ -1822,6 +2018,8 @@ impl ChatWidget {
                                 .latest_voice_input_fingerprint
                                 .is_some_and(|latest| Some(latest) == voice_input_fingerprint);
                     if old_superseded_transcript || !has_text {
+                        self.realtime_conversation.voice_segment_pending = false;
+                        self.cancel_pending_voice_submit();
                         return;
                     }
                     self.realtime_conversation.input_generation = self
@@ -1885,9 +2083,14 @@ impl ChatWidget {
             self.bump_active_cell_revision();
             self.flush_realtime_transcript_history();
         }
+        if role == "user" && self.finish_voice_input_segment(&text) {
+            self.submit_completed_voice_input();
+        }
     }
 
     fn finish_realtime_partial_transcripts(&mut self) {
+        // These partials are recovered for display after transport closure.
+        self.cancel_pending_voice_submit();
         if let Some((role, text)) = self.realtime_conversation.interleaved_transcript.take() {
             self.realtime_conversation.interleaved_transcript_cell = None;
             self.on_realtime_transcript_done(role, text);
