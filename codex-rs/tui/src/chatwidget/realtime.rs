@@ -445,6 +445,7 @@ impl ChatWidget {
             }
             // A second Enter sends the text already available if recognition stalls.
             self.cancel_pending_voice_submit();
+            self.realtime_conversation.voice_segment_pending = false;
         }
         let text = std::mem::take(&mut self.realtime_conversation.pending_voice_message);
         if !text.is_empty() {
@@ -731,7 +732,6 @@ impl ChatWidget {
         self.restore_all_undelivered_realtime_speech();
 
         // Stopping may prevent final transcript events from arriving.
-        self.cancel_pending_voice_submit();
         self.finish_realtime_partial_transcripts();
 
         if let Some(handle) = self.realtime_conversation.handle.take() {
@@ -2089,6 +2089,8 @@ impl ChatWidget {
     }
 
     fn finish_realtime_partial_transcripts(&mut self) {
+        // These partials are recovered for display after transport closure.
+        self.cancel_pending_voice_submit();
         if let Some((role, text)) = self.realtime_conversation.interleaved_transcript.take() {
             self.realtime_conversation.interleaved_transcript_cell = None;
             self.on_realtime_transcript_done(role, text);

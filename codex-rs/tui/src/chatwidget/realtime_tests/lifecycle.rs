@@ -41,6 +41,36 @@ async fn enter_waits_for_an_in_flight_dictation_segment() {
 }
 
 #[tokio::test]
+async fn forced_submit_does_not_leave_the_next_draft_waiting_for_voice() {
+    let (mut chat, _sender, _events, mut ops) = make_chatwidget_manual_with_sender().await;
+    activate_voice(&mut chat);
+    chat.realtime_conversation.dictation = true;
+    chat.on_realtime_transcript_done("user".into(), "First draft".into());
+    chat.note_voice_input_started();
+    chat.handle_key_event(crossterm::event::KeyCode::Enter.into());
+    assert!(ops.try_recv().is_err());
+
+    chat.handle_key_event(crossterm::event::KeyCode::Enter.into());
+    assert!(matches!(ops.try_recv(), Ok(AppCommand::UserTurn { .. })));
+    assert!(!chat.voice_has_pending_input());
+}
+
+#[tokio::test]
+async fn voice_disconnect_does_not_submit_a_recovered_partial() {
+    let (mut chat, _sender, _events, mut ops) = make_chatwidget_manual_with_sender().await;
+    activate_voice(&mut chat);
+    chat.on_realtime_transcript_delta("user".into(), "A partial sentence".into());
+    chat.handle_key_event(crossterm::event::KeyCode::Enter.into());
+    assert!(ops.try_recv().is_err());
+
+    chat.on_realtime_conversation_closed(Some("transport_closed".into()));
+    assert!(
+        std::iter::from_fn(|| ops.try_recv().ok())
+            .all(|operation| !matches!(operation, AppCommand::UserTurn { .. }))
+    );
+}
+
+#[tokio::test]
 async fn dictation_only_appends_completed_user_segments_to_the_draft() {
     let (mut chat, _sender, _events, mut ops) = make_chatwidget_manual_with_sender().await;
     chat.realtime_conversation.dictation = true;
