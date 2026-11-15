@@ -282,19 +282,41 @@ struct VoiceSettings {
     dictation: DictationSettings,
 }
 
+fn voice_config_path() -> Option<std::path::PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    Some(std::path::PathBuf::from(home).join(".config/codex-voice/config.json"))
+}
+
 fn dictation_settings() -> DictationSettings {
-    let Some(home) = std::env::var_os("HOME") else {
-        return DictationSettings::default();
-    };
-    let path = std::path::PathBuf::from(home).join(".config/codex-voice/config.json");
-    std::fs::read(path)
-        .ok()
+    voice_config_path()
+        .and_then(|path| std::fs::read(path).ok())
         .and_then(|json| serde_json::from_slice::<VoiceSettings>(&json).ok())
         .unwrap_or_default()
         .dictation
 }
 
 impl ChatWidget {
+    pub(super) fn show_voice_config_path(&mut self) {
+        let Some(path) = voice_config_path() else {
+            self.add_error_message(
+                "Unable to locate the Voice settings without a home directory.".into(),
+            );
+            return;
+        };
+        self.add_info_message(
+            format!("Voice configuration: {}", path.display()),
+            Some(r#"Open in the default text editor with open -t "$HOME/.config/codex-voice/config.json""#.into()),
+        );
+        #[cfg(target_os = "macos")]
+        self.add_info_message(
+            format!(
+                "Voice Call focus settings: {}",
+                self.config.codex_home.join("voice-focus.json").display()
+            ),
+            Some("Terminal focus controls the Voice Call when dictation is disabled.".into()),
+        );
+    }
+
     pub(crate) fn realtime_conversation_is_running(&self) -> bool {
         self.realtime_conversation.phase != RealtimeConversationPhase::Inactive
     }
@@ -475,6 +497,7 @@ impl ChatWidget {
                     || self.has_active_modal()
                     || self.side_conversation_active()
                     || self.blocks_direct_input
+                    || dictation_settings().enabled
                     || focus::read(self.config.codex_home.as_path()) != focus::Mode::FollowFocus
                 {
                     self.voice_focus_start = None;

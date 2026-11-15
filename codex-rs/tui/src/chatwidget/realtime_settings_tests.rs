@@ -9,6 +9,38 @@ use crossterm::event::KeyModifiers;
 use pretty_assertions::assert_eq;
 
 #[tokio::test]
+async fn voice_config_prints_the_preferences_path_and_open_command() {
+    let (mut chat, _sender, mut events, mut ops) = make_chatwidget_manual_with_sender().await;
+    chat.dispatch_command_with_args(SlashCommand::Voice, "config".into(), Vec::new());
+
+    let displayed = std::iter::from_fn(|| events.try_recv().ok())
+        .filter_map(|event| match event {
+            AppEvent::InsertHistoryCell(cell) => Some(cell.display_lines(/*width*/ 200)),
+            _ => None,
+        })
+        .flatten()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(displayed.contains(".config/codex-voice/config.json"));
+    assert!(displayed.contains("open -t"));
+    assert!(ops.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn voice_replay_targets_the_current_chat() {
+    let (mut chat, _sender, mut events, mut ops) = make_chatwidget_manual_with_sender().await;
+    let thread_id = codex_protocol::ThreadId::new();
+    chat.thread_id = Some(thread_id);
+    chat.dispatch_command_with_args(SlashCommand::Voice, "replay".into(), Vec::new());
+
+    assert!(std::iter::from_fn(|| events.try_recv().ok()).any(|event| {
+        matches!(event, AppEvent::ReplayLastVoiceReply { thread_id: target } if target == thread_id)
+    }));
+    assert!(ops.try_recv().is_err());
+}
+
+#[tokio::test]
 async fn voice_settings_selects_a_voice_without_starting_audio() {
     let (mut chat, _sender, mut events, mut ops) = make_chatwidget_manual_with_sender().await;
     chat.config.realtime.voice = Some(RealtimeVoice::Maple);

@@ -71,6 +71,7 @@ fn speech_should_stop(
 pub(super) struct SpeechQueueItem {
     markdown: String,
     spoken: String,
+    replay: bool,
 }
 
 struct SpokenHighlightGuard {
@@ -165,6 +166,7 @@ async fn speak_with_word_positions(
                         *position.lock().unwrap_or_else(|e| e.into_inner()) =
                             Some(SpokenLine {
                                 markdown: Arc::clone(&markdown_source),
+                                replay: item.replay,
                                 spoken: Arc::clone(&spoken_source),
                                 utf16_start,
                                 utf16_len,
@@ -323,10 +325,9 @@ fn speech_rate_multiplier_from_path(path: &std::path::Path) -> f32 {
 }
 
 fn configured_speech_rate_multiplier() -> f32 {
-    let Some(home) = std::env::var_os("HOME") else {
+    let Some(path) = super::voice_config_path() else {
         return DEFAULT_SPEECH_RATE_MULTIPLIER;
     };
-    let path = std::path::PathBuf::from(home).join(".config/codex-voice/config.json");
     speech_rate_multiplier_from_path(&path)
 }
 
@@ -653,6 +654,14 @@ impl ChatWidget {
     /// Queue local playback rather than cancelling the preceding assistant
     /// message. The worker exits when voice mode is explicitly stopped.
     pub(crate) fn play_verbatim_speech(&mut self, markdown: &str) -> std::io::Result<()> {
+        self.queue_verbatim_speech(markdown, /*replay*/ false)
+    }
+
+    pub(crate) fn replay_verbatim_speech(&mut self, markdown: &str) -> std::io::Result<()> {
+        self.queue_verbatim_speech(markdown, /*replay*/ true)
+    }
+
+    fn queue_verbatim_speech(&mut self, markdown: &str, replay: bool) -> std::io::Result<()> {
         let spoken = markdown_to_spoken_text(markdown);
         if spoken.is_empty() {
             return Ok(());
@@ -662,6 +671,7 @@ impl ChatWidget {
                 .send(SpeechQueueItem {
                     markdown: markdown.to_owned(),
                     spoken: spoken.clone(),
+                    replay,
                 })
                 .is_ok()
         {
@@ -672,6 +682,7 @@ impl ChatWidget {
             .send(SpeechQueueItem {
                 markdown: markdown.to_owned(),
                 spoken,
+                replay,
             })
             .map_err(|_| std::io::Error::other("Unable to queue macOS speech"))?;
         let (pause_sender, pause_receiver) = tokio::sync::watch::channel(false);

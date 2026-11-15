@@ -1325,6 +1325,9 @@ pub(crate) enum AppEvent {
 
     /// Read the owning server preference before showing the voice picker.
     OpenRealtimeSettings,
+    ReplayLastVoiceReply {
+        thread_id: ThreadId,
+    },
     OpenRealtimeSoundDevices,
     OpenRealtimeVoices,
     OpenRealtimeDevicePicker {
