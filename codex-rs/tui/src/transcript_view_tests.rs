@@ -1413,6 +1413,7 @@ fn spoken_line_background_preserves_foreground_and_scroll() {
     let previous_position = view.position;
     let offset = spoken.find("Zeile").unwrap();
     view.spoken_line = Some(SpokenLine {
+        replay: false,
         markdown: Arc::from(markdown),
         spoken: Arc::from(spoken.as_str()),
         utf16_start: spoken[..offset].encode_utf16().count(),
@@ -1452,6 +1453,50 @@ fn spoken_line_background_preserves_foreground_and_scroll() {
     view.spoken_line = None;
     let cleared = render(&mut view, &cells, 40, 12);
     assert_eq!(before, cleared);
+}
+
+#[test]
+fn spoken_replay_highlights_the_newest_matching_reply() {
+    use super::SpokenLine;
+    use crate::history_cell::AgentMarkdownCell;
+
+    let markdown = "Hello again.";
+    let cells: Vec<Arc<dyn HistoryCell>> = vec![
+        Arc::new(AgentMarkdownCell::new(
+            markdown.into(),
+            std::path::Path::new("/tmp"),
+        )),
+        Arc::new(AgentMarkdownCell::new(
+            markdown.into(),
+            std::path::Path::new("/tmp"),
+        )),
+    ];
+    let mut view = TranscriptView::default();
+    let plain = render(&mut view, &cells, 40, 12);
+    view.spoken_line = Some(SpokenLine {
+        markdown: Arc::from(markdown),
+        replay: true,
+        spoken: Arc::from(markdown),
+        utf16_start: 0,
+        utf16_len: 5,
+    });
+    let highlighted = render(&mut view, &cells, 40, 12);
+    let message_rows: Vec<_> = (plain.area.top()..plain.area.bottom())
+        .filter(|&y| {
+            let line: String = (plain.area.left()..plain.area.right())
+                .map(|x| plain[(x, y)].symbol())
+                .collect();
+            line.contains(markdown)
+        })
+        .collect();
+    assert_eq!(message_rows.len(), 2);
+    let highlighted_rows: Vec<_> = (plain.area.top()..plain.area.bottom())
+        .filter(|&y| {
+            (plain.area.left()..plain.area.right())
+                .any(|x| highlighted[(x, y)].bg != plain[(x, y)].bg)
+        })
+        .collect();
+    assert_eq!(highlighted_rows, vec![message_rows[1]]);
 }
 
 #[test]

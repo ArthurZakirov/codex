@@ -5,6 +5,33 @@ use crate::app_event::RealtimeWebrtcStartupFailure;
 use pretty_assertions::assert_eq;
 
 #[tokio::test]
+async fn dictation_only_appends_completed_user_segments_to_the_draft() {
+    let (mut chat, _sender, _events, mut ops) = make_chatwidget_manual_with_sender().await;
+    chat.realtime_conversation.dictation = true;
+    chat.realtime_conversation.phase = RealtimeConversationPhase::Active;
+    chat.bottom_pane.insert_str("Bitte");
+
+    chat.on_realtime_transcript_delta("user".into(), "prüfe".into());
+    chat.on_realtime_transcript_done("assistant".into(), "ignored".into());
+    assert_eq!(chat.bottom_pane.composer_text(), "Bitte");
+
+    chat.on_realtime_transcript_done("user".into(), "prüfe das".into());
+    chat.on_realtime_transcript_done("user".into(), "and report back".into());
+    assert_eq!(
+        chat.bottom_pane.composer_text(),
+        "Bitte prüfe das and report back"
+    );
+    assert!(ops.try_recv().is_err());
+
+    chat.realtime_conversation.phase = RealtimeConversationPhase::Stopping;
+    chat.on_realtime_transcript_done("user".into(), "late".into());
+    assert_eq!(
+        chat.bottom_pane.composer_text(),
+        "Bitte prüfe das and report back"
+    );
+}
+
+#[tokio::test]
 async fn voice_cannot_start_in_a_side_conversation() {
     let (mut chat, _sender, mut events, mut ops) = make_chatwidget_manual_with_sender().await;
     chat.set_side_conversation_active(/*active*/ true);

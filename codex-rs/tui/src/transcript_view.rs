@@ -87,6 +87,7 @@ enum Position {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SpokenLine {
     pub(crate) markdown: Arc<str>,
+    pub(crate) replay: bool,
     pub(crate) spoken: Arc<str>,
     pub(crate) utf16_start: usize,
     pub(crate) utf16_len: usize,
@@ -341,11 +342,16 @@ impl TranscriptView {
                         .filter(|message| message.markdown_source() == progress.markdown.as_ref())
                         .map(|_| index)
                 });
-                let target = matches.next()?;
-                if matches.next().is_some() {
-                    // Identical messages cannot be disambiguated from text alone.
-                    return None;
-                }
+                let target = if progress.replay {
+                    // Replay was explicitly requested for the newest reply.
+                    matches.next_back()?
+                } else {
+                    let target = matches.next()?;
+                    if matches.next().is_some() {
+                        return None;
+                    }
+                    target
+                };
                 let layout = self.layout(cells, target)?;
                 let offset = spoken_word_display_offset(
                     &progress.spoken,

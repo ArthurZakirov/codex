@@ -139,7 +139,9 @@ impl SlashCommand {
                 "include current selection, open files, and other context from your IDE"
             }
             SlashCommand::Plan => "switch to Plan mode",
-            SlashCommand::Voice => "start or stop voice; use /voice settings to choose a voice",
+            SlashCommand::Voice => {
+                "start or stop voice, replay the last reply, or find the voice config"
+            }
             SlashCommand::Goal => "set or view the goal for a long-running task",
             SlashCommand::Agents => "open the agent command center",
             SlashCommand::MultiAgents => "switch between this session's subagents",

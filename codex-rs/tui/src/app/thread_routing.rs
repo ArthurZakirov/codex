@@ -852,8 +852,18 @@ impl App {
             AppCommand::RealtimeConversationStart {
                 thread_id: realtime_thread_id,
                 offer_sdp,
+                dictation,
             } => {
                 if *realtime_thread_id != thread_id {
+                    return Ok(true);
+                }
+                if *dictation {
+                    app_server
+                        .start_realtime_dictation(
+                            *realtime_thread_id,
+                            String::from(offer_sdp.clone()),
+                        )
+                        .await?;
                     return Ok(true);
                 }
                 let model = self

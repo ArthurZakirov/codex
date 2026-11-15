@@ -852,6 +852,15 @@ impl ChatWidget {
             }
             SlashCommand::Voice => match trimmed.to_ascii_lowercase().as_str() {
                 "settings" => self.app_event_tx.send(AppEvent::OpenRealtimeSettings),
+                "config" => self.show_voice_config_path(),
+                "replay" => {
+                    if let Some(thread_id) = self.thread_id() {
+                        self.app_event_tx
+                            .send(AppEvent::ReplayLastVoiceReply { thread_id });
+                    } else {
+                        self.add_info_message("No assistant reply to replay.".into(), None);
+                    }
+                }
                 "mute" => self.app_event_tx.send(AppEvent::VoiceControl {
                     thread_id: self.thread_id(),
                     control: crate::app_event::VoiceControl::Mute,
@@ -860,7 +869,9 @@ impl ChatWidget {
                     thread_id: self.thread_id(),
                     control: crate::app_event::VoiceControl::Stop,
                 }),
-                _ => self.add_error_message("Usage: /voice [settings|mute|stop]".to_string()),
+                _ => self.add_error_message(
+                    "Usage: /voice [settings|config|replay|mute|stop]".to_string(),
+                ),
             },
             SlashCommand::Ide => {
                 self.handle_ide_command_args(trimmed);

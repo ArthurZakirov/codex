@@ -99,8 +99,8 @@ pub(super) fn session_update_session(
                     }),
                     turn_detection: Some(SessionTurnDetection {
                         r#type: TurnDetectionType::ServerVad,
-                        interrupt_response: true,
-                        create_response: true,
+                        interrupt_response: Some(true),
+                        create_response: Some(true),
                         silence_duration_ms: 500,
                     }),
                 },
@@ -158,7 +158,12 @@ pub(super) fn session_update_session(
                     transcription: Some(SessionInputAudioTranscription {
                         model: REALTIME_V2_INPUT_TRANSCRIPTION_MODEL.to_string(),
                     }),
-                    turn_detection: None,
+                    turn_detection: Some(SessionTurnDetection {
+                        r#type: TurnDetectionType::ServerVad,
+                        interrupt_response: None,
+                        create_response: None,
+                        silence_duration_ms: 500,
+                    }),
                 },
                 output: None,
             },

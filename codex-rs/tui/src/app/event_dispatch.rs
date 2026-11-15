@@ -2238,6 +2238,14 @@ impl App {
             AppEvent::RealtimeConversationStateChanged => {
                 self.repaint_agents_overview();
             }
+            AppEvent::AutoStartDictation { thread_id } => {
+                if !self.reconnect.offline
+                    && self.chat_widget.thread_id() == Some(thread_id)
+                    && self.voice_owner_thread_id().is_none()
+                {
+                    self.chat_widget.maybe_auto_start_dictation();
+                }
+            }
             AppEvent::VoiceControl { thread_id, control } => {
                 if thread_id == self.chat_widget.thread_id() || self.voice_owner_thread_id().is_some() {
                     self.control_voice(control);
@@ -2732,6 +2740,11 @@ impl App {
                 self.chat_widget.on_plugin_mentions_loaded(plugins);
             }
             AppEvent::OpenRealtimeSettings => self.chat_widget.open_realtime_settings(),
+            AppEvent::ReplayLastVoiceReply { thread_id } => {
+                if self.chat_widget.thread_id() == Some(thread_id) {
+                    self.replay_last_voice_reply();
+                }
+            }
             AppEvent::OpenRealtimeSoundDevices => self.chat_widget.open_realtime_sound_devices(),
             AppEvent::OpenRealtimeVoices => self.open_realtime_voices(app_server).await,
             AppEvent::OpenRealtimeDevicePicker { kind } => self.list_realtime_devices(kind),

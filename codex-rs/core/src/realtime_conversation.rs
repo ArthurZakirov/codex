@@ -682,6 +682,8 @@ impl RealtimeConversationManager {
             existing_call_id,
         } = start;
         let event_parser = session_config.event_parser;
+        let dictation =
+            sdp.is_some() && session_config.session_mode == RealtimeSessionMode::Transcription;
         let session_kind = match event_parser {
             RealtimeEventParser::V1 | RealtimeEventParser::FramelessBidi => RealtimeSessionKind::V1,
             RealtimeEventParser::RealtimeV2 => RealtimeSessionKind::V2,
@@ -816,7 +818,7 @@ impl RealtimeConversationManager {
             stop_token,
         });
         state.mode_instructions = Some(mode_instructions);
-        state.context_active = true;
+        state.context_active = !dictation;
         Ok(RealtimeStartOutput {
             realtime_active,
             route_handoffs,
@@ -1420,9 +1422,16 @@ async fn prepare_realtime_start(
         ConversationStartTransport::Webrtc { .. }
         | ConversationStartTransport::ExistingCall { .. } => RealtimeWsVersion::V1,
     });
+    // V2 text over WebRTC selects a transcription session. The V3 voice call
+    // continues to use the conversation session and its model configuration.
+    let webrtc_dictation = matches!(&transport, ConversationStartTransport::Webrtc { .. })
+        && version == RealtimeWsVersion::V2
+        && params.output_modality == RealtimeOutputModality::Text;
     match &transport {
         ConversationStartTransport::Webrtc { .. } => {
-            validate_avas_webrtc_start(version, config.realtime.session_type)?;
+            if !webrtc_dictation {
+                validate_avas_webrtc_start(version, config.realtime.session_type)?;
+            }
         }
         ConversationStartTransport::ExistingCall { .. } => {
             if version == RealtimeWsVersion::V2 {
@@ -1446,6 +1455,7 @@ async fn prepare_realtime_start(
         ConversationStartTransport::Websocket => {}
     }
     let configured_voice = match (&transport, params.version) {
+        _ if webrtc_dictation => ConfiguredRealtimeVoice::Ignore,
         (ConversationStartTransport::ExistingCall { .. }, _)
         | (ConversationStartTransport::Webrtc { .. }, None) => ConfiguredRealtimeVoice::Ignore,
         (ConversationStartTransport::Webrtc { .. } | ConversationStartTransport::Websocket, _) => {
@@ -1454,6 +1464,9 @@ async fn prepare_realtime_start(
     };
     let mut session_config =
         build_realtime_session_config(sess, &params, version, configured_voice).await?;
+    if webrtc_dictation {
+        session_config.session_mode = RealtimeSessionMode::Transcription;
+    }
     if matches!(&transport, ConversationStartTransport::ExistingCall { .. }) {
         session_config.session_id = params.realtime_session_id.clone();
     }
@@ -1757,6 +1770,8 @@ async fn handle_start_inner(
         end: realtime_end_instructions,
     };
     let event_parser = session_config.event_parser;
+    let dictation =
+        sdp.is_some() && session_config.session_mode == RealtimeSessionMode::Transcription;
     let start = RealtimeStart {
         api_provider,
         http_client_factory,
@@ -1818,7 +1833,7 @@ async fn handle_start_inner(
         let mut handoff_error = None;
         // Drain already-parsed events so a queued handoff is routed before the final tail.
         while let Ok((event, completed)) = events_rx.recv().await {
-            if let Some(delta) = completed {
+            if !dictation && let Some(delta) = completed {
                 let text = wrap_realtime_delegation_input(
                     "",
                     Some(&delta),
@@ -1843,10 +1858,12 @@ async fn handle_start_inner(
                 end = RealtimeConversationEnd::Error;
             }
             let maybe_routed_text = match &event {
-                RealtimeEvent::HandoffRequested(handoff) => realtime_delegation_from_handoff(
-                    handoff,
-                    event_parser == RealtimeEventParser::FramelessBidi,
-                ),
+                RealtimeEvent::HandoffRequested(handoff) if !dictation => {
+                    realtime_delegation_from_handoff(
+                        handoff,
+                        event_parser == RealtimeEventParser::FramelessBidi,
+                    )
+                }
                 _ => None,
             };
             if let Some(text) = maybe_routed_text {
@@ -1866,7 +1883,8 @@ async fn handle_start_inner(
             }
         }
         drop(events_rx);
-        if handoff_error.is_none()
+        if !dictation
+            && handoff_error.is_none()
             && let Ok(text) = transcript_tail_rx.recv().await
             && let Err(err) = route_handoffs.record_transcript(&sess_clone, text).await
         {

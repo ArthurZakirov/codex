@@ -148,6 +148,7 @@ pub(super) struct RealtimeConversationUiState {
     pub(super) phase: RealtimeConversationPhase,
     recover_late_transcripts: bool,
     attempt_id: u64,
+    dictation: bool,
     thread_id: Option<ThreadId>,
     pub(super) handle: Option<RealtimeWebrtcSessionHandle>,
     startup_abort: Option<AbortHandle>,
@@ -268,7 +269,54 @@ fn realtime_input_fingerprint(input: &str) -> (usize, u64) {
     (input.len(), hasher.finish())
 }
 
+#[derive(Default, serde::Deserialize)]
+#[serde(default)]
+struct DictationSettings {
+    enabled: bool,
+    auto_start: bool,
+}
+
+#[derive(Default, serde::Deserialize)]
+#[serde(default)]
+struct VoiceSettings {
+    dictation: DictationSettings,
+}
+
+fn voice_config_path() -> Option<std::path::PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    Some(std::path::PathBuf::from(home).join(".config/codex-voice/config.json"))
+}
+
+fn dictation_settings() -> DictationSettings {
+    voice_config_path()
+        .and_then(|path| std::fs::read(path).ok())
+        .and_then(|json| serde_json::from_slice::<VoiceSettings>(&json).ok())
+        .unwrap_or_default()
+        .dictation
+}
+
 impl ChatWidget {
+    pub(super) fn show_voice_config_path(&mut self) {
+        let Some(path) = voice_config_path() else {
+            self.add_error_message(
+                "Unable to locate the Voice settings without a home directory.".into(),
+            );
+            return;
+        };
+        self.add_info_message(
+            format!("Voice configuration: {}", path.display()),
+            Some(r#"Open in the default text editor with open -t "$HOME/.config/codex-voice/config.json""#.into()),
+        );
+        #[cfg(target_os = "macos")]
+        self.add_info_message(
+            format!(
+                "Voice Call focus settings: {}",
+                self.config.codex_home.join("voice-focus.json").display()
+            ),
+            Some("Terminal focus controls the Voice Call when dictation is disabled.".into()),
+        );
+    }
+
     pub(crate) fn realtime_conversation_is_running(&self) -> bool {
         self.realtime_conversation.phase != RealtimeConversationPhase::Inactive
     }
@@ -276,6 +324,21 @@ impl ChatWidget {
     pub(crate) fn may_receive_realtime_transcripts(&self) -> bool {
         self.realtime_conversation.phase != RealtimeConversationPhase::Inactive
             || self.realtime_conversation.recover_late_transcripts
+    }
+
+    pub(crate) fn realtime_dictation_is_running(&self) -> bool {
+        self.realtime_conversation.dictation && self.realtime_conversation_is_running()
+    }
+
+    pub(super) fn dictation_auto_start_enabled() -> bool {
+        let settings = dictation_settings();
+        settings.enabled && settings.auto_start
+    }
+
+    pub(crate) fn maybe_auto_start_dictation(&mut self) {
+        if Self::dictation_auto_start_enabled() && !self.realtime_conversation_is_running() {
+            self.toggle_realtime_conversation_inner();
+        }
     }
 
     pub(crate) fn toggle_realtime_conversation(&mut self) {
@@ -334,15 +397,15 @@ impl ChatWidget {
 
         self.session_telemetry
             .counter("codex.voice.session.start", /*inc*/ 1, &[]);
-        self.start_realtime_conversation(thread_id);
+        self.start_realtime_conversation(thread_id, dictation_settings().enabled);
     }
 
-    fn start_realtime_conversation(&mut self, thread_id: ThreadId) {
+    fn start_realtime_conversation(&mut self, thread_id: ThreadId, dictation: bool) {
         let Some(audio) = self.realtime_audio_settings() else {
             return;
         };
         #[cfg(target_os = "macos")]
-        let lease = if verbatim_speech::enabled() {
+        let lease = if verbatim_speech::enabled() || dictation {
             match audio_lease::acquire() {
                 Ok(lease) => Some(lease),
                 Err(error) => {
@@ -356,6 +419,7 @@ impl ChatWidget {
         #[cfg(not(target_os = "macos"))]
         let lease = None;
         self.realtime_conversation.recover_late_transcripts = false;
+        self.realtime_conversation.dictation = dictation;
         self.realtime_conversation.attempt_id =
             NEXT_REALTIME_ATTEMPT_ID.fetch_add(1, Ordering::Relaxed);
         self.realtime_conversation.thread_id = Some(thread_id);
@@ -399,7 +463,7 @@ impl ChatWidget {
     ) {
         use crate::tui::TuiEvent;
 
-        if !verbatim_speech::enabled() {
+        if !verbatim_speech::enabled() || self.realtime_dictation_is_running() {
             return;
         }
         match event {
@@ -414,6 +478,7 @@ impl ChatWidget {
             TuiEvent::FocusGained => {
                 self.voice_focus_allows_playback = true;
                 if allow_auto_start
+                    && !dictation_settings().enabled
                     && focus::read(self.config.codex_home.as_path()) == focus::Mode::FollowFocus
                     && let Some(thread_id) = self.thread_id()
                 {
@@ -432,6 +497,7 @@ impl ChatWidget {
                     || self.has_active_modal()
                     || self.side_conversation_active()
                     || self.blocks_direct_input
+                    || dictation_settings().enabled
                     || focus::read(self.config.codex_home.as_path()) != focus::Mode::FollowFocus
                 {
                     self.voice_focus_start = None;
@@ -556,6 +622,7 @@ impl ChatWidget {
         if !self.submit_op(AppCommand::RealtimeConversationStart {
             thread_id,
             offer_sdp: offer.offer_sdp.into(),
+            dictation: self.realtime_conversation.dictation,
         }) {
             self.record_realtime_failure(RealtimeFailureCause::LocalRequest);
             self.reset_realtime_conversation();
@@ -686,6 +753,13 @@ impl ChatWidget {
         self.update_realtime_footer();
         self.frame_requester
             .schedule_frame_in(MICROPHONE_METER_INTERVAL);
+        if self.realtime_conversation.dictation {
+            self.add_info_message(
+                "Dictation started.".to_string(),
+                Some("Press Enter to send your draft or F8 to stop dictation.".to_string()),
+            );
+            return;
+        }
         self.add_info_message(
             "Voice conversation started.".to_string(),
             Some("Use /voice mute to mute or /voice to stop.".to_string()),
@@ -1410,6 +1484,9 @@ impl ChatWidget {
     }
 
     pub(super) fn on_realtime_transcript_delta(&mut self, role: String, delta: String) {
+        if self.realtime_conversation.dictation {
+            return;
+        }
         #[cfg(target_os = "macos")]
         if verbatim_speech::enabled() && role == "assistant" {
             return;
@@ -1563,6 +1640,15 @@ impl ChatWidget {
     }
 
     pub(super) fn on_realtime_transcript_done(&mut self, role: String, mut text: String) {
+        if self.realtime_conversation.dictation {
+            if role == "user"
+                && self.realtime_conversation.phase == RealtimeConversationPhase::Active
+                && !text.trim().is_empty()
+            {
+                self.bottom_pane.append_dictated_text(text.trim());
+            }
+            return;
+        }
         #[cfg(target_os = "macos")]
         if verbatim_speech::enabled() && role == "assistant" {
             return;
@@ -1927,7 +2013,7 @@ impl ChatWidget {
                     /*hint*/ None,
                 );
             }
-            self.start_realtime_conversation(thread_id);
+            self.start_realtime_conversation(thread_id, self.realtime_conversation.dictation);
             return;
         }
         if let Some(reason) = reason
@@ -2053,6 +2139,7 @@ impl ChatWidget {
             .is_some();
         self.realtime_conversation = RealtimeConversationUiState {
             attempt_id: self.realtime_conversation.attempt_id,
+            dictation: self.realtime_conversation.dictation,
             // Keep parked speech tied to its input until it is taken for replay.
             input_generation: self.realtime_conversation.input_generation,
             pending_speech: std::mem::take(&mut self.realtime_conversation.pending_speech),

@@ -95,6 +95,9 @@ impl App {
         thread_id: ThreadId,
         notification: &ServerNotification,
     ) {
+        let previous_dictation = self.background_voice.as_ref().is_some_and(|owner| {
+            owner.thread_id() == Some(thread_id) && owner.realtime_dictation_is_running()
+        });
         if matches!(
             notification,
             ServerNotification::ThreadClosed(_)
@@ -117,6 +120,13 @@ impl App {
             .is_some_and(|owner| !owner.may_receive_realtime_transcripts())
         {
             self.retire_background_voice();
+            if previous_dictation
+                && !self.reconnect.offline
+                && self.voice_owner_thread_id().is_none()
+                && self.chat_widget.thread_id() != Some(thread_id)
+            {
+                self.chat_widget.maybe_auto_start_dictation();
+            }
         }
     }
 

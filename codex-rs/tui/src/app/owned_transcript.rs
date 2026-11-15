@@ -95,6 +95,31 @@ impl PreparedConversation {
 }
 
 impl App {
+    pub(super) fn replay_last_voice_reply(&mut self) {
+        #[cfg(target_os = "macos")]
+        {
+            let reply = self.transcript_cells.iter().rev().find_map(|cell| {
+                let message = cell
+                    .as_any()
+                    .downcast_ref::<crate::history_cell::AgentMarkdownCell>()?;
+                let markdown = message.markdown_source();
+                (!markdown.trim().is_empty()).then_some(markdown)
+            });
+            let Some(reply) = reply else {
+                self.chat_widget
+                    .add_info_message("No assistant reply to replay.".into(), None);
+                return;
+            };
+            if let Err(error) = self.chat_widget.replay_verbatim_speech(reply) {
+                self.chat_widget
+                    .add_error_message(format!("Unable to replay the last reply: {error}"));
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        self.chat_widget
+            .add_error_message("Voice replay is available on macOS.".into());
+    }
+
     /// Copy draft selections before key shortcuts, or after mouse layout has been refreshed.
     pub(super) fn handle_composer_copy_event(
         &mut self,
