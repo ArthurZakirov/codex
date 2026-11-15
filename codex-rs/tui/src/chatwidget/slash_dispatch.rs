@@ -852,7 +852,7 @@ impl ChatWidget {
             }
             SlashCommand::Voice => match trimmed.to_ascii_lowercase().as_str() {
                 "settings" => self.app_event_tx.send(AppEvent::OpenRealtimeSettings),
-                "config" => self.show_voice_config_path(),
+                "config" => self.app_event_tx.send(AppEvent::OpenVoiceConfig),
                 "replay" => {
                     if let Some(thread_id) = self.thread_id() {
                         self.app_event_tx

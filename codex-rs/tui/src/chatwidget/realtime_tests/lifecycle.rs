@@ -5,6 +5,42 @@ use crate::app_event::RealtimeWebrtcStartupFailure;
 use pretty_assertions::assert_eq;
 
 #[tokio::test]
+async fn enter_sends_a_finished_voice_call_caption_as_a_user_turn() {
+    let (mut chat, _sender, _events, mut ops) = make_chatwidget_manual_with_sender().await;
+    activate_voice(&mut chat);
+    chat.on_realtime_transcript_done("user".into(), "Send this voice message".into());
+    assert!(chat.bottom_pane.composer_text().is_empty());
+    assert!(ops.try_recv().is_err());
+
+    chat.handle_key_event(crossterm::event::KeyCode::Enter.into());
+    assert!(matches!(
+        ops.try_recv(),
+        Ok(AppCommand::UserTurn { items, .. })
+            if items.iter().any(|item| matches!(item, UserInput::Text { text, .. } if text == "Send this voice message"))
+    ));
+
+    chat.handle_key_event(crossterm::event::KeyCode::Enter.into());
+    assert!(ops.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn enter_waits_for_an_in_flight_dictation_segment() {
+    let (mut chat, _sender, _events, mut ops) = make_chatwidget_manual_with_sender().await;
+    activate_voice(&mut chat);
+    chat.realtime_conversation.dictation = true;
+    chat.on_realtime_transcript_done("user".into(), "First part".into());
+    chat.note_voice_input_started();
+    chat.handle_key_event(crossterm::event::KeyCode::Enter.into());
+    assert!(ops.try_recv().is_err());
+    chat.on_realtime_transcript_done("user".into(), "second part".into());
+    assert!(matches!(
+        ops.try_recv(),
+        Ok(AppCommand::UserTurn { items, .. })
+            if items.iter().any(|item| matches!(item, UserInput::Text { text, .. } if text == "First part second part"))
+    ));
+}
+
+#[tokio::test]
 async fn dictation_only_appends_completed_user_segments_to_the_draft() {
     let (mut chat, _sender, _events, mut ops) = make_chatwidget_manual_with_sender().await;
     chat.realtime_conversation.dictation = true;

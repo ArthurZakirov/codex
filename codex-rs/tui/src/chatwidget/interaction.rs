@@ -97,6 +97,11 @@ impl ChatWidget {
         key_event: KeyEvent,
         activation_key: Option<crate::key_hint::KeyBinding>,
     ) -> KeyEventAction {
+        if key_event.kind == KeyEventKind::Press
+            && !key_hint::plain(KeyCode::Enter).is_press(key_event)
+        {
+            self.cancel_pending_voice_submit();
+        }
         if self.handle_quick_dial_menu(key_event) {
             return KeyEventAction::None;
         }
@@ -306,6 +311,12 @@ impl ChatWidget {
             }
             _ => {
                 let had_modal_or_popup = !self.bottom_pane.no_modal_or_popup_active();
+                if !had_modal_or_popup
+                    && key_hint::plain(KeyCode::Enter).is_press(key_event)
+                    && self.prepare_voice_submit()
+                {
+                    return KeyEventAction::None;
+                }
                 let should_pause_active_goal =
                     self.bottom_pane.should_interrupt_running_task(key_event);
                 let input_result = self

@@ -1118,7 +1118,9 @@ impl BottomPane {
         let draft = self.composer_text();
         let cursor = self.composer.current_cursor();
         self.composer.set_current_cursor(draft.len());
-        if draft.ends_with(|character: char| !character.is_whitespace()) {
+        if draft.ends_with(|character: char| !character.is_whitespace())
+            || (draft.is_empty() && text.starts_with(['!', '/']))
+        {
             self.composer.insert_str(" ");
         }
         self.composer.insert_str(text);

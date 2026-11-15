@@ -932,6 +932,7 @@ impl App {
     /// Keep the navigation hint and input guard aligned, including pending paste and attachments.
     fn enter_returns_to_latest(&self) -> bool {
         self.chat_widget.composer_is_empty()
+            && !self.chat_widget.voice_has_pending_input()
             && self.chat_widget.no_modal_or_popup_active()
             && !self.backtrack.primed
             && !self.backtrack.overlay_preview_active

@@ -352,6 +352,12 @@ impl ChatWidget {
                     self.on_realtime_conversation_started();
                 }
             }
+            ServerNotification::ThreadRealtimeItemAdded(notification) => {
+                if !from_replay && notification.item["type"] == "input_audio_buffer.speech_started"
+                {
+                    self.note_voice_input_started();
+                }
+            }
             ServerNotification::ThreadRealtimeTranscriptDelta(notification) => {
                 if !from_replay {
                     self.on_realtime_transcript_delta(notification.role, notification.delta);
@@ -404,7 +410,6 @@ impl ChatWidget {
             | ServerNotification::FsChanged(_)
             | ServerNotification::FuzzyFileSearchSessionUpdated(_)
             | ServerNotification::FuzzyFileSearchSessionCompleted(_)
-            | ServerNotification::ThreadRealtimeItemAdded(_)
             | ServerNotification::ThreadRealtimeItemStarted(_)
             | ServerNotification::ThreadRealtimeItemTranscriptDelta(_)
             | ServerNotification::ThreadRealtimeItemCompleted(_)
