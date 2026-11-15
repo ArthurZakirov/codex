@@ -31,6 +31,19 @@ fn props() -> FooterProps {
     }
 }
 
+#[test]
+fn shortcut_help_displays_the_configured_voice_replay_key() {
+    let mut props = props();
+    props.key_hints.replay_voice = Some(key_hint::plain(KeyCode::F(10)).into());
+    let rendered = lines(&props, 150)
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(rendered.to_ascii_lowercase().contains("f10"));
+    assert!(rendered.contains("Replay voice"));
+}
+
 fn snapshot(name: &str, width: u16, height: Option<u16>, props: &FooterProps) {
     let inner_width = width - FOOTER_INDENT_COLS as u16;
     let measured_lines = lines(props, inner_width);

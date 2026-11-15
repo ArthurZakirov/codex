@@ -7,6 +7,7 @@ use std::path::Path;
 #[serde(rename_all = "snake_case")]
 pub(super) enum Mode {
     #[default]
+    #[serde(rename = "lock", alias = "manual")]
     Manual,
     StopOnBlur,
     FollowFocus,
@@ -40,6 +41,25 @@ pub(super) fn legacy_mode(codex_home: &Path) -> Mode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_lock_overrides_a_legacy_follow_focus_preference() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            home.path().join("voice-focus.json"),
+            r#"{"mode":"follow_focus"}"#,
+        )
+        .unwrap();
+        let config = home.path().join("config.json");
+        for spelling in ["lock", "manual"] {
+            std::fs::write(
+                &config,
+                serde_json::json!({"focus_mode": spelling}).to_string(),
+            )
+            .unwrap();
+            assert!(read(Some(&config), home.path()) == Mode::Manual);
+        }
+    }
 
     #[test]
     fn only_explicit_follow_focus_enables_automatic_start() {

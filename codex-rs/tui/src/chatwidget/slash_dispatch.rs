@@ -397,12 +397,7 @@ impl ChatWidget {
                     );
                 }
             }
-            SlashCommand::Voice => {
-                self.app_event_tx.send(AppEvent::VoiceControl {
-                    thread_id: self.thread_id(),
-                    control: crate::app_event::VoiceControl::Toggle,
-                });
-            }
+            SlashCommand::Voice => self.open_voice_menu(),
             SlashCommand::Side | SlashCommand::Btw => {
                 self.request_empty_side_conversation(cmd);
             }
@@ -865,12 +860,16 @@ impl ChatWidget {
                     thread_id: self.thread_id(),
                     control: crate::app_event::VoiceControl::Mute,
                 }),
+                "toggle" => self.app_event_tx.send(AppEvent::VoiceControl {
+                    thread_id: self.thread_id(),
+                    control: crate::app_event::VoiceControl::Toggle,
+                }),
                 "stop" => self.app_event_tx.send(AppEvent::VoiceControl {
                     thread_id: self.thread_id(),
                     control: crate::app_event::VoiceControl::Stop,
                 }),
                 _ => self.add_error_message(
-                    "Usage: /voice [settings|config|replay|mute|stop]".to_string(),
+                    "Usage: /voice [toggle|settings|config|replay|mute|stop]".to_string(),
                 ),
             },
             SlashCommand::Ide => {
