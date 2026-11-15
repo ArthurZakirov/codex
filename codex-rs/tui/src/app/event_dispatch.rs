@@ -2238,6 +2238,14 @@ impl App {
             AppEvent::RealtimeConversationStateChanged => {
                 self.repaint_agents_overview();
             }
+            AppEvent::AutoStartDictation { thread_id } => {
+                if !self.reconnect.offline
+                    && self.chat_widget.thread_id() == Some(thread_id)
+                    && self.voice_owner_thread_id().is_none()
+                {
+                    self.chat_widget.maybe_auto_start_dictation();
+                }
+            }
             AppEvent::VoiceControl { thread_id, control } => {
                 if thread_id == self.chat_widget.thread_id() || self.voice_owner_thread_id().is_some() {
                     self.control_voice(control);

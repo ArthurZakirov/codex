@@ -24,6 +24,38 @@ impl AppServerSession {
         model: Option<String>,
         voice: Option<RealtimeVoice>,
     ) -> Result<()> {
+        self.start_realtime(thread_id, offer_sdp, model, voice, /*dictation*/ false)
+            .await
+    }
+
+    pub(crate) async fn start_realtime_dictation(
+        &mut self,
+        thread_id: ThreadId,
+        offer_sdp: String,
+    ) -> Result<()> {
+        self.start_realtime(thread_id, offer_sdp, None, None, /*dictation*/ true)
+            .await
+    }
+
+    async fn start_realtime(
+        &mut self,
+        thread_id: ThreadId,
+        offer_sdp: String,
+        model: Option<String>,
+        voice: Option<RealtimeVoice>,
+        dictation: bool,
+    ) -> Result<()> {
+        let (version, output_modality) = if dictation {
+            (
+                RealtimeConversationVersion::V2,
+                RealtimeOutputModality::Text,
+            )
+        } else {
+            (
+                RealtimeConversationVersion::V3,
+                RealtimeOutputModality::Audio,
+            )
+        };
         let request_id = self.next_request_id();
         let _: ThreadRealtimeStartResponse = self
             .request_handle
@@ -40,7 +72,7 @@ impl AppServerSession {
                     backend_reasoning_status: false,
                     codex_response_handoff_channel_prefixes: None,
                     model,
-                    output_modality: RealtimeOutputModality::Audio,
+                    output_modality,
                     include_startup_context: Some(false),
                     initial_items: None,
                     realtime_start_instructions: None,
@@ -49,7 +81,7 @@ impl AppServerSession {
                     realtime_session_id: None,
                     voice_session_id: None,
                     transport: Some(ThreadRealtimeStartTransport::Webrtc { sdp: offer_sdp }),
-                    version: Some(RealtimeConversationVersion::V3),
+                    version: Some(version),
                     voice,
                 },
             })

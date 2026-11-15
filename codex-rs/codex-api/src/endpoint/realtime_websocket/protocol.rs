@@ -183,8 +183,10 @@ pub(super) enum NoiseReductionType {
 pub(super) struct SessionTurnDetection {
     #[serde(rename = "type")]
     pub(super) r#type: TurnDetectionType,
-    pub(super) interrupt_response: bool,
-    pub(super) create_response: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) interrupt_response: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) create_response: Option<bool>,
     pub(super) silence_duration_ms: u32,
 }
 
