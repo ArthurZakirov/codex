@@ -1042,6 +1042,7 @@ impl App {
         }
         #[cfg(target_os = "macos")]
         if let TuiEvent::Key(key) = &event
+            && key.kind == KeyEventKind::Press
             && self.overlay.is_none()
             && self.chat_widget.voice_replay_shortcut_available()
             && self.chat_widget.no_modal_or_popup_active()
