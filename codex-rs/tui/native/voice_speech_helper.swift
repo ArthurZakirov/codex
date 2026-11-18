@@ -10,7 +10,36 @@ private func emit(_ message: String) {
 }
 
 private final class SpeechService: NSObject, NSSpeechSynthesizerDelegate {
-    private let synthesizer = NSSpeechSynthesizer()
+    private var synthesizer = NSSpeechSynthesizer()
+    private var source: NSString = ""
+    private var starts = [0]
+    private var base = 0
+    private var current = 0
+    private var lastBack: TimeInterval?
+    private var muted = false
+
+    private func seek(back: Bool) {
+        guard started else { return }
+        let index = starts.lastIndex(where: { $0 <= current }) ?? 0
+        let now = ProcessInfo.processInfo.systemUptime
+        let repeatBack = lastBack.map { now - $0 < 1.2 } ?? false
+        let target = back ? (repeatBack ? max(0, index - 1) : index) : index + 1
+        guard starts.indices.contains(target) else { return }
+        lastBack = back ? now : nil
+        let old = synthesizer
+        old.delegate = nil
+        old.stopSpeaking()
+        synthesizer = NSSpeechSynthesizer(voice: old.voice()) ?? NSSpeechSynthesizer()
+        synthesizer.delegate = self
+        synthesizer.rate = old.rate
+        synthesizer.volume = muted ? 0 : 1
+        base = starts[target]
+        current = base
+        if !synthesizer.startSpeaking(source.substring(from: base)) {
+            emit("ERROR\tfailed to restart speech")
+            exit(1)
+        }
+    }
     private var started = false
 
     func handle(_ command: String) {
@@ -26,6 +55,12 @@ private final class SpeechService: NSObject, NSSpeechSynthesizerDelegate {
                 emit("ERROR\tinvalid speech payload")
                 exit(1)
             }
+            source = message as NSString
+            var offset = 0
+            for line in message.components(separatedBy: "\n") {
+                if offset > 0 && !line.isEmpty { starts.append(offset) }
+                offset += (line as NSString).length + 1
+            }
             started = true
             synthesizer.delegate = self
             if !fields[2].isEmpty {
@@ -39,10 +74,16 @@ private final class SpeechService: NSObject, NSSpeechSynthesizerDelegate {
             // NSSpeechSynthesizer ignores rate updates during an active
             // utterance; set it after voice selection but before playback.
             synthesizer.rate *= multiplier
+            synthesizer.volume = muted ? 0 : 1
             if !synthesizer.startSpeaking(message) {
                 emit("ERROR\tfailed to start speech")
                 exit(1)
             }
+        case "MUTE", "UNMUTE":
+            muted = verb == "MUTE"
+            synthesizer.volume = muted ? 0 : 1
+        case "BACK", "NEXT":
+            seek(back: verb == "BACK")
         case "PAUSE":
             if started { synthesizer.pauseSpeaking(at: NSSpeechSynthesizer.Boundary(rawValue: 0)!) }
         case "RESUME":
@@ -61,10 +102,13 @@ private final class SpeechService: NSObject, NSSpeechSynthesizerDelegate {
     }
 
     func speechSynthesizer(_ sender: NSSpeechSynthesizer, willSpeakWord range: NSRange, of string: String) {
-        emit("WORD\t\(range.location)\t\(range.length)")
+        guard sender === synthesizer else { return }
+        current = base + range.location
+        emit("WORD\t\(current)\t\(range.length)")
     }
 
     func speechSynthesizer(_ sender: NSSpeechSynthesizer, didFinishSpeaking finished: Bool) {
+        guard sender === synthesizer else { return }
         emit("DONE\t\(finished)")
         exit(finished ? 0 : 1)
     }
