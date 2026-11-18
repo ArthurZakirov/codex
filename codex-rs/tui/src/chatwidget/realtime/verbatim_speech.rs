@@ -29,6 +29,7 @@ static SEEK: std::sync::LazyLock<tokio::sync::broadcast::Sender<bool>> =
 
 pub(crate) struct ReadingControls {
     pub(crate) navigation: bool,
+    skip: Option<crate::key_hint::KeyBinding>,
     mute: Option<crate::key_hint::KeyBinding>,
     previous: Option<crate::key_hint::KeyBinding>,
     next: Option<crate::key_hint::KeyBinding>,
@@ -52,6 +53,7 @@ pub(crate) fn reading_controls() -> &'static ReadingControls {
         };
         ReadingControls {
             navigation: settings["paragraph_navigation"].as_bool().unwrap_or(false),
+            skip: binding("skip_message_shortcut", "alt-shift-n"),
             mute: binding("mute_shortcut", "alt-shift-m"),
             previous: binding("previous_paragraph_shortcut", "shift-up"),
             next: binding("next_paragraph_shortcut", "shift-down"),
@@ -67,6 +69,10 @@ impl ChatWidget {
         let controls = reading_controls();
         let pressed =
             |binding: Option<crate::key_hint::KeyBinding>| binding.is_some_and(|b| b.is_press(key));
+        if pressed(controls.skip) && self.realtime_verbatim_speech_active() {
+            self.interrupt_current_verbatim_speech();
+            return true;
+        }
         if pressed(controls.mute) {
             let was_muted = MUTED.fetch_xor(true, Ordering::AcqRel);
             self.add_info_message(
