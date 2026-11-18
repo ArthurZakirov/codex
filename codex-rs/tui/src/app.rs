@@ -1058,6 +1058,7 @@ impl App {
             && key.kind == KeyEventKind::Press
             && self.overlay.is_none()
             && self.chat_widget.no_modal_or_popup_active()
+            && !self.transcript_view.owns_interaction_key(*key)
             && self.chat_widget.handle_reading_key(*key)
         {
             return Ok(AppRunControl::Continue);
