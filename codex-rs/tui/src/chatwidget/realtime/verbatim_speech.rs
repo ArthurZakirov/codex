@@ -23,6 +23,73 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+static MUTED: AtomicBool = AtomicBool::new(false);
+static SEEK: std::sync::LazyLock<tokio::sync::broadcast::Sender<bool>> =
+    std::sync::LazyLock::new(|| tokio::sync::broadcast::channel(32).0);
+
+pub(crate) struct ReadingControls {
+    pub(crate) navigation: bool,
+    mute: Option<crate::key_hint::KeyBinding>,
+    previous: Option<crate::key_hint::KeyBinding>,
+    next: Option<crate::key_hint::KeyBinding>,
+}
+
+pub(crate) fn reading_controls() -> &'static ReadingControls {
+    static CONTROLS: std::sync::OnceLock<ReadingControls> = std::sync::OnceLock::new();
+    CONTROLS.get_or_init(|| {
+        let settings = voice_config_path()
+            .and_then(|p| std::fs::read(p).ok())
+            .and_then(|v| serde_json::from_slice::<serde_json::Value>(&v).ok())
+            .unwrap_or_default();
+        let binding = |name: &str, default: &str| {
+            let key = match settings.get(name) {
+                Some(value) => value.as_str()?,
+                None => default,
+            };
+            let binding = crate::keymap::parse_keybinding(key)?;
+            let (code, mods) = binding.parts();
+            (matches!(code, crossterm::event::KeyCode::F(_)) || !mods.is_empty()).then_some(binding)
+        };
+        ReadingControls {
+            navigation: settings["paragraph_navigation"].as_bool().unwrap_or(false),
+            mute: binding("mute_shortcut", "f9"),
+            previous: binding("previous_paragraph_shortcut", "shift-up"),
+            next: binding("next_paragraph_shortcut", "shift-down"),
+        }
+    })
+}
+
+impl ChatWidget {
+    pub(crate) fn handle_reading_key(&mut self, key: crossterm::event::KeyEvent) -> bool {
+        if !enabled() {
+            return false;
+        }
+        let controls = reading_controls();
+        let pressed =
+            |binding: Option<crate::key_hint::KeyBinding>| binding.is_some_and(|b| b.is_press(key));
+        if pressed(controls.mute) {
+            let was_muted = MUTED.fetch_xor(true, Ordering::AcqRel);
+            self.add_info_message(
+                if was_muted {
+                    "Voice narration audible."
+                } else {
+                    "Voice narration muted. Word highlighting is active."
+                }
+                .into(),
+                None,
+            );
+            return true;
+        }
+        if controls.navigation && self.realtime_verbatim_speech_active() {
+            let back = pressed(controls.previous);
+            if back || pressed(controls.next) {
+                return SEEK.send(back).is_ok();
+            }
+        }
+        false
+    }
+}
+
 const MAX_NARRATED_ITEM_IDS: usize = 256;
 
 /// Controls the native speech synthesizer, including cancellation of a
@@ -142,6 +209,9 @@ async fn speak_with_word_positions(
     // The native helper (used for highlighting) must honor the same per-utterance
     // configuration as the in-process synthesizer fallback.
     let rate = configured_speech_rate_multiplier();
+    let mut seek = SEEK.subscribe();
+    let mut muted = MUTED.load(Ordering::Acquire);
+    if muted { stdin.write_all(b"MUTE\n").await?; }
     stdin
         .write_all(format!("SPEAK\t{payload}\t{voice}\t{rate}\n").as_bytes())
         .await?;
@@ -151,6 +221,11 @@ async fn speak_with_word_positions(
     let mut paused = false;
     loop {
         tokio::select! {
+            Ok(back) = seek.recv() => {
+                stdin.write_all(if back { b"BACK\n" } else { b"NEXT\n" }).await?;
+                if paused { stdin.write_all(b"PAUSE\n").await?; }
+                stdin.flush().await?;
+            }
             line = words.next_line() => {
                 let line = match line? {
                     Some(line) => line,
@@ -185,6 +260,12 @@ async fn speak_with_word_positions(
                 if speech_should_stop(&cancelled, &interruption_generation, generation) {
                     let _ = stdin.write_all(b"STOP\n").await;
                     break Ok(());
+                }
+                let next_mute = MUTED.load(Ordering::Acquire);
+                if next_mute != muted {
+                    stdin.write_all(if next_mute { b"MUTE\n" } else { b"UNMUTE\n" }).await?;
+                    stdin.flush().await?;
+                    muted = next_mute;
                 }
                 let requested_pause = *pause_rx.borrow_and_update();
                 if paused != requested_pause {
@@ -338,6 +419,7 @@ fn markdown_to_spoken_text(markdown: &str) -> String {
     for event in Parser::new(spoken_markdown_without_checkout_footers(markdown)) {
         match event {
             Event::Text(text) | Event::Code(text) => spoken.push_str(&text),
+            Event::SoftBreak if reading_controls().navigation => spoken.push(' '),
             Event::SoftBreak | Event::HardBreak | Event::Rule => spoken.push('\n'),
             Event::Start(
                 Tag::Paragraph
@@ -495,6 +577,11 @@ fn speak_spoken_text_blocking(
     // Set the per-voice rate *before* starting each utterance. Changing
     // NSSpeechSynthesizer.rate during an utterance has no audible effect.
     synthesizer.setRate(synthesizer.rate() * configured_speech_rate_multiplier());
+    synthesizer.setVolume(if MUTED.load(Ordering::Acquire) {
+        0.0
+    } else {
+        1.0
+    });
     if !synthesizer.startSpeakingString(&NSString::from_str(&spoken)) {
         return Err(std::io::Error::other(
             "macOS speech synthesizer could not start",
@@ -504,6 +591,11 @@ fn speak_spoken_text_blocking(
     let _active_guard = ActiveSpeechGuard(active);
     let mut paused = false;
     while synthesizer.isSpeaking() {
+        synthesizer.setVolume(if MUTED.load(Ordering::Acquire) {
+            0.0
+        } else {
+            1.0
+        });
         if speech_should_stop(&cancelled, &interruption_generation, utterance_generation) {
             synthesizer.stopSpeaking();
             return Ok(());
