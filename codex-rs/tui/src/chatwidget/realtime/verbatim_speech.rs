@@ -52,7 +52,7 @@ pub(crate) fn reading_controls() -> &'static ReadingControls {
         };
         ReadingControls {
             navigation: settings["paragraph_navigation"].as_bool().unwrap_or(false),
-            mute: binding("mute_shortcut", "f9"),
+            mute: binding("mute_shortcut", "alt-shift-m"),
             previous: binding("previous_paragraph_shortcut", "shift-up"),
             next: binding("next_paragraph_shortcut", "shift-down"),
         }
