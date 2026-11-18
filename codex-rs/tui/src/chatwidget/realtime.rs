@@ -742,7 +742,9 @@ impl ChatWidget {
                 self.voice_handoff_request = None;
                 self.voice_focus_background = mode == focus::Mode::FollowFocus;
                 self.voice_focus_allows_playback = mode != focus::Mode::StopOnBlur;
-                if self.voice_focus_background && self.realtime_conversation_is_running() {
+                if self.voice_focus_background
+                    && (self.realtime_conversation_is_running() || self.realtime_verbatim_speech_active())
+                {
                     self.frame_requester.schedule_frame();
                 }
                 if !self.voice_focus_allows_playback {
@@ -757,7 +759,9 @@ impl ChatWidget {
                 }
             }
             TuiEvent::Draw => {
-                if self.voice_focus_background && self.realtime_conversation_is_running() {
+                if self.voice_focus_background
+                    && (self.realtime_conversation_is_running() || self.realtime_verbatim_speech_active())
+                {
                     if mode == focus::Mode::FollowFocus {
                         if matches!(audio_lease::request_handoff(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock)
                         {
