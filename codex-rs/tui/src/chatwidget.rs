@@ -631,6 +631,10 @@ pub(crate) struct ChatWidget {
     voice_focus_start: Option<(ThreadId, std::time::Instant)>,
     #[cfg(target_os = "macos")]
     voice_focus_allows_playback: bool,
+    #[cfg(target_os = "macos")]
+    voice_focus_background: bool,
+    #[cfg(target_os = "macos")]
+    voice_handoff_request: Option<std::fs::File>,
     realtime_conversation_available_for_thread: bool,
     safety_buffering: SafetyBufferingState,
     task_complete_pending: bool,
