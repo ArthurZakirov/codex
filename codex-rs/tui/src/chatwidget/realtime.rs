@@ -348,7 +348,7 @@ fn prepare_voice_config(
         ("paragraph_navigation", serde_json::json!(false)),
         ("previous_paragraph_shortcut", serde_json::json!("shift-up")),
         ("next_paragraph_shortcut", serde_json::json!("shift-down")),
-        ("mute_shortcut", serde_json::json!("f9")),
+        ("mute_shortcut", serde_json::json!("alt-shift-m")),
     ] {
         settings.entry(name).or_insert(default);
     }
