@@ -1,3 +1,3 @@
-Release the Voice focus modes, discoverable shortcuts, and unified dictation configuration.
-Baseline: 5f75f1d03735ed448caf37572cd53dcb22607fad
-Requested: 2026-11-15
+Release Voice focus handoff and reading controls.
+Baseline: a1f89da6ada60aff94c508d47962ca09a525f3c4
+Requested: 2026-11-19
