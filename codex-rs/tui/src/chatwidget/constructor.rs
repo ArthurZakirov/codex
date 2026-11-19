@@ -202,6 +202,10 @@ impl ChatWidget {
             voice_focus_start: None,
             #[cfg(target_os = "macos")]
             voice_focus_allows_playback: true,
+            #[cfg(target_os = "macos")]
+            voice_focus_background: false,
+            #[cfg(target_os = "macos")]
+            voice_handoff_request: None,
             realtime_conversation_available_for_thread: false,
             safety_buffering: SafetyBufferingState::default(),
             task_complete_pending: false,

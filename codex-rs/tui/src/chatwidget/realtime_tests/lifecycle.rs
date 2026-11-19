@@ -19,7 +19,7 @@ async fn dictation_focus_modes_release_or_keep_the_owning_session() {
     assert!(chat.voice_focus_start.is_none());
 
     chat.handle_voice_focus_mode(&TuiEvent::FocusLost, true, Mode::FollowFocus);
-    assert!(!chat.realtime_dictation_is_running());
+    assert!(chat.realtime_dictation_is_running());
     assert!(chat.voice_focus_start.is_none());
 
     chat.handle_voice_focus_mode(&TuiEvent::FocusGained, true, Mode::FollowFocus);
@@ -29,6 +29,8 @@ async fn dictation_focus_modes_release_or_keep_the_owning_session() {
     );
     chat.handle_voice_focus_mode(&TuiEvent::FocusLost, true, Mode::FollowFocus);
     assert!(chat.voice_focus_start.is_none());
+    chat.handle_voice_focus_mode(&TuiEvent::FocusLost, true, Mode::StopOnBlur);
+    assert!(!chat.realtime_dictation_is_running());
 }
 
 #[tokio::test]

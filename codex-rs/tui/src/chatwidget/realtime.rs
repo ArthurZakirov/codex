@@ -347,7 +347,7 @@ fn prepare_voice_config(
         .or_insert(serde_json::json!("f10"));
     settings.entry("_help").or_insert_with(|| serde_json::json!({
         "focus_mode": {
-            "follow_focus": "Stop listening when this terminal loses focus and start in the newly focused Codex tab. Requires terminal focus reporting.",
+            "follow_focus": "Keep listening in other apps. Transfer the microphone when another Codex tab gains focus. Requires terminal focus reporting.",
             "lock": "Keep listening in the owning chat until you stop it. Other Codex tabs cannot start voice.",
             "stop_on_blur": "Stop listening when the terminal loses focus. Start again manually."
         },
@@ -578,6 +578,7 @@ impl ChatWidget {
         #[cfg(target_os = "macos")]
         {
             self.voice_focus_start = None;
+            self.voice_handoff_request = None;
         }
         self.toggle_realtime_conversation_inner();
     }
@@ -713,7 +714,8 @@ impl ChatWidget {
         use crate::tui::TuiEvent;
 
         if !matches!(event, TuiEvent::FocusGained | TuiEvent::FocusLost)
-            && !(matches!(event, TuiEvent::Draw) && self.voice_focus_start.is_some())
+            && !(matches!(event, TuiEvent::Draw)
+                && (self.voice_focus_start.is_some() || self.voice_focus_background))
         {
             return;
         }
@@ -737,18 +739,43 @@ impl ChatWidget {
         match event {
             TuiEvent::FocusLost => {
                 self.voice_focus_start = None;
-                self.voice_focus_allows_playback = mode == focus::Mode::Manual;
+                self.voice_handoff_request = None;
+                self.voice_focus_background = mode == focus::Mode::FollowFocus;
+                self.voice_focus_allows_playback = mode != focus::Mode::StopOnBlur;
+                if self.voice_focus_background
+                    && (self.realtime_conversation_is_running()
+                        || self.realtime_verbatim_speech_active())
+                {
+                    self.frame_requester.schedule_frame();
+                }
                 if !self.voice_focus_allows_playback {
                     self.stop_realtime_conversation();
                 }
             }
             TuiEvent::FocusGained => {
+                self.voice_focus_background = false;
                 self.voice_focus_allows_playback = true;
                 if allow_auto_start && mode == focus::Mode::FollowFocus {
                     self.schedule_voice_focus_start();
                 }
             }
             TuiEvent::Draw => {
+                if self.voice_focus_background
+                    && (self.realtime_conversation_is_running()
+                        || self.realtime_verbatim_speech_active())
+                {
+                    if mode == focus::Mode::FollowFocus {
+                        if matches!(audio_lease::request_handoff(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock)
+                        {
+                            self.voice_focus_allows_playback = false;
+                            self.stop_realtime_conversation();
+                        } else {
+                            self.frame_requester
+                                .schedule_frame_in(Duration::from_millis(100));
+                        }
+                    }
+                    return;
+                }
                 let Some((thread_id, deadline)) = self.voice_focus_start else {
                     return;
                 };
@@ -761,10 +788,12 @@ impl ChatWidget {
                     || mode != focus::Mode::FollowFocus
                 {
                     self.voice_focus_start = None;
+                    self.voice_handoff_request = None;
                     return;
                 }
                 if Instant::now() >= deadline {
                     self.voice_focus_start = None;
+                    self.voice_handoff_request = None;
                     self.add_error_message(
                         "Voice Follow Focus is still waiting for the microphone. Check terminal focus reporting and close any older Voice session.".into(),
                     );
@@ -774,12 +803,19 @@ impl ChatWidget {
                     RealtimeConversationPhase::Inactive => match audio_lease::acquire() {
                         Ok(_lease) => {
                             self.voice_focus_start = None;
+                            self.voice_handoff_request = None;
                             self.toggle_realtime_conversation_inner();
                             return;
                         }
-                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            if !self.voice_focus_background && self.voice_handoff_request.is_none()
+                            {
+                                self.voice_handoff_request = audio_lease::request_handoff().ok();
+                            }
+                        }
                         Err(error) => {
                             self.voice_focus_start = None;
+                            self.voice_handoff_request = None;
                             self.add_error_message(format!("Unable to start Voice: {error}"));
                             return;
                         }
@@ -787,6 +823,7 @@ impl ChatWidget {
                     RealtimeConversationPhase::Stopping => {}
                     _ => {
                         self.voice_focus_start = None;
+                        self.voice_handoff_request = None;
                         return;
                     }
                 }

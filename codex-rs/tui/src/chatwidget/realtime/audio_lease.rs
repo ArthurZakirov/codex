@@ -26,6 +26,14 @@ pub(super) fn acquire() -> io::Result<Arc<File>> {
     Ok(lease)
 }
 
+/// Hold this separate lock while a focused chat waits for the audio owner.
+pub(super) fn request_handoff() -> io::Result<File> {
+    let home = dirs::home_dir().ok_or_else(|| io::Error::other("Home directory unavailable"))?;
+    let directory = home.join(".codex");
+    std::fs::create_dir_all(&directory)?;
+    lock(&directory.join("voice-handoff.lock"))
+}
+
 fn lock(path: &Path) -> io::Result<File> {
     use std::os::unix::fs::OpenOptionsExt;
 
