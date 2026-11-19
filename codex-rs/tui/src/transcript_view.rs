@@ -365,7 +365,28 @@ impl TranscriptView {
                     progress.utf16_len,
                     offset,
                 );
-                Some((target, layout.row_for_offset(offset), word_range))
+                #[cfg(target_os = "macos")]
+                let paragraph = if crate::chatwidget::reading_controls().navigation {
+                    let byte = utf16_byte_offset(&progress.spoken, progress.utf16_start)?;
+                    let first = progress.spoken[..byte].rfind('\n').map_or(0, |n| n + 1);
+                    let end = progress.spoken[byte..]
+                        .find('\n')
+                        .map_or(progress.spoken.len(), |n| byte + n);
+                    let mut words = progress.spoken[first..end].unicode_word_indices();
+                    let begin = first + words.next()?.0;
+                    let last = words.last().map_or(begin, |(index, _)| first + index);
+                    let row_at = |i| {
+                        let pos = progress.spoken[..i].encode_utf16().count();
+                        spoken_word_display_offset(&progress.spoken, layout.text(), pos)
+                            .map(|o| layout.row_for_offset(o))
+                    };
+                    row_at(begin).zip(row_at(last))
+                } else {
+                    None
+                };
+                #[cfg(not(target_os = "macos"))]
+                let paragraph: Option<(usize, usize)> = None;
+                Some((target, layout.row_for_offset(offset), word_range, paragraph))
             })
         } else {
             None
@@ -402,9 +423,12 @@ impl TranscriptView {
             // Only the spoken word receives a background. If its callback span
             // cannot be mapped confidently, highlight the resolved line instead.
             // Existing foreground colors and text remain untouched.
-            if let Some((target, fallback_row, word_range)) = &spoken_highlight
+            if let Some((target, fallback_row, word_range, paragraph)) = &spoken_highlight
                 && *target == index
             {
+                if paragraph.is_some_and(|(start, end)| (start..=end).contains(&row)) {
+                    buf.set_style(row_area, Style::default().bg(Color::Blue));
+                }
                 if let Some(range) = word_range {
                     layout.paint_spoken_word(range.clone(), row_area, buf, row);
                 } else if *fallback_row == row {

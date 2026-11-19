@@ -1053,6 +1053,16 @@ impl App {
             self.replay_last_voice_reply();
             return Ok(AppRunControl::Continue);
         }
+        #[cfg(target_os = "macos")]
+        if let TuiEvent::Key(key) = &event
+            && key.kind == KeyEventKind::Press
+            && self.overlay.is_none()
+            && self.chat_widget.no_modal_or_popup_active()
+            && !self.transcript_view.owns_interaction_key(*key)
+            && self.chat_widget.handle_reading_key(*key)
+        {
+            return Ok(AppRunControl::Continue);
+        }
         let voice_toggle = |app: &Self, key: KeyEvent| {
             key.kind == KeyEventKind::Press
                 && app

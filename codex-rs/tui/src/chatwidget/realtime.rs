@@ -12,6 +12,8 @@ mod recording_controls;
 mod transcript_replay;
 #[cfg(target_os = "macos")]
 mod verbatim_speech;
+#[cfg(target_os = "macos")]
+pub(crate) use verbatim_speech::reading_controls;
 
 pub(crate) use failure_metrics::RealtimeFailureCause;
 
@@ -342,6 +344,15 @@ fn prepare_voice_config(
         return Ok(());
     };
     let existing_keys = settings.len();
+    for (name, default) in [
+        ("paragraph_navigation", serde_json::json!(false)),
+        ("previous_paragraph_shortcut", serde_json::json!("shift-up")),
+        ("next_paragraph_shortcut", serde_json::json!("shift-down")),
+        ("skip_message_shortcut", serde_json::json!("alt-shift-n")),
+        ("mute_shortcut", serde_json::json!("alt-shift-m")),
+    ] {
+        settings.entry(name).or_insert(default);
+    }
     settings
         .entry("replay_shortcut")
         .or_insert(serde_json::json!("f10"));
