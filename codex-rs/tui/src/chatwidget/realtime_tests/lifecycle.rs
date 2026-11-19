@@ -672,3 +672,23 @@ async fn failure_cleanup_does_not_attribute_stop_to_the_user() {
         .join("\n");
     insta::assert_snapshot!("voice_device_failure_cleanup", rendered);
 }
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn global_submit_targets_only_the_current_dictation_attempt() {
+    let (mut chat, _, _, mut ops) = make_chatwidget_manual_with_sender().await;
+    activate_voice(&mut chat);
+    chat.realtime_conversation.dictation = true;
+    let attempt = chat.realtime_conversation.attempt_id;
+    chat.on_realtime_transcript_done("user".into(), "Background draft".into());
+    chat.submit_global_dictation(attempt.wrapping_add(1));
+    assert!(ops.try_recv().is_err());
+    chat.submit_global_dictation(attempt);
+    assert!(matches!(
+        ops.try_recv(),
+        Ok(AppCommand::UserTurn { items, .. })
+            if items.iter().any(|item| matches!(item, UserInput::Text { text, .. } if text == "Background draft"))
+    ));
+    chat.submit_global_dictation(attempt);
+    assert!(ops.try_recv().is_err());
+}
