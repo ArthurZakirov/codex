@@ -117,14 +117,44 @@ fn spoken_word_display_offset(spoken: &str, display: &str, utf16_start: usize) -
         .position(|(start, word)| *start <= target && target < start + word.len())?;
     let visible: Vec<_> = display.unicode_word_indices().collect();
     let mut cursor = 0usize;
-    for (index, (_, expected)) in words.iter().enumerate() {
+    for (index, (_, expected)) in words.iter().enumerate().take(target_word + 1) {
         // Permit a small amount of rendered-only text, e.g. code language labels.
-        let found = visible
+        let Some(found) = visible
             .iter()
             .enumerate()
             .skip(cursor)
             .take(4)
-            .find(|(_, (_, actual))| actual.to_lowercase() == expected.to_lowercase())?;
+            .find(|(_, (_, actual))| actual.to_lowercase() == expected.to_lowercase())
+        else {
+            // A link destination, a folded block, or a transformed table can break
+            // the prefix match. Locate this callback using nearby matching words
+            // beyond the last confirmed position. Leave ambiguous matches unpainted.
+            let matches_word =
+                |i: usize, j: usize| words[i].1.to_lowercase() == visible[j].1.to_lowercase();
+            let mut best_score = 0;
+            let mut offset = None;
+            for j in cursor..visible.len() {
+                if !matches_word(target_word, j) {
+                    continue;
+                }
+                let before = (1..=8.min(target_word - index).min(j - cursor))
+                    .take_while(|d| matches_word(target_word - d, j - d))
+                    .count();
+                let after = (1..=8
+                    .min(words.len() - target_word - 1)
+                    .min(visible.len() - j - 1))
+                    .take_while(|d| matches_word(target_word + d, j + d))
+                    .count();
+                let score = 1 + before + after;
+                if score > best_score {
+                    best_score = score;
+                    offset = Some(visible[j].0);
+                } else if score == best_score {
+                    offset = None;
+                }
+            }
+            return offset;
+        };
         cursor = found.0 + 1;
         if index == target_word {
             return Some(found.1.0);

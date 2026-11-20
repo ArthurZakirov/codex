@@ -1556,3 +1556,18 @@ fn spoken_word_background_handles_wrapped_multibyte_text() {
     }
     assert!(colored_rows >= 2, "long spoken word must span wrapped rows");
 }
+
+#[test]
+fn spoken_highlight_resumes_after_link_destinations_and_hidden_words() {
+    use super::spoken_word_display_offset;
+    let spoken = "Weg zum Ziel. Verdeckter Inhalt. Danach endet der Text.";
+    let display = "Weg (https://example.org/langer/pfad/zum/lesen/unterwegs) zum Ziel. Danach endet der Text.";
+    for word in ["zum", "Ziel", "Danach", "endet", "Text"] {
+        let pos = spoken[..spoken.find(word).unwrap()].encode_utf16().count();
+        assert_eq!(
+            spoken_word_display_offset(spoken, display, pos),
+            display.rfind(word)
+        );
+    }
+    assert_eq!(spoken_word_display_offset(spoken, display, 14), None);
+}
