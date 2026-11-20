@@ -24,7 +24,7 @@ mod text;
 mod turn_tip;
 
 use crate::history_cell::AgentMarkdownCell;
-use ratatui::style::{Color, Style};
+use ratatui::style::Style;
 use std::ops::Range;
 use std::sync::Arc;
 use unicode_segmentation::UnicodeSegmentation;
@@ -185,6 +185,38 @@ fn spoken_word_display_range(
     let visible_word = display.get(display_start..)?.unicode_words().next()?;
     (spoken_word.to_lowercase() == visible_word.to_lowercase())
         .then_some(display_start..display_start + visible_word.len())
+}
+
+/// Tint only occupied cells. Keep formatted text readable against its new surface.
+fn paint_spoken_line(area: Rect, buf: &mut Buffer) {
+    let fill = crate::terminal_palette::default_bg().and_then(|bg| {
+        use crate::terminal_palette::StdoutColorLevel;
+        matches!(
+            crate::terminal_palette::effective_stdout_color_level(),
+            StdoutColorLevel::TrueColor | StdoutColorLevel::Ansi256
+        )
+        .then(|| {
+            crate::terminal_palette::best_color(crate::color::blend(
+                crate::style::UI_ACCENT,
+                bg,
+                0.18,
+            ))
+        })
+    });
+    let Some(last) =
+        (area.left()..area.right()).rfind(|&x| !buf[(x, area.y)].symbol().trim().is_empty())
+    else {
+        return;
+    };
+    for x in area.left()..=last {
+        let cell = &mut buf[(x, area.y)];
+        if let Some(fill) = fill {
+            let fg = crate::style::readable_color_on(cell.fg, Some(fill));
+            cell.set_style(Style::default().bg(fill).fg(fg).not_dim());
+        } else {
+            cell.set_style(Style::default().italic());
+        }
+    }
 }
 
 struct VisibleRow {
@@ -452,17 +484,16 @@ impl TranscriptView {
             layout.render(row_area, buf, row);
             // Only the spoken word receives a background. If its callback span
             // cannot be mapped confidently, highlight the resolved line instead.
-            // Existing foreground colors and text remain untouched.
             if let Some((target, fallback_row, word_range, paragraph)) = &spoken_highlight
                 && *target == index
             {
                 if paragraph.is_some_and(|(start, end)| (start..=end).contains(&row)) {
-                    buf.set_style(row_area, Style::default().bg(Color::Blue));
+                    paint_spoken_line(row_area, buf);
                 }
                 if let Some(range) = word_range {
                     layout.paint_spoken_word(range.clone(), row_area, buf, row);
                 } else if *fallback_row == row {
-                    buf.set_style(row_area, Style::default().bg(Color::DarkGray));
+                    paint_spoken_line(row_area, buf);
                 }
             }
             self.render_disclosure(&activity_ids, &layout, row, row_area, buf);

@@ -9,6 +9,7 @@ use crossterm::event::MouseButton;
 use crossterm::event::MouseEvent;
 use crossterm::event::MouseEventKind;
 use pretty_assertions::assert_eq;
+use ratatui::style::Modifier;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
@@ -1315,7 +1316,6 @@ fn user_prompt_has_a_background_without_a_terminal_palette() {
 fn spoken_prompt_selection_keeps_its_fallback_contrast() {
     use crate::history_cell::new_spoken_user_prompt;
     use ratatui::style::Color;
-    use ratatui::style::Modifier;
 
     crate::terminal_palette::with_test_default_colors(
         /*colors*/ None::<crate::terminal_probe::DefaultColors>,
@@ -1395,7 +1395,7 @@ fn spoken_position_maps_wrapped_markdown_and_code() {
 }
 
 #[test]
-fn spoken_line_background_preserves_foreground_and_scroll() {
+fn spoken_word_emphasis_preserves_text_and_scroll() {
     use super::SpokenLine;
     use crate::history_cell::AgentMarkdownCell;
     let markdown = "**Hallo** welt. Noch ein längerer Satz. Zeile zwei.".to_string();
@@ -1425,8 +1425,7 @@ fn spoken_line_background_preserves_foreground_and_scroll() {
     for y in before.area.top()..before.area.bottom() {
         for x in before.area.left()..before.area.right() {
             assert_eq!(before[(x, y)].symbol(), after[(x, y)].symbol());
-            assert_eq!(before[(x, y)].fg, after[(x, y)].fg);
-            if after[(x, y)].bg == ratatui::style::Color::DarkGray {
+            if after[(x, y)].modifier.contains(Modifier::UNDERLINED) {
                 backgrounds += 1;
             }
         }
@@ -1442,9 +1441,7 @@ fn spoken_line_background_preserves_foreground_and_scroll() {
     let fallback = render(&mut view, &cells, 40, 12);
     let fallback_cells = (fallback.area.top()..fallback.area.bottom())
         .flat_map(|y| (fallback.area.left()..fallback.area.right()).map(move |x| (x, y)))
-        .filter(|&(x, y)| {
-            fallback[(x, y)].bg == Color::DarkGray && before[(x, y)].bg != Color::DarkGray
-        })
+        .filter(|&(x, y)| fallback[(x, y)] != before[(x, y)])
         .count();
     assert!(
         fallback_cells > backgrounds,
@@ -1550,7 +1547,7 @@ fn spoken_word_background_handles_wrapped_multibyte_text() {
         let area = Rect::new(0, row as u16, 12, 1);
         layout.render(area, &mut buf, row);
         layout.paint_spoken_word(range.clone(), area, &mut buf, row);
-        if (0..12).any(|x| buf[(x, row as u16)].bg == Color::DarkGray) {
+        if (0..12).any(|x| buf[(x, row as u16)].modifier.contains(Modifier::UNDERLINED)) {
             colored_rows += 1;
         }
     }
