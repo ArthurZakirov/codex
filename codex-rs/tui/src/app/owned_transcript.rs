@@ -577,6 +577,14 @@ impl App {
         event: &TuiEvent,
     ) -> Result<bool> {
         let has_modal = self.chat_widget.has_active_modal();
+        #[cfg(target_os = "macos")]
+        if has_modal || self.overlay.is_some() || matches!(event, TuiEvent::FocusLost) {
+            self.transcript_view.cancel_voice_pick();
+        } else if matches!(event, TuiEvent::Key(key) if key.code == crossterm::event::KeyCode::Esc && key.kind != KeyEventKind::Release)
+            && self.transcript_view.cancel_voice_pick()
+        {
+            return Ok(true);
+        }
         let modal_transcript_mouse = has_modal
             && matches!(event, TuiEvent::Mouse(mouse)
                 if self.chat_widget.centered_dialog().is_none()
@@ -633,6 +641,22 @@ impl App {
             let composer_ready = self.chat_widget.prepare_composer_mouse(*mouse);
             if mouse.kind != crossterm::event::MouseEventKind::Moved {
                 self.refresh_owned_transcript(tui)?;
+            }
+            #[cfg(target_os = "macos")]
+            if let Some((markdown, spoken, start, cell_id)) = self
+                .transcript_view
+                .pick_voice_paragraph(*mouse, self.chat_widget.thread_id(), &self.transcript_cells)
+            {
+                self.transcript_view.end_selection(&self.transcript_cells);
+                if let Err(error) = self
+                    .chat_widget
+                    .read_from_paragraph(&markdown, spoken, start, cell_id)
+                {
+                    self.chat_widget
+                        .add_error_message(format!("Unable to read paragraph: {error}"));
+                }
+                tui.frame_requester().schedule_frame();
+                return Ok(true);
             }
             if self.chat_widget.no_modal_or_popup_active()
                 && self

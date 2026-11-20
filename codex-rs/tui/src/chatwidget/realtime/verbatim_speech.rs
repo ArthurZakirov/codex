@@ -29,6 +29,8 @@ static SEEK: std::sync::LazyLock<tokio::sync::broadcast::Sender<bool>> =
 
 pub(crate) struct ReadingControls {
     pub(crate) navigation: bool,
+    pub(crate) paragraph_color: (u8, u8, u8),
+    pub(crate) paragraph_opacity: f32,
     skip: Option<crate::key_hint::KeyBinding>,
     mute: Option<crate::key_hint::KeyBinding>,
     previous: Option<crate::key_hint::KeyBinding>,
@@ -51,7 +53,20 @@ pub(crate) fn reading_controls() -> &'static ReadingControls {
             let (code, mods) = binding.parts();
             (matches!(code, crossterm::event::KeyCode::F(_)) || !mods.is_empty()).then_some(binding)
         };
+        let rgb = settings["paragraph_highlight_color"]
+            .as_str()
+            .and_then(|color| color.strip_prefix('#'))
+            .filter(|hex| hex.len() == 6 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
+            .and_then(|hex| u32::from_str_radix(hex, 16).ok())
+            .map(|rgb| ((rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8))
+            .unwrap_or(crate::style::UI_ACCENT);
         ReadingControls {
+            paragraph_color: rgb,
+            paragraph_opacity: settings["paragraph_highlight_opacity_percent"]
+                .as_f64()
+                .unwrap_or(10.0)
+                .clamp(0.0, 100.0) as f32
+                / 100.0,
             navigation: settings["paragraph_navigation"].as_bool().unwrap_or(false),
             skip: binding("skip_message_shortcut", "alt-shift-n"),
             mute: binding("mute_shortcut", "alt-shift-m"),
@@ -142,6 +157,8 @@ fn speech_should_stop(
 }
 
 pub(super) struct SpeechQueueItem {
+    start: usize,
+    cell_id: Option<usize>,
     markdown: String,
     spoken: String,
     replay: bool,
@@ -210,6 +227,7 @@ async fn speak_with_word_positions(
         .ok_or_else(|| std::io::Error::other("speech helper stdout unavailable"))?;
     let mut words = BufReader::new(stdout).lines();
     let markdown_source: Arc<str> = Arc::from(item.markdown.as_str());
+    let utf16_base = item.spoken[..item.start].encode_utf16().count();
     let spoken_source: Arc<str> = Arc::from(item.spoken.as_str());
     let payload = base64::engine::general_purpose::STANDARD.encode(item.spoken.as_bytes());
     // The native helper (used for highlighting) must honor the same per-utterance
@@ -219,7 +237,7 @@ async fn speak_with_word_positions(
     let mut muted = MUTED.load(Ordering::Acquire);
     if muted { stdin.write_all(b"MUTE\n").await?; }
     stdin
-        .write_all(format!("SPEAK\t{payload}\t{voice}\t{rate}\n").as_bytes())
+        .write_all(format!("SPEAK\t{payload}\t{voice}\t{rate}\t{utf16_base}\n").as_bytes())
         .await?;
     stdin.flush().await?;
     active.store(true, Ordering::Release);
@@ -249,6 +267,7 @@ async fn speak_with_word_positions(
                                 markdown: Arc::clone(&markdown_source),
                                 replay: item.replay,
                                 spoken: Arc::clone(&spoken_source),
+                                cell_id: item.cell_id,
                                 utf16_start,
                                 utf16_len,
                             });
@@ -420,7 +439,7 @@ fn configured_speech_rate_multiplier() -> f32 {
 
 /// Convert Markdown presentation into the same ordered words for the speech engine.
 /// The original Markdown remains unchanged in the chat history.
-fn markdown_to_spoken_text(markdown: &str) -> String {
+pub(crate) fn markdown_to_spoken_text(markdown: &str) -> String {
     let mut spoken = String::new();
     for event in Parser::new(spoken_markdown_without_checkout_footers(markdown)) {
         match event {
@@ -752,15 +771,34 @@ impl ChatWidget {
     /// Queue local playback rather than cancelling the preceding assistant
     /// message. The worker exits when voice mode is explicitly stopped.
     pub(crate) fn play_verbatim_speech(&mut self, markdown: &str) -> std::io::Result<()> {
-        self.queue_verbatim_speech(markdown, /*replay*/ false)
+        self.queue_verbatim_speech(markdown, markdown_to_spoken_text(markdown), false, 0, None)
     }
 
     pub(crate) fn replay_verbatim_speech(&mut self, markdown: &str) -> std::io::Result<()> {
-        self.queue_verbatim_speech(markdown, /*replay*/ true)
+        self.queue_verbatim_speech(markdown, markdown_to_spoken_text(markdown), true, 0, None)
     }
 
-    fn queue_verbatim_speech(&mut self, markdown: &str, replay: bool) -> std::io::Result<()> {
-        let spoken = markdown_to_spoken_text(markdown);
+    pub(crate) fn read_from_paragraph(
+        &mut self,
+        markdown: &str,
+        spoken: String,
+        start: usize,
+        cell_id: usize,
+    ) -> std::io::Result<()> {
+        self.cancel_verbatim_speech();
+        // A cancelled worker's final cleanup must not erase the new highlight.
+        self.realtime_conversation.spoken_line_progress = Default::default();
+        self.queue_verbatim_speech(markdown, spoken, true, start, Some(cell_id))
+    }
+
+    fn queue_verbatim_speech(
+        &mut self,
+        markdown: &str,
+        spoken: String,
+        replay: bool,
+        start: usize,
+        cell_id: Option<usize>,
+    ) -> std::io::Result<()> {
         if spoken.is_empty() {
             return Ok(());
         }
@@ -768,6 +806,8 @@ impl ChatWidget {
             && sender
                 .send(SpeechQueueItem {
                     markdown: markdown.to_owned(),
+                    start,
+                    cell_id,
                     spoken: spoken.clone(),
                     replay,
                 })
@@ -779,6 +819,8 @@ impl ChatWidget {
         sender
             .send(SpeechQueueItem {
                 markdown: markdown.to_owned(),
+                start,
+                cell_id,
                 spoken,
                 replay,
             })
@@ -835,7 +877,7 @@ impl ChatWidget {
                     } else {
                         // Preserve old voice behavior for a plain development build.
                         speak_spoken_text(
-                            item.spoken,
+                            item.spoken[item.start..].to_owned(),
                             pause_rx,
                             active,
                             cancelled,

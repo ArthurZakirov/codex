@@ -9,6 +9,7 @@ use crossterm::event::MouseButton;
 use crossterm::event::MouseEvent;
 use crossterm::event::MouseEventKind;
 use pretty_assertions::assert_eq;
+use ratatui::style::Modifier;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
@@ -1315,7 +1316,6 @@ fn user_prompt_has_a_background_without_a_terminal_palette() {
 fn spoken_prompt_selection_keeps_its_fallback_contrast() {
     use crate::history_cell::new_spoken_user_prompt;
     use ratatui::style::Color;
-    use ratatui::style::Modifier;
 
     crate::terminal_palette::with_test_default_colors(
         /*colors*/ None::<crate::terminal_probe::DefaultColors>,
@@ -1395,7 +1395,7 @@ fn spoken_position_maps_wrapped_markdown_and_code() {
 }
 
 #[test]
-fn spoken_line_background_preserves_foreground_and_scroll() {
+fn spoken_word_emphasis_preserves_text_and_scroll() {
     use super::SpokenLine;
     use crate::history_cell::AgentMarkdownCell;
     let markdown = "**Hallo** welt. Noch ein längerer Satz. Zeile zwei.".to_string();
@@ -1413,6 +1413,7 @@ fn spoken_line_background_preserves_foreground_and_scroll() {
     let previous_position = view.position;
     let offset = spoken.find("Zeile").unwrap();
     view.spoken_line = Some(SpokenLine {
+        cell_id: None,
         replay: false,
         markdown: Arc::from(markdown),
         spoken: Arc::from(spoken.as_str()),
@@ -1425,8 +1426,7 @@ fn spoken_line_background_preserves_foreground_and_scroll() {
     for y in before.area.top()..before.area.bottom() {
         for x in before.area.left()..before.area.right() {
             assert_eq!(before[(x, y)].symbol(), after[(x, y)].symbol());
-            assert_eq!(before[(x, y)].fg, after[(x, y)].fg);
-            if after[(x, y)].bg == ratatui::style::Color::DarkGray {
+            if after[(x, y)].modifier.contains(Modifier::UNDERLINED) {
                 backgrounds += 1;
             }
         }
@@ -1442,9 +1442,7 @@ fn spoken_line_background_preserves_foreground_and_scroll() {
     let fallback = render(&mut view, &cells, 40, 12);
     let fallback_cells = (fallback.area.top()..fallback.area.bottom())
         .flat_map(|y| (fallback.area.left()..fallback.area.right()).map(move |x| (x, y)))
-        .filter(|&(x, y)| {
-            fallback[(x, y)].bg == Color::DarkGray && before[(x, y)].bg != Color::DarkGray
-        })
+        .filter(|&(x, y)| fallback[(x, y)] != before[(x, y)])
         .count();
     assert!(
         fallback_cells > backgrounds,
@@ -1474,6 +1472,7 @@ fn spoken_replay_highlights_the_newest_matching_reply() {
     let mut view = TranscriptView::default();
     let plain = render(&mut view, &cells, 40, 12);
     view.spoken_line = Some(SpokenLine {
+        cell_id: None,
         markdown: Arc::from(markdown),
         replay: true,
         spoken: Arc::from(markdown),
@@ -1550,7 +1549,7 @@ fn spoken_word_background_handles_wrapped_multibyte_text() {
         let area = Rect::new(0, row as u16, 12, 1);
         layout.render(area, &mut buf, row);
         layout.paint_spoken_word(range.clone(), area, &mut buf, row);
-        if (0..12).any(|x| buf[(x, row as u16)].bg == Color::DarkGray) {
+        if (0..12).any(|x| buf[(x, row as u16)].modifier.contains(Modifier::UNDERLINED)) {
             colored_rows += 1;
         }
     }
@@ -1582,5 +1581,67 @@ fn spoken_highlight_does_not_jump_to_an_unrelated_later_occurrence() {
             13
         ),
         None,
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn paragraph_pick_reads_the_clicked_reply_repeatedly_and_ignores_drag() {
+    let markdown = "First paragraph.\n\nSecond paragraph.";
+    let cells: Vec<Arc<dyn HistoryCell>> = (0..2)
+        .map(|_| {
+            Arc::new(AgentMarkdownCell::new(
+                markdown.into(),
+                std::path::Path::new("/"),
+            )) as Arc<dyn HistoryCell>
+        })
+        .collect();
+    let thread = codex_protocol::ThreadId::new();
+    let mut view = TranscriptView::default();
+    let buf = render(&mut view, &cells, 50, 20);
+    let (row, column) = text(&buf)
+        .lines()
+        .enumerate()
+        .find_map(|(y, line)| line.find("Second").map(|x| (y as u16, x as u16)))
+        .unwrap();
+    let event = |kind| MouseEvent {
+        kind,
+        column,
+        row,
+        modifiers: KeyModifiers::NONE,
+    };
+    let down = event(MouseEventKind::Down(MouseButton::Left));
+    let up = event(MouseEventKind::Up(MouseButton::Left));
+    view.arm_voice_pick(thread);
+    for mouse in [
+        down,
+        event(MouseEventKind::Drag(MouseButton::Left)),
+        up,
+        down,
+    ] {
+        assert!(
+            view.pick_voice_paragraph(mouse, Some(thread), &cells)
+                .is_none()
+        );
+    }
+    let (_, spoken, start, id) = view.pick_voice_paragraph(up, Some(thread), &cells).unwrap();
+    assert_eq!(&spoken[start..], "Second paragraph.");
+    assert_eq!(EntryKey::Cell(id), EntryKey::cell(&cells[0]));
+    assert!(
+        view.pick_voice_paragraph(down, Some(thread), &cells)
+            .is_none()
+    );
+    assert!(
+        view.pick_voice_paragraph(up, Some(thread), &cells)
+            .is_some()
+    );
+    assert!(view.cancel_voice_pick());
+    assert!(
+        view.pick_voice_paragraph(down, Some(thread), &cells)
+            .is_none()
+    );
+    assert!(
+        view.pick_voice_paragraph(up, Some(thread), &cells)
+            .is_none()
     );
 }

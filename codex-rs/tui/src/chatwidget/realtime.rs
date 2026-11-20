@@ -13,7 +13,7 @@ mod transcript_replay;
 #[cfg(target_os = "macos")]
 mod verbatim_speech;
 #[cfg(target_os = "macos")]
-pub(crate) use verbatim_speech::reading_controls;
+pub(crate) use verbatim_speech::{markdown_to_spoken_text, reading_controls};
 
 pub(crate) use failure_metrics::RealtimeFailureCause;
 
@@ -345,6 +345,8 @@ fn prepare_voice_config(
     };
     let existing_keys = settings.len();
     for (name, default) in [
+        ("paragraph_highlight_color", serde_json::json!("#63A8F8")),
+        ("paragraph_highlight_opacity_percent", serde_json::json!(10)),
         ("paragraph_navigation", serde_json::json!(false)),
         ("previous_paragraph_shortcut", serde_json::json!("shift-up")),
         ("next_paragraph_shortcut", serde_json::json!("shift-down")),

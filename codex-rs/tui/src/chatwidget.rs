@@ -360,9 +360,9 @@ pub(crate) use self::rate_limits::limit_label_for_window;
 mod completion;
 mod realtime;
 #[cfg(target_os = "macos")]
-pub(crate) use realtime::reading_controls;
-#[cfg(target_os = "macos")]
 pub(crate) use realtime::voice_replay_shortcut;
+#[cfg(target_os = "macos")]
+pub(crate) use realtime::{markdown_to_spoken_text, reading_controls};
 mod realtime_settings;
 mod realtime_split_flap;
 pub(crate) use realtime::MAX_REPLAY_TRANSCRIPT_CELLS;

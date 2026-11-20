@@ -507,6 +507,7 @@ impl TextLayout {
         let Some(row) = self.rows.get(row_index) else {
             return;
         };
+        let word_style = crate::style::selection_style().underlined();
         let mut column = row.first_column;
         for (offset, grapheme) in self.text[row.source.clone()].grapheme_indices(true) {
             let start = row.source.start + offset;
@@ -517,8 +518,7 @@ impl TextLayout {
                         .min(usize::from(row.content_width))
                         .min(usize::from(area.width))
                 {
-                    buf[(area.x + selected_column as u16, area.y)]
-                        .set_style(Style::default().bg(ratatui::style::Color::DarkGray));
+                    buf[(area.x + selected_column as u16, area.y)].set_style(word_style);
                 }
             }
             column += width;

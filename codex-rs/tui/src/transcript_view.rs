@@ -24,7 +24,7 @@ mod text;
 mod turn_tip;
 
 use crate::history_cell::AgentMarkdownCell;
-use ratatui::style::{Color, Style};
+use ratatui::style::Style;
 use std::ops::Range;
 use std::sync::Arc;
 use unicode_segmentation::UnicodeSegmentation;
@@ -86,6 +86,7 @@ enum Position {
 /// A word-position report tied to one exact completed assistant message.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SpokenLine {
+    pub(crate) cell_id: Option<usize>,
     pub(crate) markdown: Arc<str>,
     pub(crate) replay: bool,
     pub(crate) spoken: Arc<str>,
@@ -187,6 +188,42 @@ fn spoken_word_display_range(
         .then_some(display_start..display_start + visible_word.len())
 }
 
+/// Tint only occupied cells. Keep formatted text readable against its new surface.
+fn paint_spoken_line(area: Rect, buf: &mut Buffer) {
+    #[cfg(target_os = "macos")]
+    let (color, opacity) = {
+        let controls = crate::chatwidget::reading_controls();
+        (controls.paragraph_color, controls.paragraph_opacity)
+    };
+    #[cfg(not(target_os = "macos"))]
+    let (color, opacity) = (crate::style::UI_ACCENT, 0.1);
+    if opacity == 0.0 {
+        return;
+    }
+    let fill = Some(crate::terminal_palette::default_bg().unwrap_or((0, 0, 0))).and_then(|bg| {
+        use crate::terminal_palette::StdoutColorLevel;
+        matches!(
+            crate::terminal_palette::effective_stdout_color_level(),
+            StdoutColorLevel::TrueColor | StdoutColorLevel::Ansi256
+        )
+        .then(|| crate::terminal_palette::best_color(crate::color::blend(color, bg, opacity)))
+    });
+    let Some(last) =
+        (area.left()..area.right()).rfind(|&x| !buf[(x, area.y)].symbol().trim().is_empty())
+    else {
+        return;
+    };
+    for x in area.left()..=last {
+        let cell = &mut buf[(x, area.y)];
+        if let Some(fill) = fill {
+            let fg = crate::style::readable_color_on(cell.fg, Some(fill));
+            cell.set_style(Style::default().bg(fill).fg(fg).not_dim());
+        } else {
+            cell.set_style(Style::default().italic());
+        }
+    }
+}
+
 struct VisibleRow {
     index: usize,
     row: usize,
@@ -226,6 +263,8 @@ pub(crate) struct TranscriptView {
     mode: HistoryRenderMode,
     pub(crate) history: TranscriptHistoryState,
     highlight: Option<usize>,
+    #[cfg(target_os = "macos")]
+    voice_pick: Option<(codex_protocol::ThreadId, Option<(u16, u16)>)>,
     pub(crate) spoken_line: Option<SpokenLine>,
     saved_position: Option<Position>,
     unseen_activity: bool,
@@ -267,6 +306,8 @@ impl Default for TranscriptView {
             mode: HistoryRenderMode::Rich,
             history: TranscriptHistoryState::Idle,
             highlight: None,
+            #[cfg(target_os = "macos")]
+            voice_pick: None,
             spoken_line: None,
             saved_position: None,
             unseen_activity: false,
@@ -275,6 +316,86 @@ impl Default for TranscriptView {
             last_click: None,
             disclosure: disclosure::Disclosure::default(),
         }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl TranscriptView {
+    pub(crate) fn arm_voice_pick(&mut self, thread: codex_protocol::ThreadId) {
+        self.voice_pick = Some((thread, None));
+    }
+
+    pub(crate) fn cancel_voice_pick(&mut self) -> bool {
+        self.voice_pick.take().is_some()
+    }
+
+    pub(crate) fn pick_voice_paragraph(
+        &mut self,
+        mouse: crossterm::event::MouseEvent,
+        thread: Option<codex_protocol::ThreadId>,
+        cells: &[Arc<dyn HistoryCell>],
+    ) -> Option<(String, String, usize, usize)> {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let (owner, pressed) = self.voice_pick.as_mut()?;
+        if Some(*owner) != thread {
+            self.voice_pick = None;
+            return None;
+        }
+        let point = (mouse.column, mouse.row);
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) if mouse.modifiers.is_empty() => {
+                *pressed = Some(point);
+                return None;
+            }
+            MouseEventKind::Up(MouseButton::Left)
+                if pressed.take() == Some(point) && mouse.modifiers.is_empty() => {}
+            MouseEventKind::Drag(_) | MouseEventKind::Down(_) => {
+                *pressed = None;
+                return None;
+            }
+            _ => return None,
+        }
+        if !self.area.contains(point.into()) {
+            return None;
+        }
+        let row = self.visible.get(usize::from(mouse.row - self.area.y))?;
+        let cell = cells.get(row.index)?;
+        let EntryKey::Cell(id) = row.key else {
+            return None;
+        };
+        if EntryKey::cell(cell) != row.key {
+            return None;
+        }
+        let markdown = cell
+            .as_any()
+            .downcast_ref::<AgentMarkdownCell>()?
+            .markdown_source();
+        let offset = row.layout.position_at(row.row, mouse.column - self.area.x);
+        if offset == row.layout.position_at(row.row, u16::MAX) {
+            return None;
+        }
+        let spoken = crate::chatwidget::markdown_to_spoken_text(markdown);
+        let mut start = 0;
+        for paragraph in spoken.split_inclusive('\n') {
+            let mut words = paragraph.unicode_word_indices();
+            if let Some(first) = words.next() {
+                let last = words.last().unwrap_or(first);
+                let locate = |i: usize| {
+                    spoken_word_display_offset(
+                        &spoken,
+                        row.layout.text(),
+                        spoken[..start + i].encode_utf16().count(),
+                    )
+                };
+                if let (Some(begin), Some(end)) = (locate(first.0), locate(last.0))
+                    && (begin..end + last.1.len()).contains(&offset)
+                {
+                    return Some((markdown.to_owned(), spoken, start, id));
+                }
+            }
+            start += paragraph.len();
+        }
+        None
     }
 }
 
@@ -372,7 +493,9 @@ impl TranscriptView {
                         .filter(|message| message.markdown_source() == progress.markdown.as_ref())
                         .map(|_| index)
                 });
-                let target = if progress.replay {
+                let target = if let Some(id) = progress.cell_id {
+                    matches.find(|&i| EntryKey::cell(&cells[i]) == EntryKey::Cell(id))?
+                } else if progress.replay {
                     // Replay was explicitly requested for the newest reply.
                     matches.next_back()?
                 } else {
@@ -452,17 +575,16 @@ impl TranscriptView {
             layout.render(row_area, buf, row);
             // Only the spoken word receives a background. If its callback span
             // cannot be mapped confidently, highlight the resolved line instead.
-            // Existing foreground colors and text remain untouched.
             if let Some((target, fallback_row, word_range, paragraph)) = &spoken_highlight
                 && *target == index
             {
                 if paragraph.is_some_and(|(start, end)| (start..=end).contains(&row)) {
-                    buf.set_style(row_area, Style::default().bg(Color::Blue));
+                    paint_spoken_line(row_area, buf);
                 }
                 if let Some(range) = word_range {
                     layout.paint_spoken_word(range.clone(), row_area, buf, row);
                 } else if *fallback_row == row {
-                    buf.set_style(row_area, Style::default().bg(Color::DarkGray));
+                    paint_spoken_line(row_area, buf);
                 }
             }
             self.render_disclosure(&activity_ids, &layout, row, row_area, buf);
