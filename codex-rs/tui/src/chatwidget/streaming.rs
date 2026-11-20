@@ -604,6 +604,13 @@ impl ChatWidget {
         }
         self.transcript.last_flushed_agent_message = None;
         if !parsed.visible_markdown.is_empty() {
+            #[cfg(target_os = "macos")]
+            self.narrate_visible_agent_message(
+                turn_id,
+                &item.id,
+                &parsed.visible_markdown,
+                from_replay,
+            );
             self.transcript
                 .record_agent_markdown(parsed.visible_markdown.clone(), message);
         }

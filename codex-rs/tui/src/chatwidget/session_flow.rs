@@ -291,6 +291,14 @@ impl ChatWidget {
         {
             self.emit_forked_thread_event(forked_from_id, fork_parent_title);
         }
+        if previous_thread_id.is_none()
+            && display == SessionConfiguredDisplay::Normal
+            && Self::dictation_auto_start_enabled()
+        {
+            self.app_event_tx.send(AppEvent::AutoStartDictation {
+                thread_id: session.thread_id,
+            });
+        }
         if !self.suppress_session_configured_redraw {
             self.request_redraw();
         }

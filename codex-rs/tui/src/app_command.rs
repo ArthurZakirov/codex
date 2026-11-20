@@ -115,6 +115,7 @@ pub(crate) enum AppCommand {
         thread_id: ThreadId,
         attempt_id: u64,
         offer_sdp: RealtimeSdp,
+        dictation: bool,
     },
     RealtimeConversationStop {
         thread_id: ThreadId,

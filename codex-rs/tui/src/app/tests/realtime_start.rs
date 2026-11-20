@@ -35,6 +35,7 @@ async fn rejected_voice_start_does_not_leave_local_capture_active() -> Result<()
                 thread_id,
                 attempt_id: 1,
                 offer_sdp: String::from("v=0\r\n").into(),
+                dictation: false,
             }),
         ))
         .await?;

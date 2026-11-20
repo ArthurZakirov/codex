@@ -25,7 +25,11 @@ mod text;
 mod turn_details;
 mod turn_tip;
 
+use crate::history_cell::AgentMarkdownCell;
+use ratatui::style::Style;
+use std::ops::Range;
 use std::sync::Arc;
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::chatwidget::ActiveCellTranscriptKey;
 use crate::history_cell::HistoryCell;
@@ -83,6 +87,147 @@ enum Position {
     Reading(Anchor),
 }
 
+/// A word-position report tied to one exact completed assistant message.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SpokenLine {
+    pub(crate) cell_id: Option<usize>,
+    pub(crate) markdown: Arc<str>,
+    pub(crate) replay: bool,
+    pub(crate) spoken: Arc<str>,
+    pub(crate) utf16_start: usize,
+    pub(crate) utf16_len: usize,
+}
+
+/// Resolve an AppKit UTF-16 callback boundary to a Rust UTF-8 byte boundary.
+/// An offset in the middle of a surrogate pair is deliberately rejected.
+fn utf16_byte_offset(text: &str, target: usize) -> Option<usize> {
+    let mut utf16 = 0usize;
+    for (offset, ch) in text.char_indices() {
+        if utf16 == target {
+            return Some(offset);
+        }
+        utf16 += ch.len_utf16();
+    }
+    (utf16 == target).then_some(text.len())
+}
+
+/// The speech callback reports UTF-16 offsets in spoken text. Match actual
+/// lexical tokens in the rendered transcript, ignoring Markdown decoration
+/// while refusing to invent a position when the token order diverges.
+fn spoken_word_display_offset(spoken: &str, display: &str, utf16_start: usize) -> Option<usize> {
+    let target = utf16_byte_offset(spoken, utf16_start)?;
+    let words: Vec<_> = spoken.unicode_word_indices().collect();
+    let target_word = words
+        .iter()
+        .position(|(start, word)| *start <= target && target < start + word.len())?;
+    let visible: Vec<_> = display.unicode_word_indices().collect();
+    let mut cursor = 0usize;
+    for (index, (_, expected)) in words.iter().enumerate().take(target_word + 1) {
+        // Permit a small amount of rendered-only text, e.g. code language labels.
+        let Some(found) = visible
+            .iter()
+            .enumerate()
+            .skip(cursor)
+            .take(4)
+            .find(|(_, (_, actual))| actual.to_lowercase() == expected.to_lowercase())
+        else {
+            // A link destination, a folded block, or a transformed table can break
+            // the prefix match. Locate this callback using nearby matching words
+            // beyond the last confirmed position. Leave ambiguous matches unpainted.
+            let matches_word =
+                |i: usize, j: usize| words[i].1.to_lowercase() == visible[j].1.to_lowercase();
+            let mut best_score = 0;
+            let mut offset = None;
+            for j in cursor..visible.len() {
+                if !matches_word(target_word, j) {
+                    continue;
+                }
+                let before = (1..=8.min(target_word - index).min(j - cursor))
+                    .take_while(|d| matches_word(target_word - d, j - d))
+                    .count();
+                let after = (1..=8
+                    .min(words.len() - target_word - 1)
+                    .min(visible.len() - j - 1))
+                    .take_while(|d| matches_word(target_word + d, j + d))
+                    .count();
+                let score = before + after;
+                if score > best_score {
+                    best_score = score;
+                    offset = Some(visible[j].0);
+                } else if score == best_score {
+                    offset = None;
+                }
+            }
+            return offset;
+        };
+        cursor = found.0 + 1;
+        if index == target_word {
+            return Some(found.1.0);
+        }
+    }
+    None
+}
+
+/// Prefer the exact visible word only when the native callback length identifies
+/// the same lexical token. A mismatch falls back to the already located line.
+fn spoken_word_display_range(
+    spoken: &str,
+    display: &str,
+    utf16_start: usize,
+    utf16_len: usize,
+    display_start: usize,
+) -> Option<Range<usize>> {
+    if utf16_len == 0 {
+        return None;
+    }
+    let start = utf16_byte_offset(spoken, utf16_start)?;
+    let end = utf16_byte_offset(spoken, utf16_start.checked_add(utf16_len)?)?;
+    let mut spoken_words = spoken.get(start..end)?.unicode_words();
+    let spoken_word = spoken_words.next()?;
+    if spoken_words.next().is_some() {
+        return None;
+    }
+    let visible_word = display.get(display_start..)?.unicode_words().next()?;
+    (spoken_word.to_lowercase() == visible_word.to_lowercase())
+        .then_some(display_start..display_start + visible_word.len())
+}
+
+/// Tint only occupied cells. Keep formatted text readable against its new surface.
+fn paint_spoken_line(area: Rect, buf: &mut Buffer) {
+    #[cfg(target_os = "macos")]
+    let (color, opacity) = {
+        let controls = crate::chatwidget::reading_controls();
+        (controls.paragraph_color, controls.paragraph_opacity)
+    };
+    #[cfg(not(target_os = "macos"))]
+    let (color, opacity) = (crate::style::UI_ACCENT, 0.1);
+    if opacity == 0.0 {
+        return;
+    }
+    let fill = Some(crate::terminal_palette::default_bg().unwrap_or((0, 0, 0))).and_then(|bg| {
+        use crate::terminal_palette::StdoutColorLevel;
+        matches!(
+            crate::terminal_palette::effective_stdout_color_level(),
+            StdoutColorLevel::TrueColor | StdoutColorLevel::Ansi256
+        )
+        .then(|| crate::terminal_palette::best_color(crate::color::blend(color, bg, opacity)))
+    });
+    let Some(last) =
+        (area.left()..area.right()).rfind(|&x| !buf[(x, area.y)].symbol().trim().is_empty())
+    else {
+        return;
+    };
+    for x in area.left()..=last {
+        let cell = &mut buf[(x, area.y)];
+        if let Some(fill) = fill {
+            let fg = crate::style::readable_color_on(cell.fg, Some(fill));
+            cell.set_style(Style::default().bg(fill).fg(fg).not_dim());
+        } else {
+            cell.set_style(Style::default().italic());
+        }
+    }
+}
+
 struct VisibleRow {
     index: usize,
     row: usize,
@@ -125,6 +270,9 @@ pub(crate) struct TranscriptView {
     mode: HistoryRenderMode,
     pub(crate) history: TranscriptHistoryState,
     highlight: Option<usize>,
+    #[cfg(target_os = "macos")]
+    voice_pick: Option<(codex_protocol::ThreadId, Option<(u16, u16)>)>,
+    pub(crate) spoken_line: Option<SpokenLine>,
     saved_position: Option<Position>,
     unseen_activity: bool,
     tail_visible: bool,
@@ -169,6 +317,9 @@ impl Default for TranscriptView {
             mode: HistoryRenderMode::Rich,
             history: TranscriptHistoryState::Idle,
             highlight: None,
+            #[cfg(target_os = "macos")]
+            voice_pick: None,
+            spoken_line: None,
             saved_position: None,
             unseen_activity: false,
             tail_visible: true,
@@ -177,6 +328,86 @@ impl Default for TranscriptView {
             disclosure: disclosure::Disclosure::default(),
             turn_details: None,
         }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl TranscriptView {
+    pub(crate) fn arm_voice_pick(&mut self, thread: codex_protocol::ThreadId) {
+        self.voice_pick = Some((thread, None));
+    }
+
+    pub(crate) fn cancel_voice_pick(&mut self) -> bool {
+        self.voice_pick.take().is_some()
+    }
+
+    pub(crate) fn pick_voice_paragraph(
+        &mut self,
+        mouse: crossterm::event::MouseEvent,
+        thread: Option<codex_protocol::ThreadId>,
+        cells: &[Arc<dyn HistoryCell>],
+    ) -> Option<(String, String, usize, usize)> {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let (owner, pressed) = self.voice_pick.as_mut()?;
+        if Some(*owner) != thread {
+            self.voice_pick = None;
+            return None;
+        }
+        let point = (mouse.column, mouse.row);
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) if mouse.modifiers.is_empty() => {
+                *pressed = Some(point);
+                return None;
+            }
+            MouseEventKind::Up(MouseButton::Left)
+                if pressed.take() == Some(point) && mouse.modifiers.is_empty() => {}
+            MouseEventKind::Drag(_) | MouseEventKind::Down(_) => {
+                *pressed = None;
+                return None;
+            }
+            _ => return None,
+        }
+        if !self.area.contains(point.into()) {
+            return None;
+        }
+        let row = self.visible.get(usize::from(mouse.row - self.area.y))?;
+        let cell = cells.get(row.index)?;
+        let EntryKey::Cell(id) = row.key else {
+            return None;
+        };
+        if EntryKey::cell(cell) != row.key {
+            return None;
+        }
+        let markdown = cell
+            .as_any()
+            .downcast_ref::<AgentMarkdownCell>()?
+            .markdown_source();
+        let offset = row.layout.position_at(row.row, mouse.column - self.area.x);
+        if offset == row.layout.position_at(row.row, u16::MAX) {
+            return None;
+        }
+        let spoken = crate::chatwidget::markdown_to_spoken_text(markdown);
+        let mut start = 0;
+        for paragraph in spoken.split_inclusive('\n') {
+            let mut words = paragraph.unicode_word_indices();
+            if let Some(first) = words.next() {
+                let last = words.last().unwrap_or(first);
+                let locate = |i: usize| {
+                    spoken_word_display_offset(
+                        &spoken,
+                        row.layout.text(),
+                        spoken[..start + i].encode_utf16().count(),
+                    )
+                };
+                if let (Some(begin), Some(end)) = (locate(first.0), locate(last.0))
+                    && (begin..end + last.1.len()).contains(&offset)
+                {
+                    return Some((markdown.to_owned(), spoken, start, id));
+                }
+            }
+            start += paragraph.len();
+        }
+        None
     }
 }
 
@@ -298,6 +529,71 @@ impl TranscriptView {
             }
         }
         let area = body;
+        // Resolve the narrated word to a wrapped row once per frame. Repeating
+        // the Markdown/token search for every painted row would be expensive
+        // for long messages and large transcripts.
+        let spoken_highlight = if self.selection.is_none()
+            && self.highlight.is_none()
+            && !self.search.is_active()
+        {
+            self.spoken_line.clone().and_then(|progress| {
+                let mut matches = cells.iter().enumerate().filter_map(|(index, cell)| {
+                    cell.as_any()
+                        .downcast_ref::<AgentMarkdownCell>()
+                        .filter(|message| message.markdown_source() == progress.markdown.as_ref())
+                        .map(|_| index)
+                });
+                let target = if let Some(id) = progress.cell_id {
+                    matches.find(|&i| EntryKey::cell(&cells[i]) == EntryKey::Cell(id))?
+                } else if progress.replay {
+                    // Replay was explicitly requested for the newest reply.
+                    matches.next_back()?
+                } else {
+                    let target = matches.next()?;
+                    if matches.next().is_some() {
+                        return None;
+                    }
+                    target
+                };
+                let layout = self.layout(cells, target)?;
+                let offset = spoken_word_display_offset(
+                    &progress.spoken,
+                    layout.text(),
+                    progress.utf16_start,
+                )?;
+                let word_range = spoken_word_display_range(
+                    &progress.spoken,
+                    layout.text(),
+                    progress.utf16_start,
+                    progress.utf16_len,
+                    offset,
+                );
+                #[cfg(target_os = "macos")]
+                let paragraph = if crate::chatwidget::reading_controls().navigation {
+                    let byte = utf16_byte_offset(&progress.spoken, progress.utf16_start)?;
+                    let first = progress.spoken[..byte].rfind('\n').map_or(0, |n| n + 1);
+                    let end = progress.spoken[byte..]
+                        .find('\n')
+                        .map_or(progress.spoken.len(), |n| byte + n);
+                    let mut words = progress.spoken[first..end].unicode_word_indices();
+                    let begin = first + words.next()?.0;
+                    let last = words.last().map_or(begin, |(index, _)| first + index);
+                    let row_at = |i| {
+                        let pos = progress.spoken[..i].encode_utf16().count();
+                        spoken_word_display_offset(&progress.spoken, layout.text(), pos)
+                            .map(|o| layout.row_for_offset(o))
+                    };
+                    row_at(begin).zip(row_at(last))
+                } else {
+                    None
+                };
+                #[cfg(not(target_os = "macos"))]
+                let paragraph: Option<(usize, usize)> = None;
+                Some((target, layout.row_for_offset(offset), word_range, paragraph))
+            })
+        } else {
+            None
+        };
         let (mut index, mut row) = start;
         let mut entry_activity_ids: Option<(usize, Arc<[String]>)> = None;
         for y in area.top()..area.bottom() {
@@ -329,6 +625,20 @@ impl TranscriptView {
             layout.render(row_area, buf, row);
             if self.agent_links.is_some() {
                 layout.underline_agent_links(row_area, buf, row);
+            }
+            // Only the spoken word receives a background. If its callback span
+            // cannot be mapped confidently, highlight the resolved line instead.
+            if let Some((target, fallback_row, word_range, paragraph)) = &spoken_highlight
+                && *target == index
+            {
+                if paragraph.is_some_and(|(start, end)| (start..=end).contains(&row)) {
+                    paint_spoken_line(row_area, buf);
+                }
+                if let Some(range) = word_range {
+                    layout.paint_spoken_word(range.clone(), row_area, buf, row);
+                } else if *fallback_row == row {
+                    paint_spoken_line(row_area, buf);
+                }
             }
             self.render_disclosure(&activity_ids, &layout, row, row_area, buf);
             if self.highlight == Some(index) && self.selection.is_none() && !self.search.is_active()

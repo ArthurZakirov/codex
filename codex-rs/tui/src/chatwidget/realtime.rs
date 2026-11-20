@@ -3,10 +3,18 @@
 //! Interleaved speakers retain separate displays so settled caption text never reanimates.
 //! Speech recovery suppresses stale queued answers while preserving unspoken text fallbacks.
 
+#[cfg(target_os = "macos")]
+mod audio_lease;
 mod failure_metrics;
+#[cfg(target_os = "macos")]
+mod focus;
 mod recording_controls;
 mod session_lock;
 mod transcript_replay;
+#[cfg(target_os = "macos")]
+mod verbatim_speech;
+#[cfg(target_os = "macos")]
+pub(crate) use verbatim_speech::{markdown_to_spoken_text, reading_controls};
 
 pub(crate) use failure_metrics::RealtimeFailureCause;
 
@@ -70,6 +78,7 @@ static NEXT_REALTIME_SPEECH_DELIVERY_ID: AtomicU64 = AtomicU64::new(1);
 struct PendingRealtimeSpeech {
     state: PendingSpeechState,
     captioned: bool,
+    rendered_in_history: bool,
     input_generation: u64,
     thread_id: ThreadId,
     turn_id: String,
@@ -143,6 +152,10 @@ pub(super) struct RealtimeConversationUiState {
     pub(super) phase: RealtimeConversationPhase,
     recover_late_transcripts: bool,
     attempt_id: u64,
+    dictation: bool,
+    pending_voice_message: String,
+    voice_segment_pending: bool,
+    submit_voice_when_ready: bool,
     thread_id: Option<ThreadId>,
     pub(super) handle: Option<RealtimeWebrtcSessionHandle>,
     startup_abort: Option<AbortHandle>,
@@ -183,6 +196,18 @@ pub(super) struct RealtimeConversationUiState {
     delegated_reasoning_turns: VecDeque<String>,
     pub(super) agent_items: HashMap<(String, String), RealtimeAgentItemOrigin>,
     pending_speech: VecDeque<PendingRealtimeSpeech>,
+    #[cfg(target_os = "macos")]
+    verbatim_speech_task: Option<tokio::task::JoinHandle<()>>,
+    #[cfg(target_os = "macos")]
+    verbatim_speech_sender:
+        Option<tokio::sync::mpsc::UnboundedSender<verbatim_speech::SpeechQueueItem>>,
+    #[cfg(target_os = "macos")]
+    spoken_line_progress:
+        std::sync::Arc<std::sync::Mutex<Option<crate::transcript_view::SpokenLine>>>,
+    #[cfg(target_os = "macos")]
+    verbatim_speech_control: Option<verbatim_speech::SpeechPlaybackControl>,
+    #[cfg(target_os = "macos")]
+    narrated_agent_items: VecDeque<(String, String)>,
 }
 
 impl RealtimeConversationUiState {
@@ -251,7 +276,289 @@ fn realtime_input_fingerprint(input: &str) -> (usize, u64) {
     (input.len(), hasher.finish())
 }
 
+#[derive(Default, serde::Deserialize)]
+#[serde(default)]
+struct DictationSettings {
+    enabled: bool,
+    auto_start: bool,
+}
+
+#[derive(Default, serde::Deserialize)]
+#[serde(default)]
+struct VoiceSettings {
+    dictation: DictationSettings,
+}
+
+fn voice_config_path() -> Option<std::path::PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    Some(std::path::PathBuf::from(home).join(".config/codex-voice/config.json"))
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn voice_replay_shortcut() -> Option<crate::key_hint::KeyBinding> {
+    static SHORTCUT: std::sync::OnceLock<Option<crate::key_hint::KeyBinding>> =
+        std::sync::OnceLock::new();
+    *SHORTCUT.get_or_init(|| {
+        let settings = voice_config_path()
+            .and_then(|path| std::fs::read(path).ok())
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+        match settings
+            .as_ref()
+            .and_then(|settings| settings.get("replay_shortcut"))
+        {
+            Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::String(key)) => {
+                crate::keymap::parse_keybinding(&key.to_ascii_lowercase()).filter(|binding| {
+                    let (code, modifiers) = binding.parts();
+                    matches!(code, crossterm::event::KeyCode::F(_))
+                        || (matches!(code, crossterm::event::KeyCode::Char(_))
+                            && modifiers.intersects(
+                                crossterm::event::KeyModifiers::CONTROL
+                                    | crossterm::event::KeyModifiers::ALT
+                                    | crossterm::event::KeyModifiers::SUPER,
+                            ))
+                })
+            }
+            _ => Some(crate::key_hint::plain(crossterm::event::KeyCode::F(10))),
+        }
+    })
+}
+
+fn prepare_voice_config(
+    path: &std::path::Path,
+    codex_home: &std::path::Path,
+) -> std::io::Result<()> {
+    let original = match std::fs::read(path) {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+    let mut value = if let Some(bytes) = &original {
+        let Ok(value) = serde_json::from_slice(bytes) else {
+            // Open invalid JSON as-is so it can be repaired in the editor.
+            return Ok(());
+        };
+        value
+    } else {
+        serde_json::json!({})
+    };
+    let Some(settings) = value.as_object_mut() else {
+        return Ok(());
+    };
+    let existing_keys = settings.len();
+    for (name, default) in [
+        ("paragraph_highlight_color", serde_json::json!("#63A8F8")),
+        ("paragraph_highlight_opacity_percent", serde_json::json!(10)),
+        ("paragraph_navigation", serde_json::json!(false)),
+        ("previous_paragraph_shortcut", serde_json::json!("shift-up")),
+        ("next_paragraph_shortcut", serde_json::json!("shift-down")),
+        ("skip_message_shortcut", serde_json::json!("alt-shift-n")),
+        ("mute_shortcut", serde_json::json!("alt-shift-m")),
+    ] {
+        settings.entry(name).or_insert(default);
+    }
+    settings
+        .entry("replay_shortcut")
+        .or_insert(serde_json::json!("f10"));
+    settings.entry("_help").or_insert_with(|| serde_json::json!({
+        "focus_mode": {
+            "follow_focus": "Keep listening in other apps. Transfer the microphone when another Codex tab gains focus. Requires terminal focus reporting.",
+            "lock": "Keep listening in the owning chat until you stop it. Other Codex tabs cannot start voice.",
+            "stop_on_blur": "Stop listening when the terminal loses focus. Start again manually."
+        },
+        "dictation": "enabled selects Dictation for F8. auto_start also starts it on launch; follow_focus starts it on focus gain.",
+        "replay_shortcut": "Single shortcut, for example f10, ctrl-shift-r or super-r (Command+R if passed through by the terminal). Use null to disable. Restart after changing it.",
+        "commands": "Type /voice and press Enter for the Voice menu. Press ? for keyboard shortcuts."
+    }));
+    settings
+        .entry("speech_rate")
+        .or_insert(serde_json::json!(1.8));
+    settings
+        .entry("dictation")
+        .or_insert_with(|| serde_json::json!({"enabled": false, "auto_start": false}));
+    if !settings.contains_key("focus_mode") {
+        #[cfg(target_os = "macos")]
+        let focus_mode =
+            serde_json::to_value(focus::legacy_mode(codex_home)).map_err(std::io::Error::other)?;
+        #[cfg(not(target_os = "macos"))]
+        let focus_mode = {
+            let _ = codex_home;
+            serde_json::json!("lock")
+        };
+        settings.insert("focus_mode".into(), focus_mode);
+    }
+    if settings.len() == existing_keys {
+        return Ok(());
+    }
+    let directory = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("missing config directory"))?;
+    std::fs::create_dir_all(directory)?;
+    let mut file = tempfile::NamedTempFile::new_in(directory)?;
+    serde_json::to_writer_pretty(&mut file, &value).map_err(std::io::Error::other)?;
+    std::io::Write::write_all(&mut file, b"\n")?;
+    if let Some(original) = original {
+        if std::fs::read(path)? == original {
+            file.persist(path).map_err(|error| error.error)?;
+        }
+    } else if let Err(error) = file.persist_noclobber(path)
+        && error.error.kind() != std::io::ErrorKind::AlreadyExists
+    {
+        return Err(error.error);
+    }
+    Ok(())
+}
+
+#[cfg(all(test, target_os = "macos"))]
+#[test]
+fn opening_config_migrates_focus_without_losing_other_settings() {
+    let home = tempfile::tempdir().unwrap();
+    let config = home.path().join("config.json");
+    std::fs::write(
+        &config,
+        r#"{"speech_rate":1.4,"dictation":{"enabled":true}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        home.path().join("voice-focus.json"),
+        r#"{"mode":"follow_focus"}"#,
+    )
+    .unwrap();
+
+    prepare_voice_config(&config, home.path()).unwrap();
+    let settings: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&config).unwrap()).unwrap();
+    assert_eq!(settings["speech_rate"], 1.4);
+    assert_eq!(settings["dictation"]["enabled"], true);
+    assert_eq!(settings["focus_mode"], "follow_focus");
+    assert!(settings["_help"]["focus_mode"]["lock"].is_string());
+    std::fs::remove_file(home.path().join("voice-focus.json")).unwrap();
+    assert!(focus::read(Some(&config), home.path()) == focus::Mode::FollowFocus);
+}
+
+fn dictation_settings() -> DictationSettings {
+    voice_config_path()
+        .and_then(|path| std::fs::read(path).ok())
+        .and_then(|json| serde_json::from_slice::<VoiceSettings>(&json).ok())
+        .unwrap_or_default()
+        .dictation
+}
+
 impl ChatWidget {
+    pub(crate) fn open_voice_config(&mut self) {
+        let Some(path) = voice_config_path() else {
+            self.add_error_message("Unable to locate Voice configuration.".into());
+            return;
+        };
+        let result = prepare_voice_config(&path, self.config.codex_home.as_path()).and_then(|()| {
+            #[cfg(target_os = "macos")]
+            let mut command = {
+                let mut command = std::process::Command::new("/usr/bin/open");
+                command.args(["-b", "com.microsoft.VSCode"]);
+                command
+            };
+            #[cfg(not(target_os = "macos"))]
+            let mut command = std::process::Command::new("code");
+            let status = command
+                .arg(&path)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()?;
+            if status.success() {
+                Ok(())
+            } else {
+                Err(std::io::Error::other(
+                    "Visual Studio Code did not open the file",
+                ))
+            }
+        });
+        if let Err(error) = result {
+            self.add_error_message(format!(
+                "Unable to open {} in VS Code: {error}",
+                path.display()
+            ));
+        }
+    }
+
+    pub(super) fn note_voice_input_started(&mut self) {
+        if self.realtime_conversation.phase == RealtimeConversationPhase::Active {
+            self.realtime_conversation.voice_segment_pending = true;
+        }
+    }
+
+    /// Prepare an explicit Enter submission using the ordinary composer path.
+    pub(super) fn prepare_voice_submit(&mut self) -> bool {
+        if self.realtime_conversation.phase != RealtimeConversationPhase::Active {
+            return false;
+        }
+        let has_draft = !self.bottom_pane.composer_text().is_empty();
+        if !self.realtime_conversation.dictation && has_draft {
+            return false;
+        }
+        if self.realtime_conversation.voice_segment_pending {
+            if !self.realtime_conversation.submit_voice_when_ready {
+                self.realtime_conversation.submit_voice_when_ready = true;
+                return true;
+            }
+            // A second Enter sends the text already available if recognition stalls.
+            self.cancel_pending_voice_submit();
+            self.realtime_conversation.voice_segment_pending = false;
+        }
+        let text = std::mem::take(&mut self.realtime_conversation.pending_voice_message);
+        if !text.is_empty() {
+            self.bottom_pane.append_dictated_text(&text);
+        }
+        false
+    }
+
+    pub(crate) fn voice_has_pending_input(&self) -> bool {
+        self.realtime_conversation.phase == RealtimeConversationPhase::Active
+            && (self.realtime_conversation.voice_segment_pending
+                || !self.realtime_conversation.pending_voice_message.is_empty())
+    }
+
+    pub(super) fn cancel_pending_voice_submit(&mut self) {
+        self.realtime_conversation.submit_voice_when_ready = false;
+    }
+
+    fn finish_voice_input_segment(&mut self, text: &str) -> bool {
+        let state = &mut self.realtime_conversation;
+        if state.phase != RealtimeConversationPhase::Active {
+            return false;
+        }
+        state.voice_segment_pending = false;
+        let text = text.trim();
+        if state.dictation {
+            if !text.is_empty() {
+                self.bottom_pane.append_dictated_text(text);
+            }
+        } else if !text.is_empty() && text.len() <= MAX_TRANSCRIPT_BYTES {
+            if state.pending_voice_message.len() + text.len() + 1 > MAX_TRANSCRIPT_BYTES {
+                state.pending_voice_message.clear();
+            }
+            if !state.pending_voice_message.is_empty() {
+                state.pending_voice_message.push(' ');
+            }
+            state.pending_voice_message.push_str(text);
+        }
+        std::mem::take(&mut state.submit_voice_when_ready)
+    }
+
+    fn submit_completed_voice_input(&mut self) {
+        if self.bottom_pane.no_modal_or_popup_active() && !self.shortcut_overlay_visible() {
+            self.handle_key_event_with_activation_key(
+                crossterm::event::KeyCode::Enter.into(),
+                /*activation_key*/ None,
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn voice_replay_shortcut_available(&self) -> bool {
+        self.realtime_conversation_available_for_thread && !self.side_conversation_active()
+    }
+
     pub(crate) fn realtime_conversation_is_running(&self) -> bool {
         self.realtime_conversation.phase != RealtimeConversationPhase::Inactive
     }
@@ -261,7 +568,37 @@ impl ChatWidget {
             || self.realtime_conversation.recover_late_transcripts
     }
 
+    pub(crate) fn realtime_dictation_is_running(&self) -> bool {
+        self.realtime_conversation.dictation && self.realtime_conversation_is_running()
+    }
+
+    pub(super) fn dictation_auto_start_enabled() -> bool {
+        let settings = dictation_settings();
+        settings.enabled && settings.auto_start
+    }
+
+    pub(crate) fn maybe_auto_start_dictation(&mut self) {
+        if !Self::dictation_auto_start_enabled() || self.realtime_conversation_is_running() {
+            return;
+        }
+        #[cfg(target_os = "macos")]
+        if self.voice_focus_mode() == focus::Mode::FollowFocus {
+            self.schedule_voice_focus_start();
+            return;
+        }
+        self.toggle_realtime_conversation_inner();
+    }
+
     pub(crate) fn toggle_realtime_conversation(&mut self) {
+        #[cfg(target_os = "macos")]
+        {
+            self.voice_focus_start = None;
+            self.voice_handoff_request = None;
+        }
+        self.toggle_realtime_conversation_inner();
+    }
+
+    fn toggle_realtime_conversation_inner(&mut self) {
         if self.realtime_conversation.phase == RealtimeConversationPhase::Stopping {
             self.realtime_conversation.startup_retry = StartupRetry::Used;
             self.add_info_message(
@@ -309,14 +646,29 @@ impl ChatWidget {
 
         self.session_telemetry
             .counter("codex.voice.session.start", /*inc*/ 1, &[]);
-        self.start_realtime_conversation(thread_id);
+        self.start_realtime_conversation(thread_id, dictation_settings().enabled);
     }
 
-    fn start_realtime_conversation(&mut self, thread_id: ThreadId) {
+    fn start_realtime_conversation(&mut self, thread_id: ThreadId, dictation: bool) {
         let Some(audio) = self.realtime_audio_settings() else {
             return;
         };
+        #[cfg(target_os = "macos")]
+        let lease = if verbatim_speech::enabled() || dictation {
+            match audio_lease::acquire() {
+                Ok(lease) => Some(lease),
+                Err(error) => {
+                    self.add_error_message(format!("Unable to start Voice: {error}"));
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        #[cfg(not(target_os = "macos"))]
+        let lease = None;
         self.realtime_conversation.recover_late_transcripts = false;
+        self.realtime_conversation.dictation = dictation;
         self.realtime_conversation.attempt_id =
             NEXT_REALTIME_ATTEMPT_ID.fetch_add(1, Ordering::Relaxed);
         self.realtime_conversation.thread_id = Some(thread_id);
@@ -343,15 +695,14 @@ impl ChatWidget {
         let app_event_tx = self.app_event_tx.clone();
         let startup_abort = session_lock.start_media(move |abort_registration| {
             let result =
-                RealtimeWebrtcSession::start(abort_registration, selection).map_err(|error| {
-                    RealtimeWebrtcStartupFailure {
+                RealtimeWebrtcSession::start_with_audio_lease(abort_registration, selection, lease)
+                    .map_err(|error| RealtimeWebrtcStartupFailure {
                         cause: error
                             .downcast_ref::<codex_realtime_webrtc::ConnectionError>()
                             .copied()
                             .unwrap_or(codex_realtime_webrtc::ConnectionError::Failed),
                         message: error.to_string(),
-                    }
-                });
+                    });
             app_event_tx.send(AppEvent::RealtimeWebrtcOfferCreated {
                 thread_id,
                 attempt_id,
@@ -362,8 +713,155 @@ impl ChatWidget {
         self.request_redraw();
     }
 
+    #[cfg(target_os = "macos")]
+    fn voice_focus_mode(&self) -> focus::Mode {
+        focus::read(
+            voice_config_path().as_deref(),
+            self.config.codex_home.as_path(),
+        )
+    }
+
+    #[cfg(target_os = "macos")]
+    fn schedule_voice_focus_start(&mut self) {
+        if let Some(thread_id) = self.thread_id() {
+            self.voice_focus_start = Some((thread_id, Instant::now() + Duration::from_secs(5)));
+            self.frame_requester.schedule_frame();
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn handle_voice_focus_event(
+        &mut self,
+        event: &crate::tui::TuiEvent,
+        allow_auto_start: bool,
+    ) {
+        use crate::tui::TuiEvent;
+
+        if !matches!(event, TuiEvent::FocusGained | TuiEvent::FocusLost)
+            && !(matches!(event, TuiEvent::Draw)
+                && (self.voice_focus_start.is_some() || self.voice_focus_background))
+        {
+            return;
+        }
+        if verbatim_speech::enabled()
+            || self.realtime_dictation_is_running()
+            || dictation_settings().enabled
+        {
+            self.handle_voice_focus_mode(event, allow_auto_start, self.voice_focus_mode());
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn handle_voice_focus_mode(
+        &mut self,
+        event: &crate::tui::TuiEvent,
+        allow_auto_start: bool,
+        mode: focus::Mode,
+    ) {
+        use crate::tui::TuiEvent;
+
+        match event {
+            TuiEvent::FocusLost => {
+                self.voice_focus_start = None;
+                self.voice_handoff_request = None;
+                self.voice_focus_background = mode == focus::Mode::FollowFocus;
+                self.voice_focus_allows_playback = mode != focus::Mode::StopOnBlur;
+                if self.voice_focus_background
+                    && (self.realtime_conversation_is_running()
+                        || self.realtime_verbatim_speech_active())
+                {
+                    self.frame_requester.schedule_frame();
+                }
+                if !self.voice_focus_allows_playback {
+                    self.stop_realtime_conversation();
+                }
+            }
+            TuiEvent::FocusGained => {
+                self.voice_focus_background = false;
+                self.voice_focus_allows_playback = true;
+                if allow_auto_start && mode == focus::Mode::FollowFocus {
+                    self.schedule_voice_focus_start();
+                }
+            }
+            TuiEvent::Draw => {
+                if self.voice_focus_background
+                    && (self.realtime_conversation_is_running()
+                        || self.realtime_verbatim_speech_active())
+                {
+                    if mode == focus::Mode::FollowFocus {
+                        if matches!(audio_lease::request_handoff(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock)
+                        {
+                            self.voice_focus_allows_playback = false;
+                            self.stop_realtime_conversation();
+                        } else {
+                            self.frame_requester
+                                .schedule_frame_in(Duration::from_millis(100));
+                        }
+                    }
+                    return;
+                }
+                let Some((thread_id, deadline)) = self.voice_focus_start else {
+                    return;
+                };
+                if self.thread_id() != Some(thread_id)
+                    || !allow_auto_start
+                    || self.has_active_modal()
+                    || self.side_conversation_active()
+                    || self.blocks_direct_input
+                    || !self.voice_focus_allows_playback
+                    || mode != focus::Mode::FollowFocus
+                {
+                    self.voice_focus_start = None;
+                    self.voice_handoff_request = None;
+                    return;
+                }
+                if Instant::now() >= deadline {
+                    self.voice_focus_start = None;
+                    self.voice_handoff_request = None;
+                    self.add_error_message(
+                        "Voice Follow Focus is still waiting for the microphone. Check terminal focus reporting and close any older Voice session.".into(),
+                    );
+                    return;
+                }
+                match self.realtime_conversation.phase {
+                    RealtimeConversationPhase::Inactive => match audio_lease::acquire() {
+                        Ok(_lease) => {
+                            self.voice_focus_start = None;
+                            self.voice_handoff_request = None;
+                            self.toggle_realtime_conversation_inner();
+                            return;
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            if !self.voice_focus_background && self.voice_handoff_request.is_none()
+                            {
+                                self.voice_handoff_request = audio_lease::request_handoff().ok();
+                            }
+                        }
+                        Err(error) => {
+                            self.voice_focus_start = None;
+                            self.voice_handoff_request = None;
+                            self.add_error_message(format!("Unable to start Voice: {error}"));
+                            return;
+                        }
+                    },
+                    RealtimeConversationPhase::Stopping => {}
+                    _ => {
+                        self.voice_focus_start = None;
+                        self.voice_handoff_request = None;
+                        return;
+                    }
+                }
+                self.frame_requester
+                    .schedule_frame_in(Duration::from_millis(100));
+            }
+            _ => {}
+        }
+    }
+
     pub(crate) fn stop_realtime_conversation(&mut self) {
         self.realtime_conversation.session_lock.take();
+        #[cfg(target_os = "macos")]
+        self.cancel_verbatim_speech();
         self.realtime_conversation.startup_retry = StartupRetry::Used;
         if matches!(
             self.realtime_conversation.phase,
@@ -445,6 +943,10 @@ impl ChatWidget {
             return;
         }
         self.realtime_conversation.handle = Some(offer.handle);
+        #[cfg(target_os = "macos")]
+        if verbatim_speech::enabled() {
+            self.suppress_realtime_speaker();
+        }
         self.update_realtime_footer();
         self.refresh_terminal_title();
         self.frame_requester
@@ -453,6 +955,7 @@ impl ChatWidget {
             thread_id,
             attempt_id,
             offer_sdp: offer.offer_sdp.into(),
+            dictation: self.realtime_conversation.dictation,
         }) {
             self.record_realtime_failure(RealtimeFailureCause::LocalRequest);
             self.reset_realtime_conversation();
@@ -605,9 +1108,18 @@ impl ChatWidget {
         self.update_realtime_footer();
         self.frame_requester
             .schedule_frame_in(MICROPHONE_METER_INTERVAL);
+        if self.realtime_conversation.dictation {
+            self.add_info_message(
+                "Dictation started.".to_string(),
+                Some("Press Enter to send your draft or F8 to stop dictation.".to_string()),
+            );
+            return;
+        }
         self.add_info_message(
             "Voice conversation started.".to_string(),
-            Some("Use /voice mute to mute or /voice to stop.".to_string()),
+            Some(
+                "Press Enter to send the latest spoken input. Use /voice stop to stop.".to_string(),
+            ),
         );
     }
 
@@ -625,6 +1137,8 @@ impl ChatWidget {
     }
 
     pub(super) fn note_realtime_typed_input(&mut self, text: &str) {
+        #[cfg(target_os = "macos")]
+        self.interrupt_current_verbatim_speech();
         self.invalidate_realtime_voice_input();
         if self.realtime_conversation.phase == RealtimeConversationPhase::Active {
             self.realtime_conversation.pending_typed_input = Some(text.to_string());
@@ -636,6 +1150,7 @@ impl ChatWidget {
             return;
         }
         self.realtime_conversation.latest_input_was_voice = false;
+        // Typed questions do not interrupt the already queued local narration.
         self.realtime_conversation.input_generation = self
             .realtime_conversation
             .input_generation
@@ -687,6 +1202,14 @@ impl ChatWidget {
         if let Some(input) = realtime_delegation_input(items)
             && !matches_local_typed_input
         {
+            // The conversational service can also hand the same caption to Codex.
+            // Once that arrives, Enter should not send that caption again.
+            let pending = &mut self.realtime_conversation.pending_voice_message;
+            if !pending.is_empty() && pending.split_whitespace().eq(input.split_whitespace()) {
+                pending.clear();
+                self.realtime_conversation.submit_voice_when_ready = false;
+            }
+
             let transcript_tail_flush = items.iter().any(|item| {
                 matches!(item, UserInput::Text { text, .. }
                     if text.contains("<source>transcript_tail_flush</source>"))
@@ -937,6 +1460,13 @@ impl ChatWidget {
             *suppressed_nonfinal = true;
             return true;
         }
+        // Only the delegated final answer is eligible for visible Markdown.
+        // A provisional item with no final marker must never leak into history.
+        if !explicitly_final && !trimmed.starts_with("[FINAL]") {
+            *completed = true;
+            *suppressed_nonfinal = true;
+            return true;
+        }
         // Typing ends the old item's speech ownership, but it does not make
         // private voice commentary into typed output. Only a visible answer
         // returns to the ordinary completion path.
@@ -965,13 +1495,16 @@ impl ChatWidget {
             .push_back(PendingRealtimeSpeech {
                 state: PendingSpeechState::AwaitingTurn,
                 captioned: false,
+                rendered_in_history: true,
                 input_generation,
                 thread_id,
                 turn_id: turn_id.to_string(),
                 item: item.clone(),
             });
 
-        true
+        // Keep the speech handoff, but also render the final answer as Markdown.
+        // Private commentary and reasoning still return early above.
+        false
     }
 
     pub(super) fn speak_completed_realtime_delegation(
@@ -979,6 +1512,12 @@ impl ChatWidget {
         turn_id: &str,
         item: &ThreadItemPayload,
     ) {
+        // Local narration happens for each visible completed item, including
+        // commentary and typed answers. Do not schedule the final twice.
+        #[cfg(target_os = "macos")]
+        if verbatim_speech::enabled() {
+            return;
+        }
         let ThreadItemPayload::AgentMessage {
             id: item_id, text, ..
         } = item
@@ -1034,16 +1573,16 @@ impl ChatWidget {
             return;
         }
         *may_speak = false;
+        let native_speech = cfg!(target_os = "macos")
+            && std::env::var("CODEX_REALTIME_VERBATIM_SPEECH").is_ok_and(|value| value == "1");
         if !can_retain_realtime_speech(turn_id, item)
-            || codex_utils_string::approx_token_count(&text) > MAX_SPEAKABLE_FINAL_TOKENS
+            || (!native_speech
+                && codex_utils_string::approx_token_count(&text) > MAX_SPEAKABLE_FINAL_TOKENS)
         {
             self.remove_waiting_realtime_speech(turn_id, item_id);
             self.finish_realtime_turn(turn_id);
-            self.handle_thread_item(
-                item.clone(),
-                turn_id.to_string(),
-                super::ThreadItemRenderSource::Live,
-            );
+            // The completed item has already been rendered in Markdown.
+            // Do not render it again merely because speech is over budget.
             return;
         }
         let delivery_id = NEXT_REALTIME_SPEECH_DELIVERY_ID.fetch_add(1, Ordering::Relaxed);
@@ -1069,6 +1608,7 @@ impl ChatWidget {
                     .push_back(PendingRealtimeSpeech {
                         state: PendingSpeechState::AwaitingTurn,
                         captioned: false,
+                        rendered_in_history: false,
                         input_generation,
                         thread_id,
                         turn_id: turn_id.to_string(),
@@ -1250,7 +1790,8 @@ impl ChatWidget {
         // Do not append old queued speech under a newer question. An answer that
         // never reached speech still needs its text fallback: a delayed user
         // transcript can advance the generation after its delegation starts.
-        if delivery.captioned
+        if delivery.rendered_in_history
+            || delivery.captioned
             || (delivery.state != PendingSpeechState::AwaitingTurn
                 && delivery.input_generation != self.realtime_conversation.input_generation)
             || self.thread_id() != Some(delivery.thread_id)
@@ -1315,6 +1856,16 @@ impl ChatWidget {
     }
 
     pub(super) fn on_realtime_transcript_delta(&mut self, role: String, delta: String) {
+        if role == "user" && !delta.trim().is_empty() {
+            self.note_voice_input_started();
+        }
+        if self.realtime_conversation.dictation {
+            return;
+        }
+        #[cfg(target_os = "macos")]
+        if verbatim_speech::enabled() && role == "assistant" {
+            return;
+        }
         if self.realtime_conversation.phase == RealtimeConversationPhase::Inactive
             && !self.realtime_conversation.recover_late_transcripts
         {
@@ -1324,6 +1875,12 @@ impl ChatWidget {
             self.realtime_conversation.phase,
             RealtimeConversationPhase::Starting | RealtimeConversationPhase::Active
         );
+        // A new spoken request supersedes local narration immediately, even
+        // before the user finishes the utterance.
+        #[cfg(target_os = "macos")]
+        if active && role == "user" && !delta.trim().is_empty() {
+            self.interrupt_current_verbatim_speech();
+        }
         // Duplex transcript chunks can interleave. Display role changes are not input boundaries.
         if active
             && role == "user"
@@ -1458,6 +2015,16 @@ impl ChatWidget {
     }
 
     pub(super) fn on_realtime_transcript_done(&mut self, role: String, mut text: String) {
+        if self.realtime_conversation.dictation {
+            if role == "user" && self.finish_voice_input_segment(&text) {
+                self.submit_completed_voice_input();
+            }
+            return;
+        }
+        #[cfg(target_os = "macos")]
+        if verbatim_speech::enabled() && role == "assistant" {
+            return;
+        }
         if matches!(
             self.realtime_conversation.phase,
             RealtimeConversationPhase::Inactive | RealtimeConversationPhase::Stopping
@@ -1552,6 +2119,11 @@ impl ChatWidget {
             return;
         }
         let has_text = !text.trim().is_empty();
+        // Some providers deliver a completed caption without partial deltas.
+        #[cfg(target_os = "macos")]
+        if role == "user" && has_text {
+            self.interrupt_current_verbatim_speech();
+        }
         if role == "assistant" && has_text {
             // appendSpeech's RPC acknowledgement only means the request was
             // queued. A subsequent assistant caption is the closest signal
@@ -1622,6 +2194,8 @@ impl ChatWidget {
                                 .latest_voice_input_fingerprint
                                 .is_some_and(|latest| Some(latest) == voice_input_fingerprint);
                     if old_superseded_transcript || !has_text {
+                        self.realtime_conversation.voice_segment_pending = false;
+                        self.cancel_pending_voice_submit();
                         return;
                     }
                     self.realtime_conversation.input_generation = self
@@ -1685,9 +2259,14 @@ impl ChatWidget {
             self.bump_active_cell_revision();
             self.flush_realtime_transcript_history();
         }
+        if role == "user" && self.finish_voice_input_segment(&text) {
+            self.submit_completed_voice_input();
+        }
     }
 
     fn finish_realtime_partial_transcripts(&mut self) {
+        // These partials are recovered for display after transport closure.
+        self.cancel_pending_voice_submit();
         if let Some((role, text)) = self.realtime_conversation.interleaved_transcript.take() {
             self.realtime_conversation.interleaved_transcript_cell = None;
             self.on_realtime_transcript_done(role, text);
@@ -1817,7 +2396,7 @@ impl ChatWidget {
                     /*hint*/ None,
                 );
             }
-            self.start_realtime_conversation(thread_id);
+            self.start_realtime_conversation(thread_id, self.realtime_conversation.dictation);
             return;
         }
         if let Some(reason) = reason
@@ -1861,6 +2440,8 @@ impl ChatWidget {
     }
 
     pub(crate) fn reset_realtime_conversation(&mut self) -> Option<ThreadId> {
+        #[cfg(target_os = "macos")]
+        self.cancel_verbatim_speech();
         if self.realtime_conversation_is_running() {
             self.app_event_tx
                 .send(AppEvent::RealtimeConversationStateChanged);
@@ -1870,24 +2451,9 @@ impl ChatWidget {
             != RealtimeConversationPhase::Inactive
             && self.last_terminal_title.is_some();
         self.restore_all_undelivered_realtime_speech();
-        // A delegated item is hidden until the turn completes so it can be spoken.
-        // If voice ends first, let the later turn completion render it normally.
-        if self
-            .transcript
-            .last_completed_agent_message
-            .as_ref()
-            .is_some_and(|completed_item| {
-                matches!(
-                    self.realtime_conversation.agent_items.get(completed_item),
-                    Some(RealtimeAgentItemOrigin::Delegated {
-                        completed: true,
-                        ..
-                    })
-                )
-            })
-        {
-            self.transcript.last_completed_agent_message = None;
-        }
+        // Delegated final answers now enter ordinary Markdown history at item
+        // completion. Keep their completion identity when voice closes: clearing
+        // it would cause TurnCompleted to insert the same answer a second time.
         // The helper may already have exited while app-server still owns the
         // voice session. An acknowledged backend start still needs a stop RPC.
         let backend_thread_id = if (self.realtime_conversation.handle.is_some()
@@ -1957,6 +2523,7 @@ impl ChatWidget {
             .is_some();
         self.realtime_conversation = RealtimeConversationUiState {
             attempt_id: self.realtime_conversation.attempt_id,
+            dictation: self.realtime_conversation.dictation,
             // Keep parked speech tied to its input until it is taken for replay.
             input_generation: self.realtime_conversation.input_generation,
             pending_speech: std::mem::take(&mut self.realtime_conversation.pending_speech),

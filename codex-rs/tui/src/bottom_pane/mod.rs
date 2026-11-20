@@ -1139,6 +1139,23 @@ impl BottomPane {
         self.request_redraw();
     }
 
+    pub(crate) fn append_dictated_text(&mut self, text: &str) {
+        self.composer.flush_pending_paste_burst();
+        let draft = self.composer_text();
+        let cursor = self.composer.current_cursor();
+        self.composer.set_current_cursor(draft.len());
+        if draft.ends_with(|character: char| !character.is_whitespace())
+            || (draft.is_empty() && text.starts_with(['!', '/']))
+        {
+            self.composer.insert_str(" ");
+        }
+        self.composer.insert_str(text);
+        if cursor != draft.len() {
+            self.composer.set_current_cursor(cursor);
+        }
+        self.request_redraw();
+    }
+
     pub(crate) fn pre_draw_tick(&mut self) {
         self.pre_draw_tick_at(Instant::now());
     }

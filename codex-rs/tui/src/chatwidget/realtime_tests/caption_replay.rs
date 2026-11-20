@@ -139,7 +139,7 @@ async fn in_progress_voice_replay_restores_the_late_reasoning_guard() {
 }
 
 #[tokio::test]
-async fn accepted_voice_answer_with_only_an_old_caption_returns_to_history_on_close() {
+async fn accepted_voice_answer_with_only_an_old_caption_does_not_duplicate_on_close() {
     let (mut chat, _sender, mut events, mut ops) = make_chatwidget_manual_with_sender().await;
     let thread_id = activate_voice(&mut chat);
     let turn_id = "accepted-turn";
@@ -183,11 +183,11 @@ async fn accepted_voice_answer_with_only_an_old_caption_returns_to_history_on_cl
             answers += usize::from(rendered.contains("Accepted answer"));
         }
     }
-    assert_eq!(answers, 1);
+    assert_eq!(answers, 0);
 }
 
 #[tokio::test]
-async fn unrelated_caption_started_before_speech_queue_keeps_answer_fallback() {
+async fn unrelated_caption_started_before_speech_queue_does_not_duplicate_answer() {
     let (mut chat, _sender, mut events, mut ops) = make_chatwidget_manual_with_sender().await;
     let thread_id = activate_voice(&mut chat);
     let turn_id = "answer-after-old-caption";
@@ -229,7 +229,7 @@ async fn unrelated_caption_started_before_speech_queue_keeps_answer_fallback() {
         })
         .filter(|text| text.contains("New answer"))
         .count();
-    assert_eq!(restored, 1);
+    assert_eq!(restored, 0);
 }
 
 #[tokio::test]
@@ -279,7 +279,7 @@ async fn done_only_caption_cannot_retire_a_newer_voice_answer() {
         })
         .filter(|text| text.contains("New answer"))
         .count();
-    assert_eq!(restored, 1);
+    assert_eq!(restored, 0);
 }
 
 #[tokio::test]
@@ -310,7 +310,16 @@ async fn captioned_voice_answer_does_not_duplicate_on_close() {
     let AppCommand::RealtimeConversationSpeech { delivery_id, .. } = ops.try_recv().unwrap() else {
         panic!("completed voice turn should queue speech");
     };
-    while events.try_recv().is_ok() {}
+    commit_realtime_history_events(&mut chat, &mut events);
+    let already_visible = std::iter::from_fn(|| events.try_recv().ok())
+        .filter_map(|event| match event {
+            AppEvent::InsertHistoryCell(cell) => Some(cell.display_lines(/*width*/ 80)),
+            _ => None,
+        })
+        .flatten()
+        .filter(|line| line.to_string().contains("Captioned answer"))
+        .count();
+    assert_eq!(already_visible, 1);
     // A delta establishes which input generation owns the completed caption.
     chat.on_realtime_transcript_delta("assistant".into(), "Captioned ".into());
     chat.on_realtime_transcript_done("assistant".into(), "Captioned answer".into());
@@ -328,7 +337,11 @@ async fn captioned_voice_answer_does_not_duplicate_on_close() {
             );
         }
     }
-    insta::assert_snapshot!("captioned_voice_answer_on_close", rendered.join("\n"));
+    assert!(
+        rendered
+            .iter()
+            .all(|line| !line.contains("Captioned answer"))
+    );
 }
 
 #[tokio::test]

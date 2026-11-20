@@ -15,12 +15,13 @@ fn realtime_offer_is_redacted_in_diagnostics_and_preserved_for_signaling() {
         thread_id,
         attempt_id: 1,
         offer_sdp: original_offer.clone().into(),
+        dictation: false,
     };
 
     assert_eq!(
         format!("{command:?}"),
         format!(
-            "RealtimeConversationStart {{ thread_id: {thread_id:?}, attempt_id: 1, offer_sdp: <redacted> }}"
+            "RealtimeConversationStart {{ thread_id: {thread_id:?}, attempt_id: 1, offer_sdp: <redacted>, dictation: false }}"
         )
     );
     assert_eq!(
@@ -29,7 +30,8 @@ fn realtime_offer_is_redacted_in_diagnostics_and_preserved_for_signaling() {
             "RealtimeConversationStart": {
                 "thread_id": thread_id,
                 "attempt_id": 1,
-                "offer_sdp": "<redacted>"
+                "offer_sdp": "<redacted>",
+                "dictation": false
             }
         })
     );

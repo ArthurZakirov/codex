@@ -643,6 +643,9 @@ impl App {
         chat_widget.restore_kill_buffer_snapshot(self.chat_widget.take_kill_buffer_snapshot());
         crate::markdown_render::preferences::init(chat_widget.local_settings.tui.rendering);
         let mut previous = std::mem::replace(&mut self.chat_widget, chat_widget);
+        if previous.realtime_dictation_is_running() {
+            previous.stop_realtime_conversation();
+        }
         if previous.realtime_conversation_is_running() {
             previous.park_voice();
             self.background_voice = Some(Box::new(previous));

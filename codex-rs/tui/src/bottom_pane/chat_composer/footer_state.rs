@@ -138,6 +138,18 @@ impl super::ChatComposer {
                 history_search: self.footer.history_search_key,
                 reasoning_down: self.footer.reasoning_down_key,
                 reasoning_up: self.footer.reasoning_up_key,
+                replay_voice: {
+                    #[cfg(target_os = "macos")]
+                    {
+                        if self.voice_command_enabled && !self.side_conversation_active {
+                            crate::chatwidget::voice_replay_shortcut().map(Into::into)
+                        } else {
+                            None
+                        }
+                    }
+                    #[cfg(not(target_os = "macos"))]
+                    None
+                },
                 toggle_voice: self
                     .footer
                     .toggle_voice_key

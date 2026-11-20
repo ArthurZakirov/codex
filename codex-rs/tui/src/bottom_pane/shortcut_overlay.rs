@@ -160,6 +160,7 @@ fn bindings(props: &FooterProps) -> [(&'static str, Vec<Entry>); 3] {
         Entry::hint(hints.reasoning_down, "Less reasoning"),
         Entry::hint(hints.reasoning_up, "More reasoning"),
         Entry::hint(hints.toggle_voice, "Voice"),
+        Entry::hint(hints.replay_voice, "Replay voice"),
         Entry::hint(hints.agents, "Agents (empty prompt)"),
         Entry::pair(
             "Subagents (empty prompt)",

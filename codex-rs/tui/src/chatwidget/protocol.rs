@@ -369,6 +369,12 @@ impl ChatWidget {
                     self.on_realtime_conversation_started();
                 }
             }
+            ServerNotification::ThreadRealtimeItemAdded(notification) => {
+                if !from_replay && notification.item["type"] == "input_audio_buffer.speech_started"
+                {
+                    self.note_voice_input_started();
+                }
+            }
             ServerNotification::ThreadRealtimeTranscriptDelta(notification) => {
                 if !from_replay {
                     self.on_realtime_transcript_delta(notification.role, notification.delta);
@@ -422,7 +428,6 @@ impl ChatWidget {
             | ServerNotification::ThreadSearchPartial(_)
             | ServerNotification::FuzzyFileSearchSessionUpdated(_)
             | ServerNotification::FuzzyFileSearchSessionCompleted(_)
-            | ServerNotification::ThreadRealtimeItemAdded(_)
             | ServerNotification::ThreadRealtimeItemStarted(_)
             | ServerNotification::ThreadRealtimeItemTranscriptDelta(_)
             | ServerNotification::ThreadRealtimeItemCompleted(_)
@@ -741,6 +746,16 @@ impl ChatWidget {
         match notification.item.payload {
             item @ ThreadItemPayload::CommandExecution { .. } => {
                 self.on_command_execution_completed(item)
+            }
+            item @ ThreadItemPayload::AgentMessage { .. } if replay_kind.is_none() => {
+                // The completed final message is already ready for Markdown display.
+                // Start speech here instead of waiting for the whole agent turn to end.
+                self.handle_thread_item(
+                    item.clone(),
+                    notification.turn_id.clone(),
+                    ThreadItemRenderSource::Live,
+                );
+                self.speak_completed_realtime_delegation(&notification.turn_id, &item);
             }
             item => self.handle_thread_item(
                 item,

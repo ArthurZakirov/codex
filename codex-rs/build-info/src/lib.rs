@@ -11,6 +11,7 @@ use sha2::Digest;
 use sha2::Sha256;
 
 static BUILD_INFO: OnceLock<BuildInfo> = OnceLock::new();
+static VOICE_RELEASE_TAG: OnceLock<&'static str> = OnceLock::new();
 
 /// Initialize build information from the commit stamped into the calling executable.
 ///
@@ -21,6 +22,9 @@ static BUILD_INFO: OnceLock<BuildInfo> = OnceLock::new();
 macro_rules! initialize {
     () => {
         $crate::BuildInfo::initialize(option_env!("STABLE_GIT_COMMIT").unwrap_or("dev"));
+        if let Some(tag) = option_env!("CODEX_VOICE_RELEASE_TAG") {
+            $crate::BuildInfo::initialize_voice_release(tag);
+        }
     };
 }
 
@@ -48,6 +52,19 @@ impl BuildInfo {
     #[doc(hidden)]
     pub fn initialize(build_commit: &'static str) {
         let _ = BUILD_INFO.get_or_init(|| Self::resolve(InstallContext::current(), build_commit));
+    }
+
+    /// Stamp the portable fork identity from the final executable.
+    #[doc(hidden)]
+    pub fn initialize_voice_release(tag: &'static str) {
+        if !tag.is_empty() {
+            let _ = VOICE_RELEASE_TAG.set(tag);
+        }
+    }
+
+    /// Return the portable Voice tag stamped by its build, if present.
+    pub fn voice_release_tag() -> Option<&'static str> {
+        VOICE_RELEASE_TAG.get().copied()
     }
 
     /// Recover structured release information from a persisted version string.

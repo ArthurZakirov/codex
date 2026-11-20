@@ -2,6 +2,11 @@
 # Roughly one arena per four CPUs reduces idle RSS after Linux musl conversations unload.
 JEMALLOC_SYS_WITH_MALLOC_CONF = "narenas_ratio:0.25"
 
+# Codex's patched rusty_v8 publishes its ptrcomp+sandbox binaries under
+# openai/codex, not the default denoland/rusty_v8 release. Keep the release tag
+# derived from the dependency version so future V8 upgrades use matching assets.
+RUSTY_V8_MIRROR = "https://github.com/openai/codex/releases/download/rusty-v8-v{version}/{file}"
+
 # curl-sys enables its NTLM sources but does not set the flag required by libcurl 8.21.
 CFLAGS_aarch64_pc_windows_gnullvm = "-DCURL_ENABLE_NTLM"
 CFLAGS_aarch64_pc_windows_msvc = "-DCURL_ENABLE_NTLM"

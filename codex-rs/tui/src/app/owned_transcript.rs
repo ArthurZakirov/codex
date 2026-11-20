@@ -145,6 +145,31 @@ impl PreparedConversation {
 }
 
 impl App {
+    pub(super) fn replay_last_voice_reply(&mut self) {
+        #[cfg(target_os = "macos")]
+        {
+            let reply = self.transcript_cells.iter().rev().find_map(|cell| {
+                let message = cell
+                    .as_any()
+                    .downcast_ref::<crate::history_cell::AgentMarkdownCell>()?;
+                let markdown = message.markdown_source();
+                (!markdown.trim().is_empty()).then_some(markdown)
+            });
+            let Some(reply) = reply else {
+                self.chat_widget
+                    .add_info_message("No assistant reply to replay.".into(), None);
+                return;
+            };
+            if let Err(error) = self.chat_widget.replay_verbatim_speech(reply) {
+                self.chat_widget
+                    .add_error_message(format!("Unable to replay the last reply: {error}"));
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        self.chat_widget
+            .add_error_message("Voice replay is available on macOS.".into());
+    }
+
     /// Copy draft selections before key shortcuts, or after mouse layout has been refreshed.
     pub(super) fn handle_composer_copy_event(
         &mut self,
@@ -678,6 +703,10 @@ impl App {
         };
         let now = Instant::now();
         let turn_tip = self.turn_tip(transcript_width, now, frames);
+        #[cfg(target_os = "macos")]
+        {
+            self.transcript_view.spoken_line = self.chat_widget.spoken_line_highlight();
+        }
         let view = &mut self.transcript_view;
         view.sync_history_tail(&self.transcript_cells);
         view.prepare_width(transcript_width);
@@ -1100,6 +1129,14 @@ impl App {
         let has_modal = self.chat_widget.has_active_modal();
         let is_vertical_wheel = matches!(event, TuiEvent::Mouse(mouse)
             if matches!(mouse.kind, MouseEventKind::ScrollUp | MouseEventKind::ScrollDown));
+        #[cfg(target_os = "macos")]
+        if has_modal || self.overlay.is_some() || matches!(event, TuiEvent::FocusLost) {
+            self.transcript_view.cancel_voice_pick();
+        } else if matches!(event, TuiEvent::Key(key) if key.code == crossterm::event::KeyCode::Esc && key.kind != KeyEventKind::Release)
+            && self.transcript_view.cancel_voice_pick()
+        {
+            return Ok(true);
+        }
         let modal_transcript_mouse = has_modal
             && matches!(event, TuiEvent::Mouse(_))
             && (self.chat_widget.centered_dialog().is_none() || is_vertical_wheel);
@@ -1200,6 +1237,22 @@ impl App {
                 if handled || is_vertical_wheel {
                     return Ok(true);
                 }
+            }
+            #[cfg(target_os = "macos")]
+            if let Some((markdown, spoken, start, cell_id)) = self
+                .transcript_view
+                .pick_voice_paragraph(*mouse, self.chat_widget.thread_id(), &self.transcript_cells)
+            {
+                self.transcript_view.end_selection(&self.transcript_cells);
+                if let Err(error) = self
+                    .chat_widget
+                    .read_from_paragraph(&markdown, spoken, start, cell_id)
+                {
+                    self.chat_widget
+                        .add_error_message(format!("Unable to read paragraph: {error}"));
+                }
+                tui.frame_requester().schedule_frame();
+                return Ok(true);
             }
             if self.chat_widget.no_modal_or_popup_active()
                 && self
@@ -1512,6 +1565,7 @@ impl App {
     /// Keep the navigation hint and input guard aligned, including pending paste and attachments.
     fn enter_returns_to_latest(&self) -> bool {
         self.chat_widget.composer_is_empty()
+            && !self.chat_widget.voice_has_pending_input()
             && self.chat_widget.no_modal_or_popup_active()
             && !self.backtrack.primed
             && !self.backtrack.overlay_preview_active

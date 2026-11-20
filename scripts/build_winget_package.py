@@ -17,11 +17,13 @@ def prepare_winget_package(package: Path) -> None:
     entrypoint = f"codex-{target}.exe"
     manifest_path = package / "codex-resources/voice/manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    manifest["sha256"][entrypoint] = manifest["sha256"].pop("bin/codex.exe")
-    (package / "bin/codex.exe").rename(package / entrypoint)
-    (package / "bin/codex-code-mode-host.exe").rename(
-        package / "codex-code-mode-host.exe"
-    )
+    relocations = {
+        "bin/codex.exe": entrypoint,
+        "bin/codex-code-mode-host.exe": "codex-code-mode-host.exe",
+    }
+    for source, destination in relocations.items():
+        manifest["sha256"][destination] = manifest["sha256"].pop(source)
+        (package / source).rename(package / destination)
     # Keep resources in place for package-aware discovery and provide the root
     # filenames declared by the existing WinGet portable installer manifest.
     for helper in ("codex-command-runner.exe", "codex-windows-sandbox-setup.exe"):

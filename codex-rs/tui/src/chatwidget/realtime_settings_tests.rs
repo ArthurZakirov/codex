@@ -9,6 +9,50 @@ use crossterm::event::KeyModifiers;
 use pretty_assertions::assert_eq;
 
 #[tokio::test]
+async fn bare_voice_command_opens_discoverable_controls() {
+    let (mut chat, _sender, mut events, mut ops) = make_chatwidget_manual_with_sender().await;
+    let thread_id = codex_protocol::ThreadId::new();
+    chat.thread_id = Some(thread_id);
+    chat.handle_slash_command_dispatch(SlashCommand::Voice);
+    let popup = render_bottom_popup(&chat, /*width*/ 100);
+    assert!(popup.contains("Start Voice"));
+    assert!(popup.contains("Open Voice configuration in VS Code"));
+    if cfg!(target_os = "macos") {
+        assert!(popup.contains("Replay last reply"));
+        chat.bottom_pane.handle_key_event(KeyCode::Down.into());
+        chat.bottom_pane.handle_key_event(KeyCode::Enter.into());
+        assert!(std::iter::from_fn(|| events.try_recv().ok()).any(|event| {
+            matches!(event, AppEvent::ReplayLastVoiceReply { thread_id: target } if target == thread_id)
+        }));
+    }
+    assert!(ops.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn voice_config_requests_opening_the_editor() {
+    let (mut chat, _sender, mut events, mut ops) = make_chatwidget_manual_with_sender().await;
+    chat.dispatch_command_with_args(SlashCommand::Voice, "config".into(), Vec::new());
+    assert!(
+        std::iter::from_fn(|| events.try_recv().ok())
+            .any(|event| matches!(event, AppEvent::OpenVoiceConfig))
+    );
+    assert!(ops.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn voice_replay_targets_the_current_chat() {
+    let (mut chat, _sender, mut events, mut ops) = make_chatwidget_manual_with_sender().await;
+    let thread_id = codex_protocol::ThreadId::new();
+    chat.thread_id = Some(thread_id);
+    chat.dispatch_command_with_args(SlashCommand::Voice, "replay".into(), Vec::new());
+
+    assert!(std::iter::from_fn(|| events.try_recv().ok()).any(|event| {
+        matches!(event, AppEvent::ReplayLastVoiceReply { thread_id: target } if target == thread_id)
+    }));
+    assert!(ops.try_recv().is_err());
+}
+
+#[tokio::test]
 async fn voice_settings_selects_a_voice_without_starting_audio() {
     let (mut chat, _sender, mut events, mut ops) = make_chatwidget_manual_with_sender().await;
     chat.config.realtime.voice = Some(RealtimeVoice::Maple);

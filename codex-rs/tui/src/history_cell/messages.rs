@@ -611,6 +611,10 @@ impl AgentMarkdownCell {
             .with_copy_source(Some(source))
     }
 
+    pub(crate) fn markdown_source(&self) -> &str {
+        &self.markdown_source
+    }
+
     pub(crate) fn with_copy_source(mut self, source: Option<String>) -> Self {
         self.copy_source = source;
         self

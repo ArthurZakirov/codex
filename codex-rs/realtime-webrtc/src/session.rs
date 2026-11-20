@@ -98,6 +98,15 @@ impl RealtimeWebrtcSession {
         abort: AbortRegistration,
         selection: AudioDeviceSelection,
     ) -> Result<StartedRealtimeWebrtcSession> {
+        Self::start_with_audio_lease(abort, selection, None)
+    }
+
+    /// Keep the optional lease until the native audio process has exited.
+    pub fn start_with_audio_lease(
+        abort: AbortRegistration,
+        selection: AudioDeviceSelection,
+        lease: Option<Arc<std::fs::File>>,
+    ) -> Result<StartedRealtimeWebrtcSession> {
         let package = codex_install_context::InstallContext::current()
             .package_layout
             .clone()
@@ -141,7 +150,7 @@ impl RealtimeWebrtcSession {
                 let task = async {
                     let host = report_failure(
                         ConnectionError::HelperStartup,
-                        VoiceHost::connect(&package, &build_commit).await,
+                        VoiceHost::connect_with_audio_lease(&package, &build_commit, lease).await,
                     )?;
                     let host = report_failure(
                         ConnectionError::RuntimeInitialization,

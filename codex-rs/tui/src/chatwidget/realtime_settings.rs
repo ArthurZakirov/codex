@@ -31,6 +31,85 @@ impl ChatWidget {
         }
     }
 
+    pub(super) fn open_voice_menu(&mut self) {
+        let thread_id = self.thread_id();
+        let mut items = vec![
+            SelectionItem {
+                name: if self.realtime_conversation_is_running() {
+                    "Stop Voice".into()
+                } else {
+                    "Start Voice".into()
+                },
+                actions: vec![Box::new(move |tx| {
+                    tx.send(AppEvent::VoiceControl {
+                        thread_id,
+                        control: crate::app_event::VoiceControl::Toggle,
+                    })
+                })],
+                dismiss_on_select: true,
+                ..Default::default()
+            },
+            SelectionItem {
+                name: "Open Voice configuration in VS Code".into(),
+                actions: vec![Box::new(|tx| tx.send(AppEvent::OpenVoiceConfig))],
+                dismiss_on_select: true,
+                ..Default::default()
+            },
+            SelectionItem {
+                name: "Choose voice and audio devices".into(),
+                actions: vec![Box::new(|tx| tx.send(AppEvent::OpenRealtimeSettings))],
+                dismiss_on_select: true,
+                ..Default::default()
+            },
+        ];
+        #[cfg(target_os = "macos")]
+        if let Some(thread_id) = thread_id {
+            items.push(SelectionItem {
+                name: "Read from clicked paragraph".into(),
+                actions: vec![Box::new(move |tx| {
+                    tx.send(AppEvent::PickVoiceParagraph { thread_id })
+                })],
+                dismiss_on_select: true,
+                ..Default::default()
+            });
+            let name = crate::chatwidget::voice_replay_shortcut().map_or_else(
+                || "Replay last reply".into(),
+                |shortcut| format!("Replay last reply ({})", shortcut.display_label()),
+            );
+            items.insert(
+                1,
+                SelectionItem {
+                    name,
+                    actions: vec![Box::new(move |tx| {
+                        tx.send(AppEvent::ReplayLastVoiceReply { thread_id })
+                    })],
+                    dismiss_on_select: true,
+                    ..Default::default()
+                },
+            );
+        }
+        if self.realtime_conversation_is_running() {
+            items.push(SelectionItem {
+                name: "Mute or unmute microphone".into(),
+                actions: vec![Box::new(move |tx| {
+                    tx.send(AppEvent::VoiceControl {
+                        thread_id,
+                        control: crate::app_event::VoiceControl::Mute,
+                    })
+                })],
+                dismiss_on_select: true,
+                ..Default::default()
+            });
+        }
+
+        self.bottom_pane.show_selection_view(SelectionViewParams {
+            title: Some("Voice".into()),
+            items,
+            footer_hint: Some(standard_popup_hint_line()),
+            ..SelectionViewParams::picker()
+        });
+    }
+
     pub(crate) fn open_realtime_settings(&mut self) {
         self.bottom_pane.show_selection_view(SelectionViewParams {
             title: Some("Voice settings".to_string()),

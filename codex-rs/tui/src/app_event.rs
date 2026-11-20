@@ -1416,6 +1416,9 @@ pub(crate) enum AppEvent {
     RealtimeSessionLockStopped {
         thread_id: ThreadId,
     },
+    AutoStartDictation {
+        thread_id: ThreadId,
+    },
     BackgroundVoiceError {
         thread_id: ThreadId,
         message: String,
@@ -1563,6 +1566,14 @@ pub(crate) enum AppEvent {
 
     /// Read the owning server preference before showing the voice picker.
     OpenRealtimeSettings,
+    OpenVoiceConfig,
+    #[cfg(target_os = "macos")]
+    PickVoiceParagraph {
+        thread_id: ThreadId,
+    },
+    ReplayLastVoiceReply {
+        thread_id: ThreadId,
+    },
     OpenRealtimeSoundDevices,
     OpenRealtimeVoices,
     OpenRealtimeDevicePicker {

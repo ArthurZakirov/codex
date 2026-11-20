@@ -9,6 +9,7 @@ use crossterm::event::MouseButton;
 use crossterm::event::MouseEvent;
 use crossterm::event::MouseEventKind;
 use pretty_assertions::assert_eq;
+use ratatui::style::Modifier;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
@@ -1333,7 +1334,6 @@ fn spoken_prompt_selection_keeps_its_fallback_contrast() {
     use crate::history_cell::new_spoken_user_prompt;
     use crate::terminal_palette::rgb_color;
     use ratatui::style::Color;
-    use ratatui::style::Modifier;
 
     crate::terminal_palette::with_test_default_colors(
         /*colors*/ None::<crate::terminal_probe::DefaultColors>,
@@ -1738,4 +1738,288 @@ fn live_search_group_keeps_its_summary_in_the_parked_pane() {
           Searching for TODO in src
           Searching for FIXME in src
     ");
+}
+
+#[test]
+fn spoken_position_maps_wrapped_markdown_and_code() {
+    use super::spoken_word_display_offset;
+    use crate::history_cell::AgentMarkdownCell;
+    let markdown = "**Hallo**, die erste Zeile umbricht wegen des schmalen Fensters.\n\n```bash\ngit status\n```\n\nNoch eine zweite Zeile.";
+    let spoken = "Hallo, die erste Zeile umbricht wegen des schmalen Fensters.\ngit status\nNoch eine zweite Zeile.";
+    let cell = AgentMarkdownCell::new(markdown.to_owned(), std::path::Path::new("/tmp"));
+    let layout = TextLayout::new(cell.display_hyperlink_lines(26), 26);
+    for term in ["erste", "Fensters", "git", "status", "zweite"] {
+        let start = spoken.find(term).unwrap();
+        let utf16_offset = spoken[..start].encode_utf16().count();
+        let rendered_offset = spoken_word_display_offset(spoken, layout.text(), utf16_offset)
+            .unwrap_or_else(|| panic!("mapping failed for {term}: {:?}", layout.text()));
+        assert!(layout.text()[rendered_offset..].starts_with(term));
+    }
+    let first = spoken.find("erste").unwrap();
+    let last = spoken.find("zweite").unwrap();
+    let first_row = layout.row_for_offset(
+        spoken_word_display_offset(
+            spoken,
+            layout.text(),
+            spoken[..first].encode_utf16().count(),
+        )
+        .unwrap(),
+    );
+    let last_row = layout.row_for_offset(
+        spoken_word_display_offset(spoken, layout.text(), spoken[..last].encode_utf16().count())
+            .unwrap(),
+    );
+    assert!(last_row > first_row);
+}
+
+#[test]
+fn spoken_word_emphasis_preserves_text_and_scroll() {
+    use super::SpokenLine;
+    use crate::history_cell::AgentMarkdownCell;
+    let markdown = "**Hallo** welt. Noch ein längerer Satz. Zeile zwei.".to_string();
+    let spoken = "Hallo welt. Noch ein längerer Satz. Zeile zwei.".to_string();
+    let cells: Vec<Arc<dyn HistoryCell>> = vec![
+        cell("An earlier message"),
+        Arc::new(AgentMarkdownCell::new(
+            markdown.clone(),
+            std::path::Path::new("/tmp"),
+        )),
+        cell("A later message"),
+    ];
+    let mut view = TranscriptView::default();
+    let before = render(&mut view, &cells, 40, 12);
+    let previous_position = view.position;
+    let offset = spoken.find("Zeile").unwrap();
+    view.spoken_line = Some(SpokenLine {
+        cell_id: None,
+        replay: false,
+        markdown: Arc::from(markdown),
+        spoken: Arc::from(spoken.as_str()),
+        utf16_start: spoken[..offset].encode_utf16().count(),
+        utf16_len: "Zeile".encode_utf16().count(),
+    });
+    let after = render(&mut view, &cells, 40, 12);
+    assert_eq!(view.position, previous_position);
+    let mut backgrounds = 0;
+    for y in before.area.top()..before.area.bottom() {
+        for x in before.area.left()..before.area.right() {
+            assert_eq!(before[(x, y)].symbol(), after[(x, y)].symbol());
+            if after[(x, y)].modifier.contains(Modifier::UNDERLINED) {
+                backgrounds += 1;
+            }
+        }
+    }
+    assert_eq!(
+        backgrounds,
+        "Zeile".len(),
+        "only the spoken word is painted"
+    );
+    // A malformed callback length must fall back to the existing whole-line
+    // highlight instead of highlighting an arbitrary neighboring word.
+    view.spoken_line.as_mut().unwrap().utf16_len = 1;
+    let fallback = render(&mut view, &cells, 40, 12);
+    let fallback_cells = (fallback.area.top()..fallback.area.bottom())
+        .flat_map(|y| (fallback.area.left()..fallback.area.right()).map(move |x| (x, y)))
+        .filter(|&(x, y)| fallback[(x, y)] != before[(x, y)])
+        .count();
+    assert!(
+        fallback_cells > backgrounds,
+        "uncertain words fall back to a line"
+    );
+    view.spoken_line = None;
+    let cleared = render(&mut view, &cells, 40, 12);
+    assert_eq!(before, cleared);
+}
+
+#[test]
+fn spoken_replay_highlights_the_newest_matching_reply() {
+    use super::SpokenLine;
+    use crate::history_cell::AgentMarkdownCell;
+
+    let markdown = "Hello again.";
+    let cells: Vec<Arc<dyn HistoryCell>> = vec![
+        Arc::new(AgentMarkdownCell::new(
+            markdown.into(),
+            std::path::Path::new("/tmp"),
+        )),
+        Arc::new(AgentMarkdownCell::new(
+            markdown.into(),
+            std::path::Path::new("/tmp"),
+        )),
+    ];
+    let mut view = TranscriptView::default();
+    let plain = render(&mut view, &cells, 40, 12);
+    view.spoken_line = Some(SpokenLine {
+        cell_id: None,
+        markdown: Arc::from(markdown),
+        replay: true,
+        spoken: Arc::from(markdown),
+        utf16_start: 0,
+        utf16_len: 5,
+    });
+    let highlighted = render(&mut view, &cells, 40, 12);
+    let message_rows: Vec<_> = (plain.area.top()..plain.area.bottom())
+        .filter(|&y| {
+            let line: String = (plain.area.left()..plain.area.right())
+                .map(|x| plain[(x, y)].symbol())
+                .collect();
+            line.contains(markdown)
+        })
+        .collect();
+    assert_eq!(message_rows.len(), 2);
+    let highlighted_rows: Vec<_> = (plain.area.top()..plain.area.bottom())
+        .filter(|&y| {
+            (plain.area.left()..plain.area.right())
+                .any(|x| highlighted[(x, y)].bg != plain[(x, y)].bg)
+        })
+        .collect();
+    assert_eq!(highlighted_rows, vec![message_rows[1]]);
+}
+
+#[test]
+fn spoken_word_matches_unicode_and_rejects_invalid_utf16_spans() {
+    use super::spoken_word_display_offset;
+    use super::spoken_word_display_range;
+    use super::utf16_byte_offset;
+
+    let spoken = "Hallo 👨‍💻 Übergröße und Ende.";
+    let offset = spoken.find("Übergröße").unwrap();
+    let utf16_start = spoken[..offset].encode_utf16().count();
+    let display_start = spoken_word_display_offset(spoken, spoken, utf16_start).unwrap();
+    assert_eq!(
+        spoken_word_display_range(
+            spoken,
+            spoken,
+            utf16_start,
+            "Übergröße".encode_utf16().count(),
+            display_start,
+        ),
+        Some(offset..offset + "Übergröße".len())
+    );
+    assert_eq!(
+        spoken_word_display_range(spoken, spoken, utf16_start, 1, display_start),
+        None,
+    );
+    // A UTF-16 boundary inside the emoji surrogate pair is not a Rust char boundary.
+    let emoji_start = spoken[..spoken.find('👨').unwrap()].encode_utf16().count();
+    assert_eq!(utf16_byte_offset(spoken, emoji_start + 1), None);
+}
+
+#[test]
+fn spoken_word_background_handles_wrapped_multibyte_text() {
+    use super::spoken_word_display_range;
+    let spoken = "Vorher Überraschungslänge Nachher";
+    let layout = TextLayout::new(vec![spoken.into()], 12);
+    let start = spoken.find("Überraschungslänge").unwrap();
+    let utf16_start = spoken[..start].encode_utf16().count();
+    let range = spoken_word_display_range(
+        spoken,
+        layout.text(),
+        utf16_start,
+        "Überraschungslänge".encode_utf16().count(),
+        start,
+    )
+    .unwrap();
+    let height = u16::try_from(layout.row_count()).unwrap();
+    let mut buf = Buffer::empty(Rect::new(0, 0, 12, height));
+    let mut colored_rows = 0;
+    for row in 0..layout.row_count() {
+        let area = Rect::new(0, row as u16, 12, 1);
+        layout.render(area, &mut buf, row);
+        layout.paint_spoken_word(range.clone(), area, &mut buf, row);
+        if (0..12).any(|x| buf[(x, row as u16)].modifier.contains(Modifier::UNDERLINED)) {
+            colored_rows += 1;
+        }
+    }
+    assert!(colored_rows >= 2, "long spoken word must span wrapped rows");
+}
+
+#[test]
+fn spoken_highlight_resumes_after_link_destinations_and_hidden_words() {
+    use super::spoken_word_display_offset;
+    let spoken = "Weg zum Ziel. Verdeckter Inhalt. Danach endet der Text.";
+    let display = "Weg (https://example.org/langer/pfad/zum/lesen/unterwegs) zum Ziel. Danach endet der Text.";
+    for word in ["zum", "Ziel", "Danach", "endet", "Text"] {
+        let pos = spoken[..spoken.find(word).unwrap()].encode_utf16().count();
+        assert_eq!(
+            spoken_word_display_offset(spoken, display, pos),
+            display.rfind(word)
+        );
+    }
+    assert_eq!(spoken_word_display_offset(spoken, display, 14), None);
+}
+
+#[test]
+fn spoken_highlight_does_not_jump_to_an_unrelated_later_occurrence() {
+    use super::spoken_word_display_offset;
+    assert_eq!(
+        spoken_word_display_offset(
+            "Start hidden token end",
+            "Start one two three four later token elsewhere",
+            13
+        ),
+        None,
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn paragraph_pick_reads_the_clicked_reply_repeatedly_and_ignores_drag() {
+    let markdown = "First paragraph.\n\nSecond paragraph.";
+    let cells: Vec<Arc<dyn HistoryCell>> = (0..2)
+        .map(|_| {
+            Arc::new(AgentMarkdownCell::new(
+                markdown.into(),
+                std::path::Path::new("/"),
+            )) as Arc<dyn HistoryCell>
+        })
+        .collect();
+    let thread = codex_protocol::ThreadId::new();
+    let mut view = TranscriptView::default();
+    let buf = render(&mut view, &cells, 50, 20);
+    let (row, column) = text(&buf)
+        .lines()
+        .enumerate()
+        .find_map(|(y, line)| line.find("Second").map(|x| (y as u16, x as u16)))
+        .unwrap();
+    let event = |kind| MouseEvent {
+        kind,
+        column,
+        row,
+        modifiers: KeyModifiers::NONE,
+    };
+    let down = event(MouseEventKind::Down(MouseButton::Left));
+    let up = event(MouseEventKind::Up(MouseButton::Left));
+    view.arm_voice_pick(thread);
+    for mouse in [
+        down,
+        event(MouseEventKind::Drag(MouseButton::Left)),
+        up,
+        down,
+    ] {
+        assert!(
+            view.pick_voice_paragraph(mouse, Some(thread), &cells)
+                .is_none()
+        );
+    }
+    let (_, spoken, start, id) = view.pick_voice_paragraph(up, Some(thread), &cells).unwrap();
+    assert_eq!(&spoken[start..], "Second paragraph.");
+    assert_eq!(EntryKey::Cell(id), EntryKey::cell(&cells[0]));
+    assert!(
+        view.pick_voice_paragraph(down, Some(thread), &cells)
+            .is_none()
+    );
+    assert!(
+        view.pick_voice_paragraph(up, Some(thread), &cells)
+            .is_some()
+    );
+    assert!(view.cancel_voice_pick());
+    assert!(
+        view.pick_voice_paragraph(down, Some(thread), &cells)
+            .is_none()
+    );
+    assert!(
+        view.pick_voice_paragraph(up, Some(thread), &cells)
+            .is_none()
+    );
 }

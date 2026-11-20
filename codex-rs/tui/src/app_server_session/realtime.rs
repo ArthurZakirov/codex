@@ -23,6 +23,34 @@ impl AppServerSession {
         call_id: String,
         voice_session_id: Uuid,
     ) -> Result<()> {
+        self.start_voice_transport(
+            thread_id,
+            ThreadRealtimeStartTransport::ExistingCall { call_id },
+            Some(voice_session_id),
+        )
+        .await
+    }
+
+    pub(crate) async fn start_realtime_dictation(
+        &mut self,
+        thread_id: ThreadId,
+        offer_sdp: String,
+    ) -> Result<()> {
+        self.start_voice_transport(
+            thread_id,
+            ThreadRealtimeStartTransport::Webrtc { sdp: offer_sdp },
+            None,
+        )
+        .await
+    }
+
+    async fn start_voice_transport(
+        &mut self,
+        thread_id: ThreadId,
+        transport: ThreadRealtimeStartTransport,
+        voice_session_id: Option<Uuid>,
+    ) -> Result<()> {
+        let dictation = voice_session_id.is_none();
         let request_id = self.next_request_id();
         let _: ThreadRealtimeStartResponse = self
             .request_handle
@@ -39,19 +67,24 @@ impl AppServerSession {
                     backend_reasoning_status: false,
                     codex_response_handoff_channel_prefixes: None,
                     model: None,
-                    output_modality: RealtimeOutputModality::Audio,
+                    output_modality: if dictation {
+                        RealtimeOutputModality::Text
+                    } else {
+                        RealtimeOutputModality::Audio
+                    },
                     include_startup_context: Some(false),
                     initial_items: None,
                     realtime_start_instructions: None,
                     realtime_end_instructions: None,
                     prompt: None,
-                    realtime_session_id: Some(thread_id.to_string()),
-                    voice_session_id: Some(voice_session_id.to_string()),
-                    transport: Some(ThreadRealtimeStartTransport::ExistingCall {
-                        // The TUI owns the peer connection and has already negotiated this call.
-                        call_id,
+                    realtime_session_id: (!dictation).then(|| thread_id.to_string()),
+                    voice_session_id: voice_session_id.map(|id| id.to_string()),
+                    transport: Some(transport),
+                    version: Some(if dictation {
+                        RealtimeConversationVersion::V2
+                    } else {
+                        RealtimeConversationVersion::V3
                     }),
-                    version: Some(RealtimeConversationVersion::V3),
                     voice: None,
                 },
             })

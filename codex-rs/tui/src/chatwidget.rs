@@ -362,6 +362,10 @@ mod reset_credits;
 pub(crate) use self::rate_limits::limit_label_for_window;
 mod completion;
 mod realtime;
+#[cfg(target_os = "macos")]
+pub(crate) use realtime::voice_replay_shortcut;
+#[cfg(target_os = "macos")]
+pub(crate) use realtime::{markdown_to_spoken_text, reading_controls};
 mod realtime_settings;
 mod realtime_split_flap;
 pub(crate) use realtime::MAX_REPLAY_TRANSCRIPT_CELLS;
@@ -648,6 +652,14 @@ pub(crate) struct ChatWidget {
     turn_lifecycle: TurnLifecycleState,
     safety_recourse: Option<safety_recourse::PendingRecourse>,
     realtime_conversation: RealtimeConversationUiState,
+    #[cfg(target_os = "macos")]
+    voice_focus_start: Option<(ThreadId, std::time::Instant)>,
+    #[cfg(target_os = "macos")]
+    voice_focus_allows_playback: bool,
+    #[cfg(target_os = "macos")]
+    voice_focus_background: bool,
+    #[cfg(target_os = "macos")]
+    voice_handoff_request: Option<std::fs::File>,
     realtime_conversation_available_for_thread: bool,
     safety_buffering: SafetyBufferingState,
     task_complete_pending: bool,

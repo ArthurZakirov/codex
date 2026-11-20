@@ -3,6 +3,55 @@
 use super::*;
 use pretty_assertions::assert_eq;
 
+#[cfg(target_os = "macos")]
+fn seed_pending_local_narration(chat: &mut ChatWidget) {
+    let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+    chat.realtime_conversation.verbatim_speech_sender = Some(sender);
+    chat.realtime_conversation.verbatim_speech_task =
+        Some(tokio::spawn(std::future::pending::<()>()));
+}
+
+#[cfg(target_os = "macos")]
+fn assert_local_narration_cancelled(chat: &ChatWidget) {
+    assert!(chat.realtime_conversation.verbatim_speech_sender.is_none());
+    assert!(chat.realtime_conversation.verbatim_speech_task.is_none());
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn new_voice_partial_cancels_queued_local_narration() {
+    let (mut chat, _sender, _events, _ops) = make_chatwidget_manual_with_sender().await;
+    activate_voice(&mut chat);
+    seed_pending_local_narration(&mut chat);
+
+    chat.on_realtime_transcript_delta("user".into(), "Actually".into());
+
+    assert_local_narration_cancelled(&chat);
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn completed_voice_caption_without_partial_cancels_local_narration() {
+    let (mut chat, _sender, _events, _ops) = make_chatwidget_manual_with_sender().await;
+    activate_voice(&mut chat);
+    seed_pending_local_narration(&mut chat);
+
+    chat.on_realtime_transcript_done("user".into(), "Change my question".into());
+
+    assert_local_narration_cancelled(&chat);
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn new_typed_input_cancels_local_narration_without_active_microphone() {
+    let (mut chat, _sender, _events, _ops) = make_chatwidget_manual_with_sender().await;
+    seed_pending_local_narration(&mut chat);
+
+    chat.note_realtime_typed_input("New question");
+
+    assert_local_narration_cancelled(&chat);
+}
+
 fn seed_interleaved_partials(chat: &mut ChatWidget) {
     chat.on_realtime_transcript_delta("assistant".into(), "First ".into());
     chat.on_realtime_transcript_delta("user".into(), "Correction".into());
@@ -421,7 +470,7 @@ async fn direct_reset_preserves_both_partial_speakers_for_replay() {
 
 #[tokio::test]
 async fn stopping_voice_preserves_the_live_transcript_once() {
-    for command in ["/voice", "/voice stop"] {
+    for subcommand in ["toggle", "stop"] {
         let (mut chat, _sender, mut events, _ops) = make_chatwidget_manual_with_sender().await;
         chat.local_settings.tui.animations = true;
         activate_voice(&mut chat);
@@ -430,15 +479,11 @@ async fn stopping_voice_preserves_the_live_transcript_once() {
         chat.on_realtime_transcript_delta("assistant".to_string(), "Answer in ".to_string());
         chat.on_realtime_transcript_delta("assistant".to_string(), "progress".to_string());
 
-        if command == "/voice" {
-            chat.handle_slash_command_dispatch(crate::slash_command::SlashCommand::Voice);
-        } else {
-            chat.handle_slash_command_with_args_dispatch(
-                crate::slash_command::SlashCommand::Voice,
-                "stop".to_string(),
-                Vec::new(),
-            );
-        }
+        chat.handle_slash_command_with_args_dispatch(
+            crate::slash_command::SlashCommand::Voice,
+            subcommand.to_string(),
+            Vec::new(),
+        );
         chat.on_realtime_transcript_done("assistant".to_string(), "Answer in progress".to_string());
         chat.on_realtime_conversation_closed(/*reason*/ None);
         chat.stop_realtime_conversation();
@@ -813,6 +858,7 @@ async fn new_voice_turn_interrupts_uncaptioned_queued_speech() {
             .push_back(PendingRealtimeSpeech {
                 state,
                 captioned,
+                rendered_in_history: false,
                 input_generation: 0,
                 thread_id,
                 turn_id: "old-turn".into(),

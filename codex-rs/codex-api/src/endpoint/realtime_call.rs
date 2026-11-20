@@ -1,6 +1,7 @@
 use crate::auth::SharedAuthProvider;
 use crate::endpoint::realtime_websocket::RealtimeEventParser;
 use crate::endpoint::realtime_websocket::RealtimeSessionConfig;
+use crate::endpoint::realtime_websocket::RealtimeSessionMode;
 use crate::endpoint::realtime_websocket::session_update_session_json;
 use crate::endpoint::session::EndpointSession;
 use crate::error::ApiError;
@@ -143,10 +144,14 @@ impl<T: HttpTransport> RealtimeCallClient<T> {
             session_config.voice.get_or_insert(RealtimeVoice::Cove);
         }
         let event_parser = session_config.event_parser;
+        let transcription = session_config.session_mode == RealtimeSessionMode::Transcription;
         let path = self.path_for_session(event_parser);
         let mut session = realtime_session_json(session_config)?;
         if let Some(session) = session.as_object_mut() {
             session.remove("id");
+            if transcription {
+                session.remove("model");
+            }
         }
         // TODO(aibrahim): Align the SIWC route with the API multipart shape and remove this branch.
         if self.uses_backend_request_shape() {
@@ -229,7 +234,9 @@ fn configure_realtime_call_request(
 }
 
 fn validate_avas_session_config(session_config: &RealtimeSessionConfig) -> Result<(), ApiError> {
-    if session_config.event_parser == RealtimeEventParser::RealtimeV2 {
+    if session_config.event_parser == RealtimeEventParser::RealtimeV2
+        && session_config.session_mode != RealtimeSessionMode::Transcription
+    {
         return Err(ApiError::InvalidRequest {
             message: "AVAS realtime calls require realtime v1 or v3".to_string(),
         });
@@ -654,6 +661,36 @@ mod tests {
             "invalid request: AVAS realtime calls require realtime v1 or v3"
         );
         assert!(transport.last_request.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn sends_transcription_call_without_conversation_output() {
+        let transport = CapturingTransport::new();
+        let client = RealtimeCallClient::new(
+            transport.clone(),
+            provider("https://chatgpt.com/backend-api/codex"),
+            Arc::new(DummyAuth),
+        );
+        let mut config = realtime_v2_session_config("sess-dictation");
+        config.session_mode = RealtimeSessionMode::Transcription;
+        client
+            .create_with_session("v=offer\r\n".to_string(), config)
+            .await
+            .expect("transcription call should be accepted by the client");
+
+        let request = transport.last_request.lock().unwrap().clone().unwrap();
+        let Some(RequestBody::Json(body)) = request.body else {
+            panic!("expected JSON request");
+        };
+        let session = &body["session"];
+        assert_eq!(session["type"], "transcription");
+        assert!(session.get("model").is_none());
+        assert!(session.get("tools").is_none());
+        assert!(session["audio"].get("output").is_none());
+        assert_eq!(
+            session["audio"]["input"]["turn_detection"],
+            serde_json::json!({"type": "server_vad", "silence_duration_ms": 500})
+        );
     }
 
     #[tokio::test]

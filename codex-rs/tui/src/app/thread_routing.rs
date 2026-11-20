@@ -908,6 +908,7 @@ impl App {
                 thread_id: realtime_thread_id,
                 attempt_id,
                 offer_sdp,
+                dictation,
             } => {
                 let attempt_id = *attempt_id;
                 if *realtime_thread_id != thread_id
@@ -915,6 +916,15 @@ impl App {
                         .chat_widget
                         .is_starting_realtime_attempt(thread_id, attempt_id)
                 {
+                    return Ok(true);
+                }
+                if *dictation {
+                    app_server
+                        .start_realtime_dictation(
+                            *realtime_thread_id,
+                            String::from(offer_sdp.clone()),
+                        )
+                        .await?;
                     return Ok(true);
                 }
                 let registration = self.chat_widget.begin_call_negotiation();
@@ -967,6 +977,20 @@ impl App {
                 {
                     self.chat_widget
                         .restore_undelivered_realtime_speech(*delivery_id);
+                    return Ok(true);
+                }
+                #[cfg(target_os = "macos")]
+                if self.chat_widget.realtime_verbatim_speech_enabled() {
+                    match self.chat_widget.play_verbatim_speech(text.as_str()) {
+                        Ok(()) => self.chat_widget.accept_realtime_speech(*delivery_id),
+                        Err(error) => {
+                            self.chat_widget
+                                .restore_undelivered_realtime_speech(*delivery_id);
+                            self.chat_widget.add_error_message(format!(
+                                "Unable to read this answer aloud using macOS speech: {error}"
+                            ));
+                        }
+                    }
                     return Ok(true);
                 }
                 app_server

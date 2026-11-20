@@ -5,6 +5,128 @@ use super::*;
 use crate::app_event::RealtimeWebrtcStartupFailure;
 use pretty_assertions::assert_eq;
 
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn dictation_focus_modes_release_or_keep_the_owning_session() {
+    use super::super::focus::Mode;
+    use crate::tui::TuiEvent;
+
+    let (mut chat, _, _, _) = make_chatwidget_manual_with_sender().await;
+    let thread = activate_voice(&mut chat);
+    chat.realtime_conversation.dictation = true;
+
+    chat.handle_voice_focus_mode(&TuiEvent::FocusLost, true, Mode::Manual);
+    assert!(chat.realtime_dictation_is_running());
+    assert!(chat.voice_focus_start.is_none());
+
+    chat.handle_voice_focus_mode(&TuiEvent::FocusLost, true, Mode::FollowFocus);
+    assert!(chat.realtime_dictation_is_running());
+    assert!(chat.voice_focus_start.is_none());
+
+    chat.handle_voice_focus_mode(&TuiEvent::FocusGained, true, Mode::FollowFocus);
+    assert_eq!(
+        chat.voice_focus_start.map(|(thread, _)| thread),
+        Some(thread)
+    );
+    chat.handle_voice_focus_mode(&TuiEvent::FocusLost, true, Mode::FollowFocus);
+    assert!(chat.voice_focus_start.is_none());
+    chat.handle_voice_focus_mode(&TuiEvent::FocusLost, true, Mode::StopOnBlur);
+    assert!(!chat.realtime_dictation_is_running());
+}
+
+#[tokio::test]
+async fn enter_sends_a_finished_voice_call_caption_as_a_user_turn() {
+    let (mut chat, _sender, _events, mut ops) = make_chatwidget_manual_with_sender().await;
+    activate_voice(&mut chat);
+    chat.on_realtime_transcript_done("user".into(), "Send this voice message".into());
+    assert!(chat.bottom_pane.composer_text().is_empty());
+    assert!(ops.try_recv().is_err());
+
+    chat.handle_key_event(crossterm::event::KeyCode::Enter.into());
+    assert!(matches!(
+        ops.try_recv(),
+        Ok(AppCommand::UserTurn { items, .. })
+            if items.iter().any(|item| matches!(item, UserInput::Text { text, .. } if text == "Send this voice message"))
+    ));
+
+    chat.handle_key_event(crossterm::event::KeyCode::Enter.into());
+    assert!(ops.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn enter_waits_for_an_in_flight_dictation_segment() {
+    let (mut chat, _sender, _events, mut ops) = make_chatwidget_manual_with_sender().await;
+    activate_voice(&mut chat);
+    chat.realtime_conversation.dictation = true;
+    chat.on_realtime_transcript_done("user".into(), "First part".into());
+    chat.note_voice_input_started();
+    chat.handle_key_event(crossterm::event::KeyCode::Enter.into());
+    assert!(ops.try_recv().is_err());
+    chat.on_realtime_transcript_done("user".into(), "second part".into());
+    assert!(matches!(
+        ops.try_recv(),
+        Ok(AppCommand::UserTurn { items, .. })
+            if items.iter().any(|item| matches!(item, UserInput::Text { text, .. } if text == "First part second part"))
+    ));
+}
+
+#[tokio::test]
+async fn forced_submit_does_not_leave_the_next_draft_waiting_for_voice() {
+    let (mut chat, _sender, _events, mut ops) = make_chatwidget_manual_with_sender().await;
+    activate_voice(&mut chat);
+    chat.realtime_conversation.dictation = true;
+    chat.on_realtime_transcript_done("user".into(), "First draft".into());
+    chat.note_voice_input_started();
+    chat.handle_key_event(crossterm::event::KeyCode::Enter.into());
+    assert!(ops.try_recv().is_err());
+
+    chat.handle_key_event(crossterm::event::KeyCode::Enter.into());
+    assert!(matches!(ops.try_recv(), Ok(AppCommand::UserTurn { .. })));
+    assert!(!chat.voice_has_pending_input());
+}
+
+#[tokio::test]
+async fn voice_disconnect_does_not_submit_a_recovered_partial() {
+    let (mut chat, _sender, _events, mut ops) = make_chatwidget_manual_with_sender().await;
+    activate_voice(&mut chat);
+    chat.on_realtime_transcript_delta("user".into(), "A partial sentence".into());
+    chat.handle_key_event(crossterm::event::KeyCode::Enter.into());
+    assert!(ops.try_recv().is_err());
+
+    chat.on_realtime_conversation_closed(Some("transport_closed".into()));
+    assert!(
+        std::iter::from_fn(|| ops.try_recv().ok())
+            .all(|operation| !matches!(operation, AppCommand::UserTurn { .. }))
+    );
+}
+
+#[tokio::test]
+async fn dictation_only_appends_completed_user_segments_to_the_draft() {
+    let (mut chat, _sender, _events, mut ops) = make_chatwidget_manual_with_sender().await;
+    chat.realtime_conversation.dictation = true;
+    chat.realtime_conversation.phase = RealtimeConversationPhase::Active;
+    chat.bottom_pane.insert_str("Bitte");
+
+    chat.on_realtime_transcript_delta("user".into(), "prüfe".into());
+    chat.on_realtime_transcript_done("assistant".into(), "ignored".into());
+    assert_eq!(chat.bottom_pane.composer_text(), "Bitte");
+
+    chat.on_realtime_transcript_done("user".into(), "prüfe das".into());
+    chat.on_realtime_transcript_done("user".into(), "and report back".into());
+    assert_eq!(
+        chat.bottom_pane.composer_text(),
+        "Bitte prüfe das and report back"
+    );
+    assert!(ops.try_recv().is_err());
+
+    chat.realtime_conversation.phase = RealtimeConversationPhase::Stopping;
+    chat.on_realtime_transcript_done("user".into(), "late".into());
+    assert_eq!(
+        chat.bottom_pane.composer_text(),
+        "Bitte prüfe das and report back"
+    );
+}
+
 #[tokio::test]
 async fn voice_cannot_start_in_a_side_conversation() {
     let (mut chat, _sender, mut events, mut ops) = make_chatwidget_manual_with_sender().await;

@@ -213,6 +213,7 @@ async fn check_remote_voice_start(
             thread_id,
             attempt_id: 1,
             offer_sdp: String::from("v=0\r\n").into(),
+            dictation: false,
         }),
     ))
     .await?;
@@ -1989,6 +1990,7 @@ async fn remote_voice_config_read_failure_does_not_start_with_local_voice() -> R
             thread_id,
             attempt_id: 1,
             offer_sdp: String::from("v=0\r\n").into(),
+            dictation: false,
         },
     )
     .await?;
@@ -2071,6 +2073,7 @@ async fn embedded_voice_settings_follow_project_after_thread_switch() -> Result<
                 thread_id,
                 attempt_id: 1,
                 offer_sdp: String::from("v=0\r\n").into(),
+                dictation: false,
             },
         )
         .await?;

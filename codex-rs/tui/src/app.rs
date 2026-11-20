@@ -892,6 +892,9 @@ impl App {
         app_server: &mut AppServerSession,
         event: TuiEvent,
     ) -> Result<AppRunControl> {
+        #[cfg(target_os = "macos")]
+        self.chat_widget
+            .handle_voice_focus_event(&event, self.overlay.is_none());
         match &event {
             TuiEvent::Draw
             | TuiEvent::Mouse(crossterm::event::MouseEvent {
@@ -1219,6 +1222,59 @@ impl App {
             return Ok(AppRunControl::Continue);
         }
         self.cancel_primed_browsing_for_event(&event);
+        // Space pauses/resumes only the currently playing macOS narration.
+        // Do not displace normal typing, transcript selection, dialogs or key
+        // repeats, and leave the microphone/agent work running independently.
+        // Playback controls work in normal terminals and --no-alt-screen mode.
+        #[cfg(target_os = "macos")]
+        if let TuiEvent::Key(key) = &event
+            && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+            && key.code == KeyCode::Char(' ')
+            && key.modifiers == KeyModifiers::NONE
+            && self.overlay.is_none()
+            && !self.transcript_view.owns_interaction_key(*key)
+            && !self.backtrack.primed
+            && !self.backtrack.overlay_preview_active
+            && self.chat_widget.no_modal_or_popup_active()
+            && self.chat_widget.composer_is_empty()
+        {
+            if key.kind == KeyEventKind::Repeat {
+                if self.chat_widget.realtime_verbatim_speech_active() {
+                    return Ok(AppRunControl::Continue);
+                }
+            } else if let Some(paused) = self.chat_widget.toggle_verbatim_speech_pause() {
+                let status = if paused {
+                    "Speech paused. Press Space to resume."
+                } else {
+                    "Speech resumed. Press Space to pause."
+                };
+                self.chat_widget.add_info_message(status.to_string(), None);
+                return Ok(AppRunControl::Continue);
+            }
+        }
+        #[cfg(target_os = "macos")]
+        if let TuiEvent::Key(key) = &event
+            && key.kind == KeyEventKind::Press
+            && self.overlay.is_none()
+            && self.chat_widget.voice_replay_shortcut_available()
+            && self.chat_widget.no_modal_or_popup_active()
+            && !self.transcript_view.owns_interaction_key(*key)
+            && crate::chatwidget::voice_replay_shortcut()
+                .is_some_and(|binding| binding.is_press(*key))
+        {
+            self.replay_last_voice_reply();
+            return Ok(AppRunControl::Continue);
+        }
+        #[cfg(target_os = "macos")]
+        if let TuiEvent::Key(key) = &event
+            && key.kind == KeyEventKind::Press
+            && self.overlay.is_none()
+            && self.chat_widget.no_modal_or_popup_active()
+            && !self.transcript_view.owns_interaction_key(*key)
+            && self.chat_widget.handle_reading_key(*key)
+        {
+            return Ok(AppRunControl::Continue);
+        }
         let voice_toggle = |app: &Self, key: KeyEvent| {
             key.kind == KeyEventKind::Press
                 && app
