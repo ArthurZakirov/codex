@@ -157,6 +157,9 @@ pub(crate) enum StatusLineItem {
     /// Current workspace notification headline.
     WorkspaceHeadline,
 
+    /// Output of configured command-backed status providers.
+    CustomCommands,
+
     /// Latest checklist task progress from `update_plan` (if available).
     TaskProgress,
 
@@ -228,6 +231,9 @@ impl StatusLineItem {
             StatusLineItem::WorkspaceHeadline => {
                 "Workspace notification headline (Enterprise workspaces only; omitted when unavailable)"
             }
+            StatusLineItem::CustomCommands => {
+                "Outputs from configured external status-line commands"
+            }
             StatusLineItem::TaskProgress => {
                 "Latest task progress from update_plan (omitted until available)"
             }
@@ -268,6 +274,7 @@ impl StatusLineItem {
             StatusLineItem::ThreadName => StatusSurfacePreviewItem::ThreadName,
             StatusLineItem::ThreadTitle => StatusSurfacePreviewItem::ThreadTitle,
             StatusLineItem::WorkspaceHeadline => StatusSurfacePreviewItem::WorkspaceHeadline,
+            StatusLineItem::CustomCommands => StatusSurfacePreviewItem::CustomCommands,
             StatusLineItem::TaskProgress => StatusSurfacePreviewItem::TaskProgress,
         }
     }

@@ -5493,6 +5493,14 @@
           },
           "type": "array"
         },
+        "status_line_commands": {
+          "default": [],
+          "description": "Commands shown as one selectable `custom-commands` status-line item. Each program writes a single short text line to stdout. Codex supplies CODEX_THREAD_ID for the displayed conversation.",
+          "items": {
+            "$ref": "#/definitions/TuiStatusLineCommand"
+          },
+          "type": "array"
+        },
         "status_line_use_colors": {
           "default": true,
           "description": "Color status line items with colors derived from the active syntax theme. Defaults to `true`.",
@@ -6656,6 +6664,32 @@
           "type": "boolean"
         }
       },
+      "type": "object"
+    },
+    "TuiStatusLineCommand": {
+      "additionalProperties": false,
+      "description": "A program that supplies one custom TUI status-line segment.",
+      "properties": {
+        "args": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "command": {
+          "description": "Executable path or name resolved through PATH; no shell is involved.",
+          "type": "string"
+        },
+        "label": {
+          "description": "Display label if the program fails or produces no output.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "command",
+        "label"
+      ],
       "type": "object"
     },
     "TuiVimNormalKeymap": {

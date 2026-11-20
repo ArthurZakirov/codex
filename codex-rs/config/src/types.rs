@@ -868,6 +868,18 @@ impl QuickDial {
     }
 }
 
+/// A program that supplies one custom TUI status-line segment.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct TuiStatusLineCommand {
+    /// Display label if the program fails or produces no output.
+    pub label: String,
+    /// Executable path or name resolved through PATH; no shell is involved.
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+}
+
 /// Collection of settings that are specific to the TUI.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default, JsonSchema)]
 #[schemars(deny_unknown_fields)]
@@ -975,6 +987,12 @@ pub struct Tui {
     /// Defaults to `true`.
     #[serde(default = "default_true")]
     pub status_line_use_colors: bool,
+
+    /// Commands shown as one selectable `custom-commands` status-line item.
+    /// Each program writes a single short text line to stdout. Codex supplies
+    /// CODEX_THREAD_ID for the displayed conversation.
+    #[serde(default)]
+    pub status_line_commands: Vec<TuiStatusLineCommand>,
 
     /// Ordered list of terminal title item identifiers.
     ///
