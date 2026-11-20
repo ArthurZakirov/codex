@@ -142,6 +142,8 @@ fn speech_should_stop(
 }
 
 pub(super) struct SpeechQueueItem {
+    start: usize,
+    cell_id: Option<usize>,
     markdown: String,
     spoken: String,
     replay: bool,
@@ -210,8 +212,9 @@ async fn speak_with_word_positions(
         .ok_or_else(|| std::io::Error::other("speech helper stdout unavailable"))?;
     let mut words = BufReader::new(stdout).lines();
     let markdown_source: Arc<str> = Arc::from(item.markdown.as_str());
+    let utf16_base = item.spoken[..item.start].encode_utf16().count();
     let spoken_source: Arc<str> = Arc::from(item.spoken.as_str());
-    let payload = base64::engine::general_purpose::STANDARD.encode(item.spoken.as_bytes());
+    let payload = base64::engine::general_purpose::STANDARD.encode(&item.spoken.as_bytes()[item.start..]);
     // The native helper (used for highlighting) must honor the same per-utterance
     // configuration as the in-process synthesizer fallback.
     let rate = configured_speech_rate_multiplier();
@@ -249,7 +252,8 @@ async fn speak_with_word_positions(
                                 markdown: Arc::clone(&markdown_source),
                                 replay: item.replay,
                                 spoken: Arc::clone(&spoken_source),
-                                utf16_start,
+                                cell_id: item.cell_id,
+                                utf16_start: utf16_base + utf16_start,
                                 utf16_len,
                             });
                         frames.schedule_frame();
@@ -420,7 +424,7 @@ fn configured_speech_rate_multiplier() -> f32 {
 
 /// Convert Markdown presentation into the same ordered words for the speech engine.
 /// The original Markdown remains unchanged in the chat history.
-fn markdown_to_spoken_text(markdown: &str) -> String {
+pub(crate) fn markdown_to_spoken_text(markdown: &str) -> String {
     let mut spoken = String::new();
     for event in Parser::new(spoken_markdown_without_checkout_footers(markdown)) {
         match event {
@@ -752,15 +756,34 @@ impl ChatWidget {
     /// Queue local playback rather than cancelling the preceding assistant
     /// message. The worker exits when voice mode is explicitly stopped.
     pub(crate) fn play_verbatim_speech(&mut self, markdown: &str) -> std::io::Result<()> {
-        self.queue_verbatim_speech(markdown, /*replay*/ false)
+        self.queue_verbatim_speech(markdown, markdown_to_spoken_text(markdown), false, 0, None)
     }
 
     pub(crate) fn replay_verbatim_speech(&mut self, markdown: &str) -> std::io::Result<()> {
-        self.queue_verbatim_speech(markdown, /*replay*/ true)
+        self.queue_verbatim_speech(markdown, markdown_to_spoken_text(markdown), true, 0, None)
     }
 
-    fn queue_verbatim_speech(&mut self, markdown: &str, replay: bool) -> std::io::Result<()> {
-        let spoken = markdown_to_spoken_text(markdown);
+    pub(crate) fn read_from_paragraph(
+        &mut self,
+        markdown: &str,
+        spoken: String,
+        start: usize,
+        cell_id: usize,
+    ) -> std::io::Result<()> {
+        self.cancel_verbatim_speech();
+        // A cancelled worker's final cleanup must not erase the new highlight.
+        self.realtime_conversation.spoken_line_progress = Default::default();
+        self.queue_verbatim_speech(markdown, spoken, true, start, Some(cell_id))
+    }
+
+    fn queue_verbatim_speech(
+        &mut self,
+        markdown: &str,
+        spoken: String,
+        replay: bool,
+        start: usize,
+        cell_id: Option<usize>,
+    ) -> std::io::Result<()> {
         if spoken.is_empty() {
             return Ok(());
         }
@@ -768,6 +791,8 @@ impl ChatWidget {
             && sender
                 .send(SpeechQueueItem {
                     markdown: markdown.to_owned(),
+                    start,
+                    cell_id,
                     spoken: spoken.clone(),
                     replay,
                 })
@@ -779,6 +804,8 @@ impl ChatWidget {
         sender
             .send(SpeechQueueItem {
                 markdown: markdown.to_owned(),
+                start,
+                cell_id,
                 spoken,
                 replay,
             })
@@ -835,7 +862,7 @@ impl ChatWidget {
                     } else {
                         // Preserve old voice behavior for a plain development build.
                         speak_spoken_text(
-                            item.spoken,
+                            item.spoken[item.start..].to_owned(),
                             pause_rx,
                             active,
                             cancelled,

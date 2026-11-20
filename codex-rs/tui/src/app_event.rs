@@ -1326,6 +1326,10 @@ pub(crate) enum AppEvent {
     /// Read the owning server preference before showing the voice picker.
     OpenRealtimeSettings,
     OpenVoiceConfig,
+    #[cfg(target_os = "macos")]
+    PickVoiceParagraph {
+        thread_id: ThreadId,
+    },
     ReplayLastVoiceReply {
         thread_id: ThreadId,
     },

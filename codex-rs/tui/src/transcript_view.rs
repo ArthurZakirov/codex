@@ -86,6 +86,7 @@ enum Position {
 /// A word-position report tied to one exact completed assistant message.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SpokenLine {
+    pub(crate) cell_id: Option<usize>,
     pub(crate) markdown: Arc<str>,
     pub(crate) replay: bool,
     pub(crate) spoken: Arc<str>,
@@ -226,6 +227,8 @@ pub(crate) struct TranscriptView {
     mode: HistoryRenderMode,
     pub(crate) history: TranscriptHistoryState,
     highlight: Option<usize>,
+    #[cfg(target_os = "macos")]
+    voice_pick: Option<(codex_protocol::ThreadId, Option<(u16, u16)>)>,
     pub(crate) spoken_line: Option<SpokenLine>,
     saved_position: Option<Position>,
     unseen_activity: bool,
@@ -267,6 +270,8 @@ impl Default for TranscriptView {
             mode: HistoryRenderMode::Rich,
             history: TranscriptHistoryState::Idle,
             highlight: None,
+            #[cfg(target_os = "macos")]
+            voice_pick: None,
             spoken_line: None,
             saved_position: None,
             unseen_activity: false,
@@ -275,6 +280,87 @@ impl Default for TranscriptView {
             last_click: None,
             disclosure: disclosure::Disclosure::default(),
         }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl TranscriptView {
+    pub(crate) fn arm_voice_pick(&mut self, thread: codex_protocol::ThreadId) {
+        self.voice_pick = Some((thread, None));
+    }
+
+    pub(crate) fn cancel_voice_pick(&mut self) -> bool {
+        self.voice_pick.take().is_some()
+    }
+
+    pub(crate) fn pick_voice_paragraph(
+        &mut self,
+        mouse: crossterm::event::MouseEvent,
+        thread: Option<codex_protocol::ThreadId>,
+        cells: &[Arc<dyn HistoryCell>],
+    ) -> Option<(String, String, usize, usize)> {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let (owner, pressed) = self.voice_pick.as_mut()?;
+        if Some(*owner) != thread {
+            self.voice_pick = None;
+            return None;
+        }
+        let point = (mouse.column, mouse.row);
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) if mouse.modifiers.is_empty() => {
+                *pressed = Some(point);
+                return None;
+            }
+            MouseEventKind::Up(MouseButton::Left)
+                if pressed.take() == Some(point) && mouse.modifiers.is_empty() => {}
+            MouseEventKind::Drag(_) | MouseEventKind::Down(_) => {
+                *pressed = None;
+                return None;
+            }
+            _ => return None,
+        }
+        if !self.area.contains(point.into()) {
+            return None;
+        }
+        let row = self.visible.get(usize::from(mouse.row - self.area.y))?;
+        let cell = cells.get(row.index)?;
+        let EntryKey::Cell(id) = row.key else {
+            return None;
+        };
+        if EntryKey::cell(cell) != row.key {
+            return None;
+        }
+        let markdown = cell
+            .as_any()
+            .downcast_ref::<AgentMarkdownCell>()?
+            .markdown_source();
+        let offset = row.layout.position_at(row.row, mouse.column - self.area.x);
+        if offset == row.layout.position_at(row.row, u16::MAX) {
+            return None;
+        }
+        let spoken = crate::chatwidget::markdown_to_spoken_text(markdown);
+        let mut start = 0;
+        for paragraph in spoken.split_inclusive('\n') {
+            let mut words = paragraph.unicode_word_indices();
+            if let Some(first) = words.next() {
+                let last = words.last().unwrap_or(first);
+                let locate = |i: usize| {
+                    spoken_word_display_offset(
+                        &spoken,
+                        row.layout.text(),
+                        spoken[..start + i].encode_utf16().count(),
+                    )
+                };
+                if let (Some(begin), Some(end)) = (locate(first.0), locate(last.0))
+                    && (begin..end + last.1.len()).contains(&offset)
+                {
+                    self.voice_pick = None;
+                    return Some((markdown.to_owned(), spoken, start, id));
+                }
+            }
+            start += paragraph.len();
+        }
+        None
     }
 }
 
@@ -372,7 +458,9 @@ impl TranscriptView {
                         .filter(|message| message.markdown_source() == progress.markdown.as_ref())
                         .map(|_| index)
                 });
-                let target = if progress.replay {
+                let target = if let Some(id) = progress.cell_id {
+                    matches.find(|&i| EntryKey::cell(&cells[i]) == EntryKey::Cell(id))?
+                } else if progress.replay {
                     // Replay was explicitly requested for the newest reply.
                     matches.next_back()?
                 } else {

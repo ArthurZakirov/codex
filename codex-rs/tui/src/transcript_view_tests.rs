@@ -1413,6 +1413,7 @@ fn spoken_line_background_preserves_foreground_and_scroll() {
     let previous_position = view.position;
     let offset = spoken.find("Zeile").unwrap();
     view.spoken_line = Some(SpokenLine {
+        cell_id: None,
         replay: false,
         markdown: Arc::from(markdown),
         spoken: Arc::from(spoken.as_str()),
@@ -1474,6 +1475,7 @@ fn spoken_replay_highlights_the_newest_matching_reply() {
     let mut view = TranscriptView::default();
     let plain = render(&mut view, &cells, 40, 12);
     view.spoken_line = Some(SpokenLine {
+        cell_id: None,
         markdown: Arc::from(markdown),
         replay: true,
         spoken: Arc::from(markdown),
@@ -1583,4 +1585,50 @@ fn spoken_highlight_does_not_jump_to_an_unrelated_later_occurrence() {
         ),
         None,
     );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn paragraph_pick_reads_the_clicked_reply_only_once_and_ignores_drag() {
+    let markdown = "First paragraph.\n\nSecond paragraph.";
+    let cells: Vec<Arc<dyn HistoryCell>> = (0..2)
+        .map(|_| {
+            Arc::new(AgentMarkdownCell::new(
+                markdown.into(),
+                std::path::Path::new("/"),
+            )) as Arc<dyn HistoryCell>
+        })
+        .collect();
+    let thread = codex_protocol::ThreadId::new();
+    let mut view = TranscriptView::default();
+    let buf = render(&mut view, &cells, 50, 20);
+    let (row, column) = text(&buf)
+        .lines()
+        .enumerate()
+        .find_map(|(y, line)| line.find("Second").map(|x| (y as u16, x as u16)))
+        .unwrap();
+    let event = |kind| MouseEvent {
+        kind,
+        column,
+        row,
+        modifiers: KeyModifiers::NONE,
+    };
+    let down = event(MouseEventKind::Down(MouseButton::Left));
+    let up = event(MouseEventKind::Up(MouseButton::Left));
+    view.arm_voice_pick(thread);
+    for mouse in [
+        down,
+        event(MouseEventKind::Drag(MouseButton::Left)),
+        up,
+        down,
+    ] {
+        assert!(
+            view.pick_voice_paragraph(mouse, Some(thread), &cells)
+                .is_none()
+        );
+    }
+    let (_, spoken, start, id) = view.pick_voice_paragraph(up, Some(thread), &cells).unwrap();
+    assert_eq!(&spoken[start..], "Second paragraph.");
+    assert_eq!(EntryKey::Cell(id), EntryKey::cell(&cells[0]));
+    assert!(!view.cancel_voice_pick());
 }

@@ -848,6 +848,13 @@ impl ChatWidget {
             SlashCommand::Voice => match trimmed.to_ascii_lowercase().as_str() {
                 "settings" => self.app_event_tx.send(AppEvent::OpenRealtimeSettings),
                 "config" => self.app_event_tx.send(AppEvent::OpenVoiceConfig),
+                #[cfg(target_os = "macos")]
+                "read-from" => {
+                    if let Some(thread_id) = self.thread_id() {
+                        self.app_event_tx
+                            .send(AppEvent::PickVoiceParagraph { thread_id });
+                    }
+                }
                 "replay" => {
                     if let Some(thread_id) = self.thread_id() {
                         self.app_event_tx

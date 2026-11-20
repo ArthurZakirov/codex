@@ -13,7 +13,7 @@ mod transcript_replay;
 #[cfg(target_os = "macos")]
 mod verbatim_speech;
 #[cfg(target_os = "macos")]
-pub(crate) use verbatim_speech::reading_controls;
+pub(crate) use verbatim_speech::{markdown_to_spoken_text, reading_controls};
 
 pub(crate) use failure_metrics::RealtimeFailureCause;
 
