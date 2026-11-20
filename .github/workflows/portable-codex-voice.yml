@@ -111,7 +111,7 @@ jobs:
         run: |
           set -euo pipefail
           # Use the repository's own native build and receipt-verification pipeline.
-          python3 .github/scripts/run_bazel_with_buildbuddy.py build --config=release \
+          python3 .github/scripts/run_bazel.py build --config=release \
             --macos_minimum_os=14.0 \
             //codex-rs/voice-host:codex-voice-host //third_party/voice:native_runtime
           source="bazel-bin/third_party/voice/native_runtime_${PREFIX}"
