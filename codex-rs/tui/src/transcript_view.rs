@@ -145,7 +145,7 @@ fn spoken_word_display_offset(spoken: &str, display: &str, utf16_start: usize) -
                     .min(visible.len() - j - 1))
                     .take_while(|d| matches_word(target_word + d, j + d))
                     .count();
-                let score = 1 + before + after;
+                let score = before + after;
                 if score > best_score {
                     best_score = score;
                     offset = Some(visible[j].0);

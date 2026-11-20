@@ -1571,3 +1571,16 @@ fn spoken_highlight_resumes_after_link_destinations_and_hidden_words() {
     }
     assert_eq!(spoken_word_display_offset(spoken, display, 14), None);
 }
+
+#[test]
+fn spoken_highlight_does_not_jump_to_an_unrelated_later_occurrence() {
+    use super::spoken_word_display_offset;
+    assert_eq!(
+        spoken_word_display_offset(
+            "Start hidden token end",
+            "Start one two three four later token elsewhere",
+            13
+        ),
+        None,
+    );
+}
