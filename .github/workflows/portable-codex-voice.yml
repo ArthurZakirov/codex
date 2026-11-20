@@ -2,7 +2,7 @@ name: Build paragraph click test artifact
 
 on:
   push:
-    branches: [test/voice-click-read]
+    branches: [test/voice-click-read-macos15]
 
 permissions:
   contents: read
@@ -25,7 +25,7 @@ jobs:
       matrix:
         include:
           - target: aarch64-apple-darwin
-            runner: macos-26
+            runner: macos-15
             native_prefix: macos_aarch64
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
