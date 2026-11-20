@@ -1395,7 +1395,7 @@ fn spoken_position_maps_wrapped_markdown_and_code() {
 }
 
 #[test]
-fn spoken_line_background_preserves_foreground_and_scroll() {
+fn spoken_word_emphasis_preserves_text_and_scroll() {
     use super::SpokenLine;
     use crate::history_cell::AgentMarkdownCell;
     let markdown = "**Hallo** welt. Noch ein längerer Satz. Zeile zwei.".to_string();
@@ -1425,8 +1425,7 @@ fn spoken_line_background_preserves_foreground_and_scroll() {
     for y in before.area.top()..before.area.bottom() {
         for x in before.area.left()..before.area.right() {
             assert_eq!(before[(x, y)].symbol(), after[(x, y)].symbol());
-            assert_eq!(before[(x, y)].fg, after[(x, y)].fg);
-            if after[(x, y)].bg == ratatui::style::Color::DarkGray {
+            if after[(x, y)].modifier.contains(Modifier::UNDERLINED) {
                 backgrounds += 1;
             }
         }
@@ -1442,9 +1441,7 @@ fn spoken_line_background_preserves_foreground_and_scroll() {
     let fallback = render(&mut view, &cells, 40, 12);
     let fallback_cells = (fallback.area.top()..fallback.area.bottom())
         .flat_map(|y| (fallback.area.left()..fallback.area.right()).map(move |x| (x, y)))
-        .filter(|&(x, y)| {
-            fallback[(x, y)].bg == Color::DarkGray && before[(x, y)].bg != Color::DarkGray
-        })
+        .filter(|&(x, y)| fallback[(x, y)] != before[(x, y)])
         .count();
     assert!(
         fallback_cells > backgrounds,
@@ -1550,7 +1547,7 @@ fn spoken_word_background_handles_wrapped_multibyte_text() {
         let area = Rect::new(0, row as u16, 12, 1);
         layout.render(area, &mut buf, row);
         layout.paint_spoken_word(range.clone(), area, &mut buf, row);
-        if (0..12).any(|x| buf[(x, row as u16)].bg == Color::DarkGray) {
+        if (0..12).any(|x| buf[(x, row as u16)].modifier.contains(Modifier::UNDERLINED)) {
             colored_rows += 1;
         }
     }
