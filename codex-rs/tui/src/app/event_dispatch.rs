@@ -2251,6 +2251,12 @@ impl App {
                     self.control_voice(control);
                 }
             }
+            #[cfg(target_os = "macos")]
+            AppEvent::SubmitDictation { thread_id, attempt_id } => {
+                if self.overlay.is_none() && self.chat_widget.thread_id() == Some(thread_id) {
+                    self.chat_widget.submit_global_dictation(attempt_id);
+                }
+            }
             AppEvent::RealtimeWebrtcOfferCreated {
                 thread_id,
                 attempt_id,

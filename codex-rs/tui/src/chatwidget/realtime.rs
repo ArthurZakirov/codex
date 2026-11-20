@@ -144,8 +144,55 @@ enum StartupRetry {
     Used,
 }
 
+#[cfg(target_os = "macos")]
+struct GlobalSubmit(tokio::task::JoinHandle<()>);
+
+#[cfg(target_os = "macos")]
+impl Drop for GlobalSubmit {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl GlobalSubmit {
+    // The caller holds the exclusive audio lease, including while replacing a stale socket.
+    fn listen(
+        sender: crate::app_event_sender::AppEventSender,
+        thread_id: ThreadId,
+        attempt_id: u64,
+    ) -> std::io::Result<Self> {
+        use std::io;
+        use std::os::unix::fs::PermissionsExt;
+
+        let home =
+            dirs::home_dir().ok_or_else(|| io::Error::other("Home directory unavailable"))?;
+        let path = home.join(".codex/voice-submit.sock");
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err),
+        }
+        let socket = tokio::net::UnixDatagram::bind(&path)?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        Ok(Self(tokio::spawn(async move {
+            let mut message = [0; 16];
+            while let Ok(len) = socket.recv(&mut message).await {
+                if &message[..len] == b"submit" {
+                    sender.send(AppEvent::SubmitDictation {
+                        thread_id,
+                        attempt_id,
+                    });
+                }
+            }
+        })))
+    }
+}
+
 #[derive(Default)]
 pub(super) struct RealtimeConversationUiState {
+    #[cfg(target_os = "macos")]
+    global_submit: Option<GlobalSubmit>,
     startup_retry: StartupRetry,
     pub(super) phase: RealtimeConversationPhase,
     recover_late_transcripts: bool,
@@ -345,6 +392,10 @@ fn prepare_voice_config(
     };
     let existing_keys = settings.len();
     for (name, default) in [
+        (
+            "global_submit_shortcut",
+            serde_json::json!("alt-shift-return"),
+        ),
         ("paragraph_navigation", serde_json::json!(false)),
         ("previous_paragraph_shortcut", serde_json::json!("shift-up")),
         ("next_paragraph_shortcut", serde_json::json!("shift-down")),
@@ -541,6 +592,20 @@ impl ChatWidget {
         std::mem::take(&mut state.submit_voice_when_ready)
     }
 
+    #[cfg(target_os = "macos")]
+    pub(crate) fn submit_global_dictation(&mut self, attempt_id: u64) {
+        let state = &self.realtime_conversation;
+        if state.attempt_id == attempt_id
+            && state.dictation
+            && state.phase == RealtimeConversationPhase::Active
+            && !self.blocks_direct_input
+            && !self.side_conversation_active()
+            && (self.voice_has_pending_input() || !self.bottom_pane.composer_text().is_empty())
+        {
+            self.submit_completed_voice_input();
+        }
+    }
+
     fn submit_completed_voice_input(&mut self) {
         if self.bottom_pane.no_modal_or_popup_active() && !self.shortcut_overlay_visible() {
             self.handle_key_event_with_activation_key(
@@ -669,6 +734,15 @@ impl ChatWidget {
             NEXT_REALTIME_ATTEMPT_ID.fetch_add(1, Ordering::Relaxed);
         self.realtime_conversation.thread_id = Some(thread_id);
         let attempt_id = self.realtime_conversation.attempt_id;
+        #[cfg(target_os = "macos")]
+        if dictation && lease.is_some() {
+            match GlobalSubmit::listen(self.app_event_tx.clone(), thread_id, attempt_id) {
+                Ok(listener) => self.realtime_conversation.global_submit = Some(listener),
+                Err(err) => {
+                    self.add_error_message(format!("Global dictation shortcut unavailable: {err}"))
+                }
+            }
+        }
         let (startup_abort, abort_registration) = AbortHandle::new_pair();
         self.realtime_conversation.startup_abort = Some(startup_abort);
         self.realtime_conversation.phase = RealtimeConversationPhase::Starting;

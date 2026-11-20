@@ -1265,6 +1265,12 @@ pub(crate) enum AppEvent {
         action: AstraModelPickerAction,
     },
 
+    #[cfg(target_os = "macos")]
+    SubmitDictation {
+        thread_id: ThreadId,
+        attempt_id: u64,
+    },
+
     /// Result of creating a TUI-owned WebRTC offer for an active thread.
     RealtimeWebrtcOfferCreated {
         thread_id: ThreadId,
