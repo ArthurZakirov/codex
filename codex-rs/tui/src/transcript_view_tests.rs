@@ -9,6 +9,7 @@ use crossterm::event::MouseButton;
 use crossterm::event::MouseEvent;
 use crossterm::event::MouseEventKind;
 use pretty_assertions::assert_eq;
+use ratatui::style::Modifier;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
@@ -1315,7 +1316,6 @@ fn user_prompt_has_a_background_without_a_terminal_palette() {
 fn spoken_prompt_selection_keeps_its_fallback_contrast() {
     use crate::history_cell::new_spoken_user_prompt;
     use ratatui::style::Color;
-    use ratatui::style::Modifier;
 
     crate::terminal_palette::with_test_default_colors(
         /*colors*/ None::<crate::terminal_probe::DefaultColors>,
