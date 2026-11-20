@@ -214,7 +214,7 @@ async fn speak_with_word_positions(
     let markdown_source: Arc<str> = Arc::from(item.markdown.as_str());
     let utf16_base = item.spoken[..item.start].encode_utf16().count();
     let spoken_source: Arc<str> = Arc::from(item.spoken.as_str());
-    let payload = base64::engine::general_purpose::STANDARD.encode(&item.spoken.as_bytes()[item.start..]);
+    let payload = base64::engine::general_purpose::STANDARD.encode(item.spoken.as_bytes());
     // The native helper (used for highlighting) must honor the same per-utterance
     // configuration as the in-process synthesizer fallback.
     let rate = configured_speech_rate_multiplier();
@@ -222,7 +222,7 @@ async fn speak_with_word_positions(
     let mut muted = MUTED.load(Ordering::Acquire);
     if muted { stdin.write_all(b"MUTE\n").await?; }
     stdin
-        .write_all(format!("SPEAK\t{payload}\t{voice}\t{rate}\n").as_bytes())
+        .write_all(format!("SPEAK\t{payload}\t{voice}\t{rate}\t{utf16_base}\n").as_bytes())
         .await?;
     stdin.flush().await?;
     active.store(true, Ordering::Release);
@@ -253,7 +253,7 @@ async fn speak_with_word_positions(
                                 replay: item.replay,
                                 spoken: Arc::clone(&spoken_source),
                                 cell_id: item.cell_id,
-                                utf16_start: utf16_base + utf16_start,
+                                utf16_start,
                                 utf16_len,
                             });
                         frames.schedule_frame();

@@ -1,5 +1,5 @@
 // Word-position-aware macOS speech worker. All AppKit calls stay on the process main thread.
-// stdin: SPEAK<TAB>base64(UTF-8)<TAB>voice-id<TAB>rate-multiplier, PAUSE, RESUME, STOP
+// stdin: SPEAK<TAB>base64(UTF-8)<TAB>voice-id<TAB>rate-multiplier[<TAB>UTF-16 paragraph start], PAUSE, RESUME, STOP
 // stdout: WORD<TAB>utf16-start<TAB>utf16-length, DONE, ERROR<TAB>reason
 import AppKit
 import Foundation
@@ -15,17 +15,13 @@ private final class SpeechService: NSObject, NSSpeechSynthesizerDelegate {
     private var starts = [0]
     private var base = 0
     private var current = 0
-    private var lastBack: TimeInterval?
     private var muted = false
 
     private func seek(back: Bool) {
         guard started else { return }
         let index = starts.lastIndex(where: { $0 <= current }) ?? 0
-        let now = ProcessInfo.processInfo.systemUptime
-        let repeatBack = lastBack.map { now - $0 < 1.2 } ?? false
-        let target = back ? (repeatBack ? max(0, index - 1) : index) : index + 1
+        let target = back ? index - 1 : index + 1
         guard starts.indices.contains(target) else { return }
-        lastBack = back ? now : nil
         let old = synthesizer
         old.delegate = nil
         old.stopSpeaking()
@@ -47,7 +43,7 @@ private final class SpeechService: NSObject, NSSpeechSynthesizerDelegate {
         guard let verb = fields.first else { return }
         switch verb {
         case "SPEAK":
-            guard !started, fields.count == 4,
+            guard !started, (4...5).contains(fields.count),
                   let multiplier = Float(fields[3]),
                   multiplier.isFinite, (0.5...2.0).contains(multiplier),
                   let payload = Data(base64Encoded: fields[1]),
@@ -61,6 +57,12 @@ private final class SpeechService: NSObject, NSSpeechSynthesizerDelegate {
                 if offset > 0 && !line.isEmpty { starts.append(offset) }
                 offset += (line as NSString).length + 1
             }
+            guard let start = Int(fields.count == 5 ? fields[4] : "0"), starts.contains(start) else {
+                emit("ERROR\tinvalid paragraph start")
+                exit(1)
+            }
+            base = start
+            current = start
             started = true
             synthesizer.delegate = self
             if !fields[2].isEmpty {
@@ -75,7 +77,7 @@ private final class SpeechService: NSObject, NSSpeechSynthesizerDelegate {
             // utterance; set it after voice selection but before playback.
             synthesizer.rate *= multiplier
             synthesizer.volume = muted ? 0 : 1
-            if !synthesizer.startSpeaking(message) {
+            if !synthesizer.startSpeaking(source.substring(from: base)) {
                 emit("ERROR\tfailed to start speech")
                 exit(1)
             }
