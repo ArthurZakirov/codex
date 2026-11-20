@@ -354,7 +354,6 @@ impl TranscriptView {
                 if let (Some(begin), Some(end)) = (locate(first.0), locate(last.0))
                     && (begin..end + last.1.len()).contains(&offset)
                 {
-                    self.voice_pick = None;
                     return Some((markdown.to_owned(), spoken, start, id));
                 }
             }

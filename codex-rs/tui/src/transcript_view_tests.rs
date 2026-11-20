@@ -1589,7 +1589,7 @@ fn spoken_highlight_does_not_jump_to_an_unrelated_later_occurrence() {
 
 #[cfg(target_os = "macos")]
 #[test]
-fn paragraph_pick_reads_the_clicked_reply_only_once_and_ignores_drag() {
+fn paragraph_pick_reads_the_clicked_reply_repeatedly_and_ignores_drag() {
     let markdown = "First paragraph.\n\nSecond paragraph.";
     let cells: Vec<Arc<dyn HistoryCell>> = (0..2)
         .map(|_| {
@@ -1630,5 +1630,21 @@ fn paragraph_pick_reads_the_clicked_reply_only_once_and_ignores_drag() {
     let (_, spoken, start, id) = view.pick_voice_paragraph(up, Some(thread), &cells).unwrap();
     assert_eq!(&spoken[start..], "Second paragraph.");
     assert_eq!(EntryKey::Cell(id), EntryKey::cell(&cells[0]));
-    assert!(!view.cancel_voice_pick());
+    assert!(
+        view.pick_voice_paragraph(down, Some(thread), &cells)
+            .is_none()
+    );
+    assert!(
+        view.pick_voice_paragraph(up, Some(thread), &cells)
+            .is_some()
+    );
+    assert!(view.cancel_voice_pick());
+    assert!(
+        view.pick_voice_paragraph(down, Some(thread), &cells)
+            .is_none()
+    );
+    assert!(
+        view.pick_voice_paragraph(up, Some(thread), &cells)
+            .is_none()
+    );
 }

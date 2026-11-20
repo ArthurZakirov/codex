@@ -2746,7 +2746,7 @@ impl App {
                 if self.chat_widget.thread_id() == Some(thread_id) {
                     if tui.is_owned_screen() {
                         self.transcript_view.arm_voice_pick(thread_id);
-                        self.chat_widget.add_info_message("Click an assistant paragraph to read from there. Esc cancels.".into(), None);
+                        self.chat_widget.add_info_message("Click any assistant paragraph to read from there. Click again to jump. Esc exits.".into(), None);
                     } else {
                         self.chat_widget.add_error_message("Paragraph picking requires the full-screen transcript.".into());
                     }
