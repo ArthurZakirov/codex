@@ -29,6 +29,8 @@ static SEEK: std::sync::LazyLock<tokio::sync::broadcast::Sender<bool>> =
 
 pub(crate) struct ReadingControls {
     pub(crate) navigation: bool,
+    pub(crate) paragraph_color: (u8, u8, u8),
+    pub(crate) paragraph_opacity: f32,
     skip: Option<crate::key_hint::KeyBinding>,
     mute: Option<crate::key_hint::KeyBinding>,
     previous: Option<crate::key_hint::KeyBinding>,
@@ -51,7 +53,20 @@ pub(crate) fn reading_controls() -> &'static ReadingControls {
             let (code, mods) = binding.parts();
             (matches!(code, crossterm::event::KeyCode::F(_)) || !mods.is_empty()).then_some(binding)
         };
+        let rgb = settings["paragraph_highlight_color"]
+            .as_str()
+            .and_then(|color| color.strip_prefix('#'))
+            .filter(|hex| hex.len() == 6 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
+            .and_then(|hex| u32::from_str_radix(hex, 16).ok())
+            .map(|rgb| ((rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8))
+            .unwrap_or(crate::style::UI_ACCENT);
         ReadingControls {
+            paragraph_color: rgb,
+            paragraph_opacity: settings["paragraph_highlight_opacity_percent"]
+                .as_f64()
+                .unwrap_or(10.0)
+                .clamp(0.0, 100.0) as f32
+                / 100.0,
             navigation: settings["paragraph_navigation"].as_bool().unwrap_or(false),
             skip: binding("skip_message_shortcut", "alt-shift-n"),
             mute: binding("mute_shortcut", "alt-shift-m"),
