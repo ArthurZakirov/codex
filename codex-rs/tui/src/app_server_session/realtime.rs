@@ -12,20 +12,23 @@ use codex_app_server_protocol::ThreadRealtimeStopResponse;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::RealtimeConversationVersion;
 use codex_protocol::protocol::RealtimeOutputModality;
-use codex_protocol::protocol::RealtimeVoice;
 use color_eyre::eyre::Result;
 use color_eyre::eyre::WrapErr;
+use uuid::Uuid;
 
 impl AppServerSession {
     pub(crate) async fn thread_realtime_start(
         &mut self,
         thread_id: ThreadId,
-        offer_sdp: String,
-        model: Option<String>,
-        voice: Option<RealtimeVoice>,
+        call_id: String,
+        voice_session_id: Uuid,
     ) -> Result<()> {
-        self.start_realtime(thread_id, offer_sdp, model, voice, /*dictation*/ false)
-            .await
+        self.start_voice_transport(
+            thread_id,
+            ThreadRealtimeStartTransport::ExistingCall { call_id },
+            Some(voice_session_id),
+        )
+        .await
     }
 
     pub(crate) async fn start_realtime_dictation(
@@ -33,29 +36,21 @@ impl AppServerSession {
         thread_id: ThreadId,
         offer_sdp: String,
     ) -> Result<()> {
-        self.start_realtime(thread_id, offer_sdp, None, None, /*dictation*/ true)
-            .await
+        self.start_voice_transport(
+            thread_id,
+            ThreadRealtimeStartTransport::Webrtc { sdp: offer_sdp },
+            None,
+        )
+        .await
     }
 
-    async fn start_realtime(
+    async fn start_voice_transport(
         &mut self,
         thread_id: ThreadId,
-        offer_sdp: String,
-        model: Option<String>,
-        voice: Option<RealtimeVoice>,
-        dictation: bool,
+        transport: ThreadRealtimeStartTransport,
+        voice_session_id: Option<Uuid>,
     ) -> Result<()> {
-        let (version, output_modality) = if dictation {
-            (
-                RealtimeConversationVersion::V2,
-                RealtimeOutputModality::Text,
-            )
-        } else {
-            (
-                RealtimeConversationVersion::V3,
-                RealtimeOutputModality::Audio,
-            )
-        };
+        let dictation = voice_session_id.is_none();
         let request_id = self.next_request_id();
         let _: ThreadRealtimeStartResponse = self
             .request_handle
@@ -71,18 +66,26 @@ impl AppServerSession {
                     codex_response_handoff_mode: None,
                     backend_reasoning_status: false,
                     codex_response_handoff_channel_prefixes: None,
-                    model,
-                    output_modality,
+                    model: None,
+                    output_modality: if dictation {
+                        RealtimeOutputModality::Text
+                    } else {
+                        RealtimeOutputModality::Audio
+                    },
                     include_startup_context: Some(false),
                     initial_items: None,
                     realtime_start_instructions: None,
                     realtime_end_instructions: None,
                     prompt: None,
-                    realtime_session_id: None,
-                    voice_session_id: None,
-                    transport: Some(ThreadRealtimeStartTransport::Webrtc { sdp: offer_sdp }),
-                    version: Some(version),
-                    voice,
+                    realtime_session_id: (!dictation).then(|| thread_id.to_string()),
+                    voice_session_id: voice_session_id.map(|id| id.to_string()),
+                    transport: Some(transport),
+                    version: Some(if dictation {
+                        RealtimeConversationVersion::V2
+                    } else {
+                        RealtimeConversationVersion::V3
+                    }),
+                    voice: None,
                 },
             })
             .await

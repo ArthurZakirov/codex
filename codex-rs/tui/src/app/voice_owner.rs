@@ -135,6 +135,7 @@ impl App {
         app_server: &mut AppServerSession,
         destination: Option<ThreadId>,
     ) {
+        app_server.task_search.cancel();
         let thread_ids: Vec<_> = self
             .thread_event_channels
             .iter()
@@ -157,6 +158,7 @@ impl App {
             {
                 continue;
             }
+            self.cancel_cloud_inventory_refresh(app_server).await;
             if let Err(err) = app_server.thread_unsubscribe(thread_id).await {
                 tracing::warn!("failed to unsubscribe thread {thread_id}: {err}");
             }

@@ -64,6 +64,14 @@ impl ChatWidget {
         ];
         #[cfg(target_os = "macos")]
         if let Some(thread_id) = thread_id {
+            items.push(SelectionItem {
+                name: "Read from clicked paragraph".into(),
+                actions: vec![Box::new(move |tx| {
+                    tx.send(AppEvent::PickVoiceParagraph { thread_id })
+                })],
+                dismiss_on_select: true,
+                ..Default::default()
+            });
             let name = crate::chatwidget::voice_replay_shortcut().map_or_else(
                 || "Replay last reply".into(),
                 |shortcut| format!("Replay last reply ({})", shortcut.display_label()),
@@ -129,9 +137,8 @@ impl ChatWidget {
         current: Option<RealtimeVoice>,
         voices: RealtimeVoicesList,
     ) {
-        // The TUI uses V3, which shares the V1 voice catalog.
         let mut items: Vec<SelectionItem> = voices
-            .v1
+            .v3
             .into_iter()
             .map(|voice| SelectionItem {
                 name: voice.wire_name().to_string(),

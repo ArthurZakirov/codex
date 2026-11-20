@@ -12,10 +12,24 @@ jobs:
   # Keep reusable workflow calls alphabetized. The `required` job below is the
   # version-controlled list that the main-branch ruleset should require.
   bazel:
+    permissions:
+      contents: read
+      id-token: write
     name: Bazel
     if: ${{ github.repository == 'openai/codex' }}
     uses: ./.github/workflows/bazel.yml
     secrets: inherit
+
+  bazel-result:
+    name: Bazel result
+    needs: bazel
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require the Bazel workflow to succeed
+        env:
+          BAZEL_RESULT: ${{ needs.bazel.result }}
+        run: test "$BAZEL_RESULT" = success
 
   blob-size-policy:
     name: Blob size policy
@@ -85,7 +99,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+      - uses: dtolnay/rust-toolchain@d124f86f28ff42855784ff3319f48ac182c248f8 # 1.99.1
       - name: Typecheck Codex TUI on macOS
         run: cargo check --manifest-path codex-rs/Cargo.toml -p codex-tui --lib --locked -j 2
       - name: Test local voice playback
@@ -98,12 +112,18 @@ jobs:
     secrets: inherit
 
   rust-ci:
+    permissions:
+      contents: read
+      id-token: write
     name: rust-ci
     if: ${{ github.repository == 'openai/codex' }}
     uses: ./.github/workflows/rust-ci.yml
     secrets: inherit
 
   sdk:
+    permissions:
+      contents: read
+      id-token: write
     name: sdk
     if: ${{ github.repository == 'openai/codex' }}
     uses: ./.github/workflows/sdk.yml
@@ -114,8 +134,6 @@ jobs:
     # Without `always()`, GitHub skips this job after a failed dependency and a
     # required check can appear successful instead of reporting the failure.
     if: ${{ always() }}
-    # Bazel is advisory while the BuildBuddy key is revoked. Restore its dependency
-    # once the suite can run without BuildBuddy.
     needs:
       - blob-size-policy
       - cargo-deny
