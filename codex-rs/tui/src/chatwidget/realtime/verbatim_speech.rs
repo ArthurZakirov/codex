@@ -665,9 +665,13 @@ impl ChatWidget {
         self.frame_requester.schedule_frame();
         self.realtime_conversation.verbatim_speech_sender.take();
         let control = self.realtime_conversation.verbatim_speech_control.take();
+        let task = self.realtime_conversation.verbatim_speech_task.take();
         if let Some(control) = control {
-            // The worker releases its lease only after the synthesizer stops.
             control.cancel();
+            // A new worker waits until native audio and the lease have been released.
+            self.realtime_conversation.retiring_speech_task = task;
+        } else if let Some(task) = task {
+            task.abort();
         }
     }
 
@@ -795,7 +799,7 @@ impl ChatWidget {
         });
         let progress = Arc::clone(&self.realtime_conversation.spoken_line_progress);
         let frames = self.frame_requester.clone();
-        let previous = self.realtime_conversation.verbatim_speech_task.take();
+        let previous = self.realtime_conversation.retiring_speech_task.take();
         self.realtime_conversation.verbatim_speech_task = Some(tokio::spawn(async move {
             if let Some(previous) = previous {
                 let _ = previous.await;
