@@ -13,6 +13,7 @@ private final class SpeechService: NSObject, NSSpeechSynthesizerDelegate {
     private var synthesizer = NSSpeechSynthesizer()
     private var source: NSString = ""
     private var starts = [0]
+    private var wordAtStart: [Int: NSRange] = [:]
     private var base = 0
     private var current = 0
     private var selectedVoice: NSSpeechSynthesizer.VoiceName?
@@ -57,6 +58,10 @@ private final class SpeechService: NSObject, NSSpeechSynthesizerDelegate {
                 exit(1)
             }
             source = message as NSString
+            message.enumerateSubstrings(in: message.startIndex..<message.endIndex, options: [.byWords, .substringNotRequired]) { _, range, _, _ in
+                let word = NSRange(range, in: message)
+                self.wordAtStart[word.location] = word
+            }
             var offset = 0
             for line in message.components(separatedBy: "\n") {
                 if offset > 0 && !line.isEmpty { starts.append(offset) }
@@ -110,8 +115,20 @@ private final class SpeechService: NSObject, NSSpeechSynthesizerDelegate {
 
     func speechSynthesizer(_ sender: NSSpeechSynthesizer, willSpeakWord range: NSRange, of string: String) {
         guard sender === synthesizer else { return }
-        current = base + range.location
-        emit("WORD\t\(current)\t\(range.length)")
+        let reported = base + range.location
+        // Some system voices include the preceding space in their word offset.
+        // AppKit may still report the length of the word without that space.
+        var first = reported
+        while first < source.length && first < reported + range.length {
+            if wordAtStart[first] != nil { break }
+            guard let scalar = UnicodeScalar(source.character(at: first)),
+                  CharacterSet.whitespacesAndNewlines.union(.punctuationCharacters).contains(scalar)
+            else { break }
+            first += 1
+        }
+        let word = wordAtStart[first]
+        current = word?.location ?? reported
+        emit("WORD\t\(current)\t\(word?.length ?? range.length)")
     }
 
     func speechSynthesizer(_ sender: NSSpeechSynthesizer, didFinishSpeaking finished: Bool) {
