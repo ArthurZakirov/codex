@@ -1242,13 +1242,7 @@ impl App {
                 if self.chat_widget.realtime_verbatim_speech_active() {
                     return Ok(AppRunControl::Continue);
                 }
-            } else if let Some(paused) = self.chat_widget.toggle_verbatim_speech_pause() {
-                let status = if paused {
-                    "Speech paused. Press Space to resume."
-                } else {
-                    "Speech resumed. Press Space to pause."
-                };
-                self.chat_widget.add_info_message(status.to_string(), None);
+            } else if self.chat_widget.toggle_verbatim_speech_pause().is_some() {
                 return Ok(AppRunControl::Continue);
             }
         }
