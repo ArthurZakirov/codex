@@ -24,9 +24,6 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 static MUTED: AtomicBool = AtomicBool::new(false);
-static SEEK: std::sync::LazyLock<tokio::sync::broadcast::Sender<bool>> =
-    std::sync::LazyLock::new(|| tokio::sync::broadcast::channel(32).0);
-
 pub(crate) struct ReadingControls {
     pub(crate) navigation: bool,
     pub(crate) paragraph_color: (u8, u8, u8),
@@ -101,14 +98,44 @@ impl ChatWidget {
             );
             return true;
         }
-        if controls.navigation && self.realtime_verbatim_speech_active() {
-            let back = pressed(controls.previous);
-            if back || pressed(controls.next) {
-                return SEEK.send(back).is_ok();
+        let back = pressed(controls.previous);
+        if controls.navigation
+            && (back || pressed(controls.next))
+            && let Some(line) = self.spoken_line_highlight()
+        {
+            if let Some(start) = adjacent_paragraph(&line.spoken, line.utf16_start, back)
+                && let Err(error) = self.replace_narration(
+                    &line.markdown,
+                    line.spoken.to_string(),
+                    start,
+                    line.cell_id,
+                )
+            {
+                self.add_error_message(format!("Unable to read paragraph: {error}"));
             }
+            return true;
         }
         false
     }
+}
+
+fn adjacent_paragraph(spoken: &str, current_utf16: usize, back: bool) -> Option<usize> {
+    let mut byte = 0;
+    let mut utf16 = 0;
+    let mut previous = None;
+    let mut current = None;
+    for line in spoken.split_inclusive('\n') {
+        if !line.trim_end_matches('\n').is_empty() {
+            if utf16 > current_utf16 {
+                return if back { previous } else { Some(byte) };
+            }
+            previous = current;
+            current = Some(byte);
+        }
+        byte += line.len();
+        utf16 += line.encode_utf16().count();
+    }
+    if back { previous } else { None }
 }
 
 const MAX_NARRATED_ITEM_IDS: usize = 256;
@@ -233,7 +260,6 @@ async fn speak_with_word_positions(
     // The native helper (used for highlighting) must honor the same per-utterance
     // configuration as the in-process synthesizer fallback.
     let rate = configured_speech_rate_multiplier();
-    let mut seek = SEEK.subscribe();
     let mut muted = MUTED.load(Ordering::Acquire);
     if muted { stdin.write_all(b"MUTE\n").await?; }
     stdin
@@ -245,11 +271,6 @@ async fn speak_with_word_positions(
     let mut paused = false;
     loop {
         tokio::select! {
-            Ok(back) = seek.recv() => {
-                stdin.write_all(if back { b"BACK\n" } else { b"NEXT\n" }).await?;
-                if paused { stdin.write_all(b"PAUSE\n").await?; }
-                stdin.flush().await?;
-            }
             line = words.next_line() => {
                 let line = match line? {
                     Some(line) => line,
@@ -644,12 +665,9 @@ impl ChatWidget {
         self.frame_requester.schedule_frame();
         self.realtime_conversation.verbatim_speech_sender.take();
         let control = self.realtime_conversation.verbatim_speech_control.take();
-        let task = self.realtime_conversation.verbatim_speech_task.take();
         if let Some(control) = control {
             // The worker releases its lease only after the synthesizer stops.
             control.cancel();
-        } else if let Some(task) = task {
-            task.abort();
         }
     }
 
@@ -694,7 +712,7 @@ impl ChatWidget {
     }
 
     pub(crate) fn replay_verbatim_speech(&mut self, markdown: &str) -> std::io::Result<()> {
-        self.queue_verbatim_speech(markdown, markdown_to_spoken_text(markdown), true, 0, None)
+        self.replace_narration(markdown, markdown_to_spoken_text(markdown), 0, None)
     }
 
     pub(crate) fn read_from_paragraph(
@@ -704,10 +722,30 @@ impl ChatWidget {
         start: usize,
         cell_id: usize,
     ) -> std::io::Result<()> {
+        self.replace_narration(markdown, spoken, start, Some(cell_id))
+    }
+
+    fn replace_narration(
+        &mut self,
+        markdown: &str,
+        spoken: String,
+        start: usize,
+        cell_id: Option<usize>,
+    ) -> std::io::Result<()> {
+        if spoken.is_empty() {
+            return Ok(());
+        }
         self.cancel_verbatim_speech();
-        // A cancelled worker's final cleanup must not erase the new highlight.
-        self.realtime_conversation.spoken_line_progress = Default::default();
-        self.queue_verbatim_speech(markdown, spoken, true, start, Some(cell_id))
+        // Seed the destination so another keypress can navigate before the first word callback.
+        self.realtime_conversation.spoken_line_progress = Arc::new(Mutex::new(Some(SpokenLine {
+            markdown: Arc::from(markdown),
+            spoken: Arc::from(spoken.as_str()),
+            replay: true,
+            cell_id,
+            utf16_start: spoken[..start].encode_utf16().count(),
+            utf16_len: 0,
+        })));
+        self.queue_verbatim_speech(markdown, spoken, true, start, cell_id)
     }
 
     fn queue_verbatim_speech(
@@ -757,8 +795,12 @@ impl ChatWidget {
         });
         let progress = Arc::clone(&self.realtime_conversation.spoken_line_progress);
         let frames = self.frame_requester.clone();
-        self.realtime_conversation.verbatim_speech_task =
-            Some(tokio::spawn(drain_speech_queue(receiver, move |item| {
+        let previous = self.realtime_conversation.verbatim_speech_task.take();
+        self.realtime_conversation.verbatim_speech_task = Some(tokio::spawn(async move {
+            if let Some(previous) = previous {
+                let _ = previous.await;
+            }
+            drain_speech_queue(receiver, move |item| {
                 // Each new spoken item starts unpaused. All queued items retain
                 // their original FIFO order during an earlier item's pause.
                 pause_sender.send_replace(false);
@@ -806,7 +848,9 @@ impl ChatWidget {
                         .await
                     }
                 }
-            })));
+            })
+            .await;
+        }));
         Ok(())
     }
 }
@@ -831,6 +875,16 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use std::sync::atomic::AtomicU64;
     use std::sync::atomic::Ordering;
+
+    #[test]
+    fn repeated_paragraph_navigation_uses_the_last_destination() {
+        let spoken = "🍎 one\n\nZwei\nThree";
+        assert_eq!(super::adjacent_paragraph(spoken, 0, false), Some(10));
+        assert_eq!(super::adjacent_paragraph(spoken, 8, false), Some(15));
+        assert_eq!(super::adjacent_paragraph(spoken, 13, true), Some(10));
+        assert_eq!(super::adjacent_paragraph(spoken, 8, true), Some(0));
+        assert_eq!(super::adjacent_paragraph(spoken, 0, true), None);
+    }
 
     #[test]
     fn voice_speed_configuration_uses_valid_json_and_rejects_bad_rates() {

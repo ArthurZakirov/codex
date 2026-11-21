@@ -271,7 +271,14 @@ pub(crate) struct TranscriptView {
     pub(crate) history: TranscriptHistoryState,
     highlight: Option<usize>,
     #[cfg(target_os = "macos")]
-    voice_pick: Option<(codex_protocol::ThreadId, Option<(u16, u16)>)>,
+    voice_pick: Option<codex_protocol::ThreadId>,
+    #[cfg(target_os = "macos")]
+    voice_press: Option<(
+        codex_protocol::ThreadId,
+        u16,
+        u16,
+        crossterm::event::KeyModifiers,
+    )>,
     pub(crate) spoken_line: Option<SpokenLine>,
     saved_position: Option<Position>,
     unseen_activity: bool,
@@ -319,6 +326,8 @@ impl Default for TranscriptView {
             highlight: None,
             #[cfg(target_os = "macos")]
             voice_pick: None,
+            #[cfg(target_os = "macos")]
+            voice_press: None,
             spoken_line: None,
             saved_position: None,
             unseen_activity: false,
@@ -334,10 +343,12 @@ impl Default for TranscriptView {
 #[cfg(target_os = "macos")]
 impl TranscriptView {
     pub(crate) fn arm_voice_pick(&mut self, thread: codex_protocol::ThreadId) {
-        self.voice_pick = Some((thread, None));
+        self.voice_pick = Some(thread);
+        self.voice_press = None;
     }
 
     pub(crate) fn cancel_voice_pick(&mut self) -> bool {
+        self.voice_press = None;
         self.voice_pick.take().is_some()
     }
 
@@ -348,21 +359,22 @@ impl TranscriptView {
         cells: &[Arc<dyn HistoryCell>],
     ) -> Option<(String, String, usize, usize)> {
         use crossterm::event::{MouseButton, MouseEventKind};
-        let (owner, pressed) = self.voice_pick.as_mut()?;
-        if Some(*owner) != thread {
-            self.voice_pick = None;
-            return None;
-        }
+        let thread = thread?;
         let point = (mouse.column, mouse.row);
+        let gesture = (thread, mouse.column, mouse.row, mouse.modifiers);
+        let alt = mouse.modifiers == crossterm::event::KeyModifiers::ALT;
         match mouse.kind {
-            MouseEventKind::Down(MouseButton::Left) if mouse.modifiers.is_empty() => {
-                *pressed = Some(point);
+            MouseEventKind::Down(MouseButton::Left) => {
+                let can_pick = (alt || mouse.modifiers.is_empty())
+                    && (self.voice_pick == Some(thread)
+                        || self.spoken_line.is_some()
+                        || (alt && crate::chatwidget::reading_controls().navigation));
+                self.voice_press = can_pick.then_some(gesture);
                 return None;
             }
-            MouseEventKind::Up(MouseButton::Left)
-                if pressed.take() == Some(point) && mouse.modifiers.is_empty() => {}
+            MouseEventKind::Up(MouseButton::Left) if self.voice_press.take() == Some(gesture) => {}
             MouseEventKind::Drag(_) | MouseEventKind::Down(_) => {
-                *pressed = None;
+                self.voice_press = None;
                 return None;
             }
             _ => return None,
