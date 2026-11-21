@@ -24,9 +24,6 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 static MUTED: AtomicBool = AtomicBool::new(false);
-static SEEK: std::sync::LazyLock<tokio::sync::broadcast::Sender<bool>> =
-    std::sync::LazyLock::new(|| tokio::sync::broadcast::channel(32).0);
-
 pub(crate) struct ReadingControls {
     pub(crate) navigation: bool,
     pub(crate) paragraph_color: (u8, u8, u8),
@@ -101,14 +98,44 @@ impl ChatWidget {
             );
             return true;
         }
-        if controls.navigation && self.realtime_verbatim_speech_active() {
-            let back = pressed(controls.previous);
-            if back || pressed(controls.next) {
-                return SEEK.send(back).is_ok();
+        let back = pressed(controls.previous);
+        if controls.navigation
+            && (back || pressed(controls.next))
+            && let Some(line) = self.spoken_line_highlight()
+        {
+            if let Some(start) = adjacent_paragraph(&line.spoken, line.utf16_start, back)
+                && let Err(error) = self.replace_narration(
+                    &line.markdown,
+                    line.spoken.to_string(),
+                    start,
+                    line.cell_id,
+                )
+            {
+                self.add_error_message(format!("Unable to read paragraph: {error}"));
             }
+            return true;
         }
         false
     }
+}
+
+fn adjacent_paragraph(spoken: &str, current_utf16: usize, back: bool) -> Option<usize> {
+    let mut byte = 0;
+    let mut utf16 = 0;
+    let mut previous = None;
+    let mut current = None;
+    for line in spoken.split_inclusive('\n') {
+        if !line.trim_end_matches('\n').is_empty() {
+            if utf16 > current_utf16 {
+                return if back { previous } else { Some(byte) };
+            }
+            previous = current;
+            current = Some(byte);
+        }
+        byte += line.len();
+        utf16 += line.encode_utf16().count();
+    }
+    if back { previous } else { None }
 }
 
 const MAX_NARRATED_ITEM_IDS: usize = 256;
@@ -209,7 +236,7 @@ async fn speak_with_word_positions(
         position: Arc::clone(&position),
         frames: frames.clone(),
     };
-    let voice = choose_speech_voice(detect_speech_language(&item.spoken)).unwrap_or_default();
+    let voice = narration_voice().unwrap_or_default();
     let mut child = tokio::process::Command::new(helper)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -233,7 +260,6 @@ async fn speak_with_word_positions(
     // The native helper (used for highlighting) must honor the same per-utterance
     // configuration as the in-process synthesizer fallback.
     let rate = configured_speech_rate_multiplier();
-    let mut seek = SEEK.subscribe();
     let mut muted = MUTED.load(Ordering::Acquire);
     if muted { stdin.write_all(b"MUTE\n").await?; }
     stdin
@@ -245,11 +271,6 @@ async fn speak_with_word_positions(
     let mut paused = false;
     loop {
         tokio::select! {
-            Ok(back) = seek.recv() => {
-                stdin.write_all(if back { b"BACK\n" } else { b"NEXT\n" }).await?;
-                if paused { stdin.write_all(b"PAUSE\n").await?; }
-                stdin.flush().await?;
-            }
             line = words.next_line() => {
                 let line = match line? {
                     Some(line) => line,
@@ -479,102 +500,19 @@ pub(crate) fn markdown_to_spoken_text(markdown: &str) -> String {
     spoken.trim().to_string()
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SpeechLanguage {
-    German,
-    English,
-}
-
-/// Technical identifiers should not overwhelm natural-language cues.
-fn detect_speech_language(text: &str) -> SpeechLanguage {
-    const GERMAN: &[&str] = &[
-        "der", "die", "das", "und", "ist", "ich", "nicht", "mit", "für", "eine", "einen", "wir",
-        "werden", "kann", "bitte", "diese", "wenn", "dann", "auch", "wird", "auf", "von", "zu",
-        "den", "dem", "sie", "hallo", "guten", "morgen", "wie", "geht", "es", "dir", "mir", "du",
-        "dein", "deine", "danke", "heute", "jetzt", "noch", "schon", "aber", "doch", "haben",
-        "sind", "kein", "keine", "kannst", "können", "weiter", "mal",
-    ];
-    const ENGLISH: &[&str] = &[
-        "the", "and", "is", "are", "with", "for", "this", "that", "you", "your", "will", "can",
-        "please", "when", "then", "from", "not", "we", "have", "does", "into", "should", "it",
-        "of", "to",
-    ];
-    let mut german = 0;
-    let mut english = 0;
-    for word in text
-        .split(|c: char| !c.is_alphabetic())
-        .filter(|w| !w.is_empty())
-    {
-        let lower = word.to_lowercase();
-        if lower.chars().any(|c| matches!(c, 'ä' | 'ö' | 'ü' | 'ß')) {
-            german += 3;
-        }
-        if GERMAN.contains(&lower.as_str()) {
-            german += 1;
-        }
-        if ENGLISH.contains(&lower.as_str()) {
-            english += 1;
-        }
-    }
-    if german > english {
-        SpeechLanguage::German
-    } else {
-        SpeechLanguage::English
-    }
-}
-
-fn speech_voice_quality_rank(voice: &str) -> u8 {
-    let name = voice.to_ascii_lowercase();
-    if name.contains(".premium.") {
-        3
-    } else if name.contains(".enhanced.") {
-        2
-    } else {
-        1
-    }
-}
-
-#[allow(deprecated)]
-fn choose_speech_voice(language: SpeechLanguage) -> Option<String> {
-    if language == SpeechLanguage::English {
-        // Preserve the macOS system default, just as /usr/bin/say did before.
-        // Explicitly selecting compact Samantha changes the English voice.
-        return None;
-    }
-    let voices = NSSpeechSynthesizer::availableVoices();
-    let candidates: Vec<String> = voices.iter().map(|voice| voice.to_string()).collect();
-    let german_voices: Vec<&String> = candidates
-        .iter()
-        .filter(|voice| voice.to_ascii_lowercase().contains("de-de"))
-        .collect();
-    if let Ok(requested) = std::env::var("CODEX_REALTIME_GERMAN_VOICE") {
-        if let Some(voice) = german_voices
-            .iter()
-            .filter(|voice| {
-                voice.eq_ignore_ascii_case(&requested)
-                    || voice
-                        .rsplit('.')
-                        .next()
-                        .is_some_and(|name| name.eq_ignore_ascii_case(&requested))
-            })
-            .max_by_key(|voice| speech_voice_quality_rank(voice))
-        {
-            return Some((*voice).clone());
-        }
-        tracing::warn!(
-            "German speech voice {requested:?} is not installed; using a German system voice"
-        );
-    }
-    german_voices
-        .iter()
-        .filter(|voice| voice.to_ascii_lowercase().ends_with(".anna"))
-        .max_by_key(|voice| speech_voice_quality_rank(voice))
-        .or_else(|| {
-            german_voices
-                .iter()
-                .max_by_key(|voice| speech_voice_quality_rank(voice))
+/// Use one voice for the entire session, including replays of mixed-language text.
+fn narration_voice() -> Option<&'static str> {
+    static VOICE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    VOICE
+        .get_or_init(|| {
+            let settings: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(voice_config_path()?).ok()?).ok()?;
+            settings["speech_voice"]
+                .as_str()
+                .filter(|id| !id.is_empty())
+                .map(str::to_owned)
         })
-        .map(|voice| (*voice).clone())
+        .as_deref()
 }
 
 /// The speech engine, not its process, owns the playback position.
@@ -594,9 +532,11 @@ fn speak_spoken_text_blocking(
         return Ok(());
     }
     let synthesizer = NSSpeechSynthesizer::new();
-    if let Some(voice) = choose_speech_voice(detect_speech_language(&spoken)) {
-        if !synthesizer.setVoice(Some(&NSString::from_str(&voice))) {
-            tracing::warn!("macOS speech voice {voice} was unavailable; using system default");
+    if let Some(voice) = narration_voice() {
+        if !synthesizer.setVoice(Some(&NSString::from_str(voice))) {
+            return Err(std::io::Error::other(format!(
+                "Configured speech voice {voice} is unavailable"
+            )));
         }
     }
     // Set the per-voice rate *before* starting each utterance. Changing
@@ -725,12 +665,9 @@ impl ChatWidget {
         self.frame_requester.schedule_frame();
         self.realtime_conversation.verbatim_speech_sender.take();
         let control = self.realtime_conversation.verbatim_speech_control.take();
-        let task = self.realtime_conversation.verbatim_speech_task.take();
         if let Some(control) = control {
             // The worker releases its lease only after the synthesizer stops.
             control.cancel();
-        } else if let Some(task) = task {
-            task.abort();
         }
     }
 
@@ -775,7 +712,7 @@ impl ChatWidget {
     }
 
     pub(crate) fn replay_verbatim_speech(&mut self, markdown: &str) -> std::io::Result<()> {
-        self.queue_verbatim_speech(markdown, markdown_to_spoken_text(markdown), true, 0, None)
+        self.replace_narration(markdown, markdown_to_spoken_text(markdown), 0, None)
     }
 
     pub(crate) fn read_from_paragraph(
@@ -785,10 +722,30 @@ impl ChatWidget {
         start: usize,
         cell_id: usize,
     ) -> std::io::Result<()> {
+        self.replace_narration(markdown, spoken, start, Some(cell_id))
+    }
+
+    fn replace_narration(
+        &mut self,
+        markdown: &str,
+        spoken: String,
+        start: usize,
+        cell_id: Option<usize>,
+    ) -> std::io::Result<()> {
+        if spoken.is_empty() {
+            return Ok(());
+        }
         self.cancel_verbatim_speech();
-        // A cancelled worker's final cleanup must not erase the new highlight.
-        self.realtime_conversation.spoken_line_progress = Default::default();
-        self.queue_verbatim_speech(markdown, spoken, true, start, Some(cell_id))
+        // Seed the destination so another keypress can navigate before the first word callback.
+        self.realtime_conversation.spoken_line_progress = Arc::new(Mutex::new(Some(SpokenLine {
+            markdown: Arc::from(markdown),
+            spoken: Arc::from(spoken.as_str()),
+            replay: true,
+            cell_id,
+            utf16_start: spoken[..start].encode_utf16().count(),
+            utf16_len: 0,
+        })));
+        self.queue_verbatim_speech(markdown, spoken, true, start, cell_id)
     }
 
     fn queue_verbatim_speech(
@@ -838,8 +795,12 @@ impl ChatWidget {
         });
         let progress = Arc::clone(&self.realtime_conversation.spoken_line_progress);
         let frames = self.frame_requester.clone();
-        self.realtime_conversation.verbatim_speech_task =
-            Some(tokio::spawn(drain_speech_queue(receiver, move |item| {
+        let previous = self.realtime_conversation.verbatim_speech_task.take();
+        self.realtime_conversation.verbatim_speech_task = Some(tokio::spawn(async move {
+            if let Some(previous) = previous {
+                let _ = previous.await;
+            }
+            drain_speech_queue(receiver, move |item| {
                 // Each new spoken item starts unpaused. All queued items retain
                 // their original FIFO order during an earlier item's pause.
                 pause_sender.send_replace(false);
@@ -887,7 +848,9 @@ impl ChatWidget {
                         .await
                     }
                 }
-            })));
+            })
+            .await;
+        }));
         Ok(())
     }
 }
@@ -912,6 +875,16 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use std::sync::atomic::AtomicU64;
     use std::sync::atomic::Ordering;
+
+    #[test]
+    fn repeated_paragraph_navigation_uses_the_last_destination() {
+        let spoken = "🍎 one\n\nZwei\nThree";
+        assert_eq!(super::adjacent_paragraph(spoken, 0, false), Some(10));
+        assert_eq!(super::adjacent_paragraph(spoken, 8, false), Some(15));
+        assert_eq!(super::adjacent_paragraph(spoken, 13, true), Some(10));
+        assert_eq!(super::adjacent_paragraph(spoken, 8, true), Some(0));
+        assert_eq!(super::adjacent_paragraph(spoken, 0, true), None);
+    }
 
     #[test]
     fn voice_speed_configuration_uses_valid_json_and_rejects_bad_rates() {
@@ -954,74 +927,6 @@ mod tests {
         assert_eq!(super::speech_rate_multiplier_from_path(&config), 1.8);
         std::fs::remove_file(&config).unwrap();
         assert_eq!(super::speech_rate_multiplier_from_path(&config), 1.8);
-    }
-
-    #[test]
-    fn german_premium_voice_outranks_compact_and_enhanced() {
-        assert_eq!(
-            super::speech_voice_quality_rank("com.apple.voice.compact.de-DE.Anna"),
-            1
-        );
-        assert_eq!(
-            super::speech_voice_quality_rank("com.apple.voice.enhanced.de-DE.Anna"),
-            2
-        );
-        assert_eq!(
-            super::speech_voice_quality_rank("com.apple.voice.premium.de-DE.Anna"),
-            3
-        );
-    }
-
-    #[test]
-    fn english_narration_preserves_the_original_mac_system_voice() {
-        assert_eq!(
-            super::choose_speech_voice(super::SpeechLanguage::English),
-            None
-        );
-    }
-
-    #[test]
-    fn detects_german_prose_and_technical_terms() {
-        assert_eq!(
-            super::detect_speech_language(
-                "Bitte erkläre, wie wir den Pydantic Validator mit Git rebase testen können."
-            ),
-            super::SpeechLanguage::German
-        );
-        assert_eq!(
-            super::detect_speech_language("Die Funktion ist für diese API nicht verfügbar."),
-            super::SpeechLanguage::German
-        );
-        assert_eq!(
-            super::detect_speech_language("Guten Morgen, wie geht es dir heute?"),
-            super::SpeechLanguage::German
-        );
-        assert_eq!(
-            super::detect_speech_language("Hallo, kannst du mir helfen?"),
-            super::SpeechLanguage::German
-        );
-    }
-
-    #[test]
-    fn detects_english_prose_and_technical_terms() {
-        assert_eq!(
-            super::detect_speech_language(
-                "Please explain how we can test the Pydantic validator with Git rebase."
-            ),
-            super::SpeechLanguage::English
-        );
-        assert_eq!(
-            super::detect_speech_language("The function is not available for this API."),
-            super::SpeechLanguage::English
-        );
-    }
-
-    #[test]
-    fn defaults_to_english_for_code_only_or_ambiguous_text() {
-        assert_eq!(
-            super::detect_speech_language("git switch feature; cargo test"),
-            super::SpeechLanguage::English
-        );
     }
 
     #[test]

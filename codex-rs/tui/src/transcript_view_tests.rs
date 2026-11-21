@@ -2013,6 +2013,18 @@ fn paragraph_pick_reads_the_clicked_reply_repeatedly_and_ignores_drag() {
         view.pick_voice_paragraph(up, Some(thread), &cells)
             .is_some()
     );
+    let alt = |mouse: MouseEvent| MouseEvent {
+        modifiers: KeyModifiers::ALT,
+        ..mouse
+    };
+    assert!(
+        view.pick_voice_paragraph(alt(down), Some(thread), &cells)
+            .is_none()
+    );
+    assert!(
+        view.pick_voice_paragraph(alt(up), Some(thread), &cells)
+            .is_some()
+    );
     assert!(view.cancel_voice_pick());
     assert!(
         view.pick_voice_paragraph(down, Some(thread), &cells)
