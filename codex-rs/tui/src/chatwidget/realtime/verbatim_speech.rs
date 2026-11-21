@@ -209,7 +209,7 @@ async fn speak_with_word_positions(
         position: Arc::clone(&position),
         frames: frames.clone(),
     };
-    let voice = choose_speech_voice(detect_speech_language(&item.spoken)).unwrap_or_default();
+    let voice = narration_voice().unwrap_or_default();
     let mut child = tokio::process::Command::new(helper)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -479,102 +479,19 @@ pub(crate) fn markdown_to_spoken_text(markdown: &str) -> String {
     spoken.trim().to_string()
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SpeechLanguage {
-    German,
-    English,
-}
-
-/// Technical identifiers should not overwhelm natural-language cues.
-fn detect_speech_language(text: &str) -> SpeechLanguage {
-    const GERMAN: &[&str] = &[
-        "der", "die", "das", "und", "ist", "ich", "nicht", "mit", "für", "eine", "einen", "wir",
-        "werden", "kann", "bitte", "diese", "wenn", "dann", "auch", "wird", "auf", "von", "zu",
-        "den", "dem", "sie", "hallo", "guten", "morgen", "wie", "geht", "es", "dir", "mir", "du",
-        "dein", "deine", "danke", "heute", "jetzt", "noch", "schon", "aber", "doch", "haben",
-        "sind", "kein", "keine", "kannst", "können", "weiter", "mal",
-    ];
-    const ENGLISH: &[&str] = &[
-        "the", "and", "is", "are", "with", "for", "this", "that", "you", "your", "will", "can",
-        "please", "when", "then", "from", "not", "we", "have", "does", "into", "should", "it",
-        "of", "to",
-    ];
-    let mut german = 0;
-    let mut english = 0;
-    for word in text
-        .split(|c: char| !c.is_alphabetic())
-        .filter(|w| !w.is_empty())
-    {
-        let lower = word.to_lowercase();
-        if lower.chars().any(|c| matches!(c, 'ä' | 'ö' | 'ü' | 'ß')) {
-            german += 3;
-        }
-        if GERMAN.contains(&lower.as_str()) {
-            german += 1;
-        }
-        if ENGLISH.contains(&lower.as_str()) {
-            english += 1;
-        }
-    }
-    if german > english {
-        SpeechLanguage::German
-    } else {
-        SpeechLanguage::English
-    }
-}
-
-fn speech_voice_quality_rank(voice: &str) -> u8 {
-    let name = voice.to_ascii_lowercase();
-    if name.contains(".premium.") {
-        3
-    } else if name.contains(".enhanced.") {
-        2
-    } else {
-        1
-    }
-}
-
-#[allow(deprecated)]
-fn choose_speech_voice(language: SpeechLanguage) -> Option<String> {
-    if language == SpeechLanguage::English {
-        // Preserve the macOS system default, just as /usr/bin/say did before.
-        // Explicitly selecting compact Samantha changes the English voice.
-        return None;
-    }
-    let voices = NSSpeechSynthesizer::availableVoices();
-    let candidates: Vec<String> = voices.iter().map(|voice| voice.to_string()).collect();
-    let german_voices: Vec<&String> = candidates
-        .iter()
-        .filter(|voice| voice.to_ascii_lowercase().contains("de-de"))
-        .collect();
-    if let Ok(requested) = std::env::var("CODEX_REALTIME_GERMAN_VOICE") {
-        if let Some(voice) = german_voices
-            .iter()
-            .filter(|voice| {
-                voice.eq_ignore_ascii_case(&requested)
-                    || voice
-                        .rsplit('.')
-                        .next()
-                        .is_some_and(|name| name.eq_ignore_ascii_case(&requested))
-            })
-            .max_by_key(|voice| speech_voice_quality_rank(voice))
-        {
-            return Some((*voice).clone());
-        }
-        tracing::warn!(
-            "German speech voice {requested:?} is not installed; using a German system voice"
-        );
-    }
-    german_voices
-        .iter()
-        .filter(|voice| voice.to_ascii_lowercase().ends_with(".anna"))
-        .max_by_key(|voice| speech_voice_quality_rank(voice))
-        .or_else(|| {
-            german_voices
-                .iter()
-                .max_by_key(|voice| speech_voice_quality_rank(voice))
+/// Use one voice for the entire session, including replays of mixed-language text.
+fn narration_voice() -> Option<&'static str> {
+    static VOICE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    VOICE
+        .get_or_init(|| {
+            let settings: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(voice_config_path()?).ok()?).ok()?;
+            settings["speech_voice"]
+                .as_str()
+                .filter(|id| !id.is_empty())
+                .map(str::to_owned)
         })
-        .map(|voice| (*voice).clone())
+        .as_deref()
 }
 
 /// The speech engine, not its process, owns the playback position.
@@ -594,9 +511,11 @@ fn speak_spoken_text_blocking(
         return Ok(());
     }
     let synthesizer = NSSpeechSynthesizer::new();
-    if let Some(voice) = choose_speech_voice(detect_speech_language(&spoken)) {
-        if !synthesizer.setVoice(Some(&NSString::from_str(&voice))) {
-            tracing::warn!("macOS speech voice {voice} was unavailable; using system default");
+    if let Some(voice) = narration_voice() {
+        if !synthesizer.setVoice(Some(&NSString::from_str(voice))) {
+            return Err(std::io::Error::other(format!(
+                "Configured speech voice {voice} is unavailable"
+            )));
         }
     }
     // Set the per-voice rate *before* starting each utterance. Changing
@@ -954,74 +873,6 @@ mod tests {
         assert_eq!(super::speech_rate_multiplier_from_path(&config), 1.8);
         std::fs::remove_file(&config).unwrap();
         assert_eq!(super::speech_rate_multiplier_from_path(&config), 1.8);
-    }
-
-    #[test]
-    fn german_premium_voice_outranks_compact_and_enhanced() {
-        assert_eq!(
-            super::speech_voice_quality_rank("com.apple.voice.compact.de-DE.Anna"),
-            1
-        );
-        assert_eq!(
-            super::speech_voice_quality_rank("com.apple.voice.enhanced.de-DE.Anna"),
-            2
-        );
-        assert_eq!(
-            super::speech_voice_quality_rank("com.apple.voice.premium.de-DE.Anna"),
-            3
-        );
-    }
-
-    #[test]
-    fn english_narration_preserves_the_original_mac_system_voice() {
-        assert_eq!(
-            super::choose_speech_voice(super::SpeechLanguage::English),
-            None
-        );
-    }
-
-    #[test]
-    fn detects_german_prose_and_technical_terms() {
-        assert_eq!(
-            super::detect_speech_language(
-                "Bitte erkläre, wie wir den Pydantic Validator mit Git rebase testen können."
-            ),
-            super::SpeechLanguage::German
-        );
-        assert_eq!(
-            super::detect_speech_language("Die Funktion ist für diese API nicht verfügbar."),
-            super::SpeechLanguage::German
-        );
-        assert_eq!(
-            super::detect_speech_language("Guten Morgen, wie geht es dir heute?"),
-            super::SpeechLanguage::German
-        );
-        assert_eq!(
-            super::detect_speech_language("Hallo, kannst du mir helfen?"),
-            super::SpeechLanguage::German
-        );
-    }
-
-    #[test]
-    fn detects_english_prose_and_technical_terms() {
-        assert_eq!(
-            super::detect_speech_language(
-                "Please explain how we can test the Pydantic validator with Git rebase."
-            ),
-            super::SpeechLanguage::English
-        );
-        assert_eq!(
-            super::detect_speech_language("The function is not available for this API."),
-            super::SpeechLanguage::English
-        );
-    }
-
-    #[test]
-    fn defaults_to_english_for_code_only_or_ambiguous_text() {
-        assert_eq!(
-            super::detect_speech_language("git switch feature; cargo test"),
-            super::SpeechLanguage::English
-        );
     }
 
     #[test]

@@ -15,6 +15,7 @@ private final class SpeechService: NSObject, NSSpeechSynthesizerDelegate {
     private var starts = [0]
     private var base = 0
     private var current = 0
+    private var selectedVoice: NSSpeechSynthesizer.VoiceName?
     private var muted = false
 
     private func seek(back: Bool) {
@@ -25,7 +26,11 @@ private final class SpeechService: NSObject, NSSpeechSynthesizerDelegate {
         let old = synthesizer
         old.delegate = nil
         old.stopSpeaking()
-        synthesizer = NSSpeechSynthesizer(voice: old.voice()) ?? NSSpeechSynthesizer()
+        guard let replacement = NSSpeechSynthesizer(voice: selectedVoice) else {
+            emit("ERROR\tselected speech voice unavailable")
+            exit(1)
+        }
+        synthesizer = replacement
         synthesizer.delegate = self
         synthesizer.rate = old.rate
         synthesizer.volume = muted ? 0 : 1
@@ -67,10 +72,10 @@ private final class SpeechService: NSObject, NSSpeechSynthesizerDelegate {
             synthesizer.delegate = self
             if !fields[2].isEmpty {
                 let voice = NSSpeechSynthesizer.VoiceName(rawValue: fields[2])
+                selectedVoice = voice
                 if !synthesizer.setVoice(voice) {
-                    // Match the existing Codex voice fallback rather than
-                    // dropping the entire utterance when a voice was removed.
-                    emit("WARN\trequested voice unavailable; using system default")
+                    emit("ERROR\tconfigured speech voice unavailable")
+                    exit(1)
                 }
             }
             // NSSpeechSynthesizer ignores rate updates during an active
