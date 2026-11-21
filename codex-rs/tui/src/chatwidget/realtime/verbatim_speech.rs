@@ -154,13 +154,17 @@ impl SpeechPlaybackControl {
         self.active.load(Ordering::Acquire)
     }
 
-    fn toggle_pause(&self) -> Option<bool> {
+    fn set_paused(&self, paused: bool) -> bool {
         if !self.is_active() {
-            return None;
+            return false;
         }
-        let next = !*self.paused.borrow();
-        self.paused.send_replace(next);
-        Some(next)
+        self.paused.send_if_modified(|current| {
+            if *current == paused {
+                return false;
+            }
+            *current = paused;
+            true
+        })
     }
 
     fn interrupt_current(&self) {
@@ -730,12 +734,12 @@ impl ChatWidget {
             .is_some_and(SpeechPlaybackControl::is_active)
     }
 
-    /// Return None rather than intercept Space when no synthesizer is speaking.
-    pub(crate) fn toggle_verbatim_speech_pause(&mut self) -> Option<bool> {
+    /// Consume the key only when it changes playback state.
+    pub(crate) fn set_verbatim_speech_paused(&self, paused: bool) -> bool {
         self.realtime_conversation
             .verbatim_speech_control
             .as_ref()
-            .and_then(SpeechPlaybackControl::toggle_pause)
+            .is_some_and(|control| control.set_paused(paused))
     }
 
     /// A new user input interrupts only the current utterance. The existing
@@ -1348,7 +1352,8 @@ mod tests {
         started.notified().await;
         sender.send("Queued commentary".to_string()).unwrap();
         sender.send("Queued final".to_string()).unwrap();
-        assert_eq!(control.toggle_pause(), Some(true));
+        assert!(control.set_paused(true));
+        assert!(!control.set_paused(true));
         control.interrupt_current();
 
         assert!(!cancelled.load(Ordering::Acquire));
@@ -1363,7 +1368,7 @@ mod tests {
             *narrated.lock().unwrap(),
             ["Queued commentary", "Queued final"]
         );
-        assert_eq!(control.toggle_pause(), None);
+        assert!(!control.set_paused(true));
     }
 
     #[test]
@@ -1391,12 +1396,14 @@ mod tests {
             cancelled,
             interruption_generation: Arc::new(AtomicU64::new(0)),
         };
-        assert_eq!(control.toggle_pause(), None);
+        assert!(!control.set_paused(true));
         active.store(true, Ordering::Release);
-        assert_eq!(control.toggle_pause(), Some(true));
-        assert_eq!(control.toggle_pause(), Some(false));
+        assert!(control.set_paused(true));
+        assert!(!control.set_paused(true));
+        assert!(control.set_paused(false));
+        assert!(!control.set_paused(false));
         active.store(false, Ordering::Release);
-        assert_eq!(control.toggle_pause(), None);
+        assert!(!control.set_paused(true));
     }
 
     #[test]
@@ -1410,11 +1417,13 @@ mod tests {
             cancelled: Arc::clone(&cancelled),
             interruption_generation: Arc::new(AtomicU64::new(0)),
         };
-        assert_eq!(control.toggle_pause(), Some(true));
+        assert!(control.set_paused(true));
+        assert!(!control.set_paused(true));
         control.cancel();
         assert!(cancelled.load(Ordering::Acquire));
         // The native speech worker notices cancellation even while paused.
-        assert_eq!(control.toggle_pause(), Some(false));
+        assert!(control.set_paused(false));
+        assert!(!control.set_paused(false));
     }
 
     #[test]
