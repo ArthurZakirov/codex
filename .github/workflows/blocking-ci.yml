@@ -23,7 +23,7 @@ jobs:
   bazel-result:
     name: Bazel result
     needs: bazel
-    if: ${{ always() }}
+    if: ${{ always() && github.repository == 'openai/codex' }}
     runs-on: ubuntu-24.04
     steps:
       - name: Require the Bazel workflow to succeed
