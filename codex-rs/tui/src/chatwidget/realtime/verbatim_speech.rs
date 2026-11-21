@@ -216,8 +216,8 @@ fn speech_helper_path() -> Option<std::path::PathBuf> {
     path.is_file().then_some(path)
 }
 
-/// The small Swift worker runs AppKit on its own main thread and emits real
-/// NSSpeechSynthesizer word callbacks. No synthesized timestamp is substituted.
+/// The Swift worker reports word positions from AppKit, bridging a missing adjacent
+/// word within a phrase using the active speaking rate.
 async fn speak_with_word_positions(
     item: SpeechQueueItem,
     mut pause_rx: tokio::sync::watch::Receiver<bool>,
