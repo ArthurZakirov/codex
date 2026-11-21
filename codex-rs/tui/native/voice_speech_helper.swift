@@ -165,8 +165,17 @@ private final class SpeechService: NSObject, NSSpeechSynthesizerDelegate {
 
     func speechSynthesizer(_ sender: NSSpeechSynthesizer, didFinishSpeaking finished: Bool) {
         guard sender === synthesizer else { return }
-        emit("DONE\t\(finished)")
-        exit(finished ? 0 : 1)
+        guard finished else {
+            emit("DONE\tfalse")
+            exit(1)
+        }
+        // Keep the worker and its audio lease alive while the output device
+        // drains buffered speech. STOP remains immediate during this interval.
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(500)) {
+            guard sender === self.synthesizer else { return }
+            emit("DONE\ttrue")
+            exit(0)
+        }
     }
 }
 
