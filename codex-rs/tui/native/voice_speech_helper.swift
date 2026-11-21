@@ -13,8 +13,31 @@ private final class SpeechService: NSObject, NSSpeechSynthesizerDelegate {
     private var synthesizer = NSSpeechSynthesizer()
     private var source: NSString = ""
     private var starts = [0]
+    private var wordIndex: [Int: Int] = [:]
+    private var words: [NSRange] = []
+    private var gapTimer: Timer?
+    private var paused = false
+    private var lastEmitted = -1
+
+    // AppKit can omit a short word between two real callbacks. Bridge one word
+    // within the same phrase. Every native callback takes precedence.
+    private func scheduleAdjacentWord(after index: Int) {
+        guard !paused, words.indices.contains(index + 1) else { return }
+        let word = words[index]
+        let next = words[index + 1]
+        let gap = source.substring(with: NSRange(location: NSMaxRange(word), length: next.location - NSMaxRange(word)))
+        guard !gap.isEmpty, gap.allSatisfy({ $0 == " " || $0 == "\t" }) else { return }
+        let seconds = 60 / Double(max(synthesizer.rate, 1))
+        let weight = min(1.35, max(0.55, Double(word.length) / 5))
+        gapTimer = Timer.scheduledTimer(withTimeInterval: seconds * weight, repeats: false) { [weak self] _ in
+            guard let self, !self.paused else { return }
+            self.lastEmitted = next.location
+            emit("WORD\t\(next.location)\t\(next.length)")
+        }
+    }
     private var base = 0
     private var current = 0
+    private var selectedVoice: NSSpeechSynthesizer.VoiceName?
     private var muted = false
 
     private func seek(back: Bool) {
@@ -22,13 +45,19 @@ private final class SpeechService: NSObject, NSSpeechSynthesizerDelegate {
         let index = starts.lastIndex(where: { $0 <= current }) ?? 0
         let target = back ? index - 1 : index + 1
         guard starts.indices.contains(target) else { return }
+        gapTimer?.invalidate()
         let old = synthesizer
         old.delegate = nil
         old.stopSpeaking()
-        synthesizer = NSSpeechSynthesizer(voice: old.voice()) ?? NSSpeechSynthesizer()
+        guard let replacement = NSSpeechSynthesizer(voice: selectedVoice) else {
+            emit("ERROR\tselected speech voice unavailable")
+            exit(1)
+        }
+        synthesizer = replacement
         synthesizer.delegate = self
         synthesizer.rate = old.rate
         synthesizer.volume = muted ? 0 : 1
+        lastEmitted = -1
         base = starts[target]
         current = base
         if !synthesizer.startSpeaking(source.substring(from: base)) {
@@ -52,6 +81,11 @@ private final class SpeechService: NSObject, NSSpeechSynthesizerDelegate {
                 exit(1)
             }
             source = message as NSString
+            message.enumerateSubstrings(in: message.startIndex..<message.endIndex, options: [.byWords, .substringNotRequired]) { _, range, _, _ in
+                let word = NSRange(range, in: message)
+                self.wordIndex[word.location] = self.words.count
+                self.words.append(word)
+            }
             var offset = 0
             for line in message.components(separatedBy: "\n") {
                 if offset > 0 && !line.isEmpty { starts.append(offset) }
@@ -67,10 +101,10 @@ private final class SpeechService: NSObject, NSSpeechSynthesizerDelegate {
             synthesizer.delegate = self
             if !fields[2].isEmpty {
                 let voice = NSSpeechSynthesizer.VoiceName(rawValue: fields[2])
+                selectedVoice = voice
                 if !synthesizer.setVoice(voice) {
-                    // Match the existing Codex voice fallback rather than
-                    // dropping the entire utterance when a voice was removed.
-                    emit("WARN\trequested voice unavailable; using system default")
+                    emit("ERROR\tconfigured speech voice unavailable")
+                    exit(1)
                 }
             }
             // NSSpeechSynthesizer ignores rate updates during an active
@@ -87,8 +121,11 @@ private final class SpeechService: NSObject, NSSpeechSynthesizerDelegate {
         case "BACK", "NEXT":
             seek(back: verb == "BACK")
         case "PAUSE":
+            paused = true
+            gapTimer?.invalidate()
             if started { synthesizer.pauseSpeaking(at: NSSpeechSynthesizer.Boundary(rawValue: 0)!) }
         case "RESUME":
+            paused = false
             if started { synthesizer.continueSpeaking() }
         case "RATE":
             if fields.count == 2, let rate = Float(fields[1]), rate > 0 {
@@ -105,8 +142,25 @@ private final class SpeechService: NSObject, NSSpeechSynthesizerDelegate {
 
     func speechSynthesizer(_ sender: NSSpeechSynthesizer, willSpeakWord range: NSRange, of string: String) {
         guard sender === synthesizer else { return }
-        current = base + range.location
-        emit("WORD\t\(current)\t\(range.length)")
+        let reported = base + range.location
+        // Some system voices include the preceding space in their word offset.
+        // AppKit may still report the length of the word without that space.
+        var first = reported
+        while first < source.length && first < reported + range.length {
+            if wordIndex[first] != nil { break }
+            guard let scalar = UnicodeScalar(source.character(at: first)),
+                  CharacterSet.whitespacesAndNewlines.union(.punctuationCharacters).contains(scalar)
+            else { break }
+            first += 1
+        }
+        guard first >= lastEmitted else { return }
+        gapTimer?.invalidate()
+        let index = wordIndex[first]
+        let word = index.map { words[$0] }
+        current = word?.location ?? reported
+        lastEmitted = current
+        emit("WORD\t\(current)\t\(word?.length ?? range.length)")
+        if let index { scheduleAdjacentWord(after: index) }
     }
 
     func speechSynthesizer(_ sender: NSSpeechSynthesizer, didFinishSpeaking finished: Bool) {

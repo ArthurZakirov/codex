@@ -199,6 +199,8 @@ pub(super) struct RealtimeConversationUiState {
     #[cfg(target_os = "macos")]
     verbatim_speech_task: Option<tokio::task::JoinHandle<()>>,
     #[cfg(target_os = "macos")]
+    retiring_speech_task: Option<tokio::task::JoinHandle<()>>,
+    #[cfg(target_os = "macos")]
     verbatim_speech_sender:
         Option<tokio::sync::mpsc::UnboundedSender<verbatim_speech::SpeechQueueItem>>,
     #[cfg(target_os = "macos")]
