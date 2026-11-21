@@ -1238,7 +1238,10 @@ impl App {
                 if self.chat_widget.realtime_verbatim_speech_active() {
                     return Ok(AppRunControl::Continue);
                 }
-            } else if self.chat_widget.set_verbatim_speech_paused(key.modifiers == KeyModifiers::NONE) {
+            } else if self
+                .chat_widget
+                .set_verbatim_speech_paused(key.modifiers == KeyModifiers::NONE)
+            {
                 return Ok(AppRunControl::Continue);
             }
         }
