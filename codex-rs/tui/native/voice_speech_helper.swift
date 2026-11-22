@@ -22,6 +22,9 @@ private final class SpeechService: NSObject, NSSpeechSynthesizerDelegate, AVAudi
     private var paused = false
     private var audioURL: URL?
     private var cues: [(range: NSRange, fileOffset: Int64)] = []
+    private typealias Playback = (player: AVAudioPlayer, cues: [(range: NSRange, fileOffset: Int64)], offset: Int64, rate: Double, index: Int)
+    private var buffered: Playback?
+    private var active: Playback?
     private var cueIndex = 0
     private var dataOffset: Int64 = 0
     private var bytesPerSecond: Double = 1
@@ -31,6 +34,8 @@ private final class SpeechService: NSObject, NSSpeechSynthesizerDelegate, AVAudi
         playbackTimer = nil
         player?.stop()
         player = nil
+        active = nil
+        buffered = nil
         if let url = audioURL { try? FileManager.default.removeItem(at: url) }
         audioURL = nil
         cues.removeAll(keepingCapacity: true)
@@ -38,13 +43,12 @@ private final class SpeechService: NSObject, NSSpeechSynthesizerDelegate, AVAudi
     }
 
     private func renderParagraph(at index: Int) {
-        clearPlayback()
+        cues.removeAll(keepingCapacity: true)
         guard starts.indices.contains(index) else {
             emit("DONE\ttrue")
             exit(0)
         }
         base = starts[index]
-        current = base
         let end = index + 1 < starts.count ? starts[index + 1] : source.length
         let paragraph = source.substring(with: NSRange(location: base, length: end - base))
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("codex-speech-\(UUID().uuidString).aiff")
@@ -90,10 +94,10 @@ private final class SpeechService: NSObject, NSSpeechSynthesizerDelegate, AVAudi
     }
 
     private func updatePlayback() {
-        guard let player, !paused else { return }
-        let offset = dataOffset + Int64(player.currentTime * bytesPerSecond)
-        while cueIndex < cues.count && cues[cueIndex].fileOffset <= offset {
-            let word = cues[cueIndex].range
+        guard let player, let active, !paused else { return }
+        let offset = active.offset + Int64(player.currentTime * active.rate)
+        while cueIndex < active.cues.count && active.cues[cueIndex].fileOffset <= offset {
+            let word = active.cues[cueIndex].range
             current = word.location
             emit("WORD\t\(word.location)\t\(word.length)")
             cueIndex += 1
@@ -215,19 +219,36 @@ private final class SpeechService: NSObject, NSSpeechSynthesizerDelegate, AVAudi
             }
             let output = try AVAudioPlayer(contentsOf: url)
             expandPhraseCues(audioEnd: dataOffset + Int64(output.duration * bytesPerSecond))
-            player = output
-            output.delegate = self
-            output.volume = muted ? 0 : 1
-            guard output.prepareToPlay(), paused || output.play() else { throw CocoaError(.fileReadUnknown) }
+            guard output.prepareToPlay(), let index = starts.firstIndex(of: base) else { throw CocoaError(.fileReadUnknown) }
+            buffered = (output, cues, dataOffset, bytesPerSecond, index)
             try? FileManager.default.removeItem(at: url)
             audioURL = nil
-            playbackTimer = Timer.scheduledTimer(withTimeInterval: 0.015, repeats: true) { [weak self] _ in
-                self?.updatePlayback()
-            }
+            if player == nil { playBuffered() }
         } catch {
             clearPlayback()
             emit("ERROR\tcould not play rendered speech: \(error.localizedDescription)")
             exit(1)
+        }
+    }
+
+    private func playBuffered() {
+        guard let next = buffered else { return }
+        buffered = nil
+        active = next
+        current = starts[next.index]
+        cueIndex = 0
+        player = next.player
+        next.player.delegate = self
+        next.player.volume = muted ? 0 : 1
+        guard paused || next.player.play() else {
+            emit("ERROR\tcould not start paragraph playback")
+            exit(1)
+        }
+        playbackTimer = Timer.scheduledTimer(withTimeInterval: 0.015, repeats: true) { [weak self] _ in
+            self?.updatePlayback()
+        }
+        if next.index + 1 < starts.count {
+            renderParagraph(at: next.index + 1)
         }
     }
 
@@ -238,8 +259,13 @@ private final class SpeechService: NSObject, NSSpeechSynthesizerDelegate, AVAudi
             emit("ERROR\taudio output interrupted")
             exit(1)
         }
-        let next = (starts.firstIndex(of: base) ?? 0) + 1
-        renderParagraph(at: next)
+        playbackTimer?.invalidate()
+        self.player = nil
+        if active?.index == starts.count - 1 {
+            emit("DONE\ttrue")
+            exit(0)
+        }
+        playBuffered()
     }
 
 }
