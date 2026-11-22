@@ -431,6 +431,22 @@ async fn voice_waits_for_peer_when_backend_starts_first() {
 }
 
 #[tokio::test]
+async fn replacing_an_attachment_keeps_the_new_offer_until_its_started_event() {
+    let (mut chat, _sender, _events, _ops) = make_chatwidget_manual_with_sender().await;
+    let thread = ThreadId::new();
+    chat.thread_id = Some(thread);
+    start_voice_attempt_for_test(&mut chat, thread, 17);
+    chat.on_realtime_conversation_closed(Some("requested".into()));
+    assert!(chat.is_starting_realtime_attempt(thread, 17));
+    chat.on_realtime_conversation_started();
+    chat.on_realtime_webrtc_connected(17, Ok(()));
+    assert_eq!(
+        chat.realtime_conversation.phase,
+        RealtimeConversationPhase::Active
+    );
+}
+
+#[tokio::test]
 async fn interrupted_dictation_keeps_draft_and_mute_and_waits_for_cleanup() {
     for message in [
         "Your session hit the maximum duration of 60 minutes.",

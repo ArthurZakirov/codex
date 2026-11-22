@@ -2383,6 +2383,14 @@ impl ChatWidget {
             }
             return;
         }
+        // Starting a replacement on the same thread first emits the previous
+        // attachment's requested close, before the new attachment's Started.
+        if reason.as_deref() == Some("requested")
+            && self.realtime_conversation.phase == RealtimeConversationPhase::Starting
+            && !self.realtime_conversation.backend_started
+        {
+            return;
+        }
         let renew_dictation = self.realtime_conversation.startup_retry
             == StartupRetry::RenewingConnection
             || (self.realtime_conversation.phase == RealtimeConversationPhase::Active
@@ -2421,7 +2429,6 @@ impl ChatWidget {
             };
             self.record_realtime_failure(cause);
         }
-        let failed = self.realtime_conversation.failure_recorded;
         let session_lock =
             retry_thread_id.and_then(|_| self.realtime_conversation.session_lock.take());
         self.reset_realtime_connection(renew_dictation && retry_thread_id.is_some());
@@ -2444,11 +2451,10 @@ impl ChatWidget {
             return;
         }
         if let Some(reason) = reason
-            && reason != "error"
-            && !(failed && reason == "requested")
+            && !matches!(reason.as_str(), "error" | "requested")
         {
             let message = format!("Voice conversation ended: {reason}");
-            if self.app_event_tx.voice_only.load(Ordering::Relaxed) && reason != "requested" {
+            if self.app_event_tx.voice_only.load(Ordering::Relaxed) {
                 self.add_realtime_error(message);
             } else {
                 self.add_info_message(message, /*hint*/ None);
