@@ -87,9 +87,7 @@ impl RealtimeWebrtcSession {
             target_os = "macos",
             target_os = "linux",
             all(windows, target_env = "msvc")
-        )) && codex_install_context::InstallContext::current()
-            .package_layout
-            .as_ref()
+        )) && codex_install_context::CodexPackageLayout::for_running_voice()
             .is_some_and(|package| package_has_runtime(package.package_dir.as_path()))
     }
 
@@ -107,9 +105,7 @@ impl RealtimeWebrtcSession {
         selection: AudioDeviceSelection,
         lease: Option<Arc<std::fs::File>>,
     ) -> Result<StartedRealtimeWebrtcSession> {
-        let package = codex_install_context::InstallContext::current()
-            .package_layout
-            .clone()
+        let package = codex_install_context::CodexPackageLayout::for_running_voice()
             .ok_or_else(|| anyhow::anyhow!("voice package unavailable"))?;
         let build_commit = codex_build_info::BuildInfo::get().build_commit().to_owned();
         let (sender, receiver) = mpsc::channel(/*buffer*/ 8);

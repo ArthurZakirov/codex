@@ -137,11 +137,17 @@ enum RealtimeTurnOrigin {
     },
 }
 
+fn recoverable_dictation_error(message: &str) -> bool {
+    message == "Your session hit the maximum duration of 60 minutes."
+        || message.ends_with("WebSocket protocol error: Connection reset without closing handshake")
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum StartupRetry {
     #[default]
     Available,
     WaitingForStop,
+    RenewingConnection,
     Used,
 }
 
@@ -2332,6 +2338,33 @@ impl ChatWidget {
         if self.realtime_conversation.phase == RealtimeConversationPhase::Inactive {
             return;
         }
+        if self.realtime_conversation.phase == RealtimeConversationPhase::Active
+            && self.realtime_conversation.dictation
+            && cause == RealtimeFailureCause::Backend
+            && recoverable_dictation_error(&message)
+            && let Some(thread_id) = self.realtime_conversation.thread_id
+        {
+            self.finish_realtime_partial_transcripts();
+            if let Some(handle) = self.realtime_conversation.handle.take() {
+                handle.close();
+            }
+            self.realtime_conversation.phase = RealtimeConversationPhase::Stopping;
+            self.realtime_conversation.startup_retry = StartupRetry::RenewingConnection;
+            self.bottom_pane.set_voice_strip(None);
+            if self.submit_op(AppCommand::RealtimeConversationStop { thread_id }) {
+                self.request_redraw();
+                return;
+            }
+            self.reset_realtime_conversation();
+            self.add_realtime_error(message);
+            return;
+        }
+        if self.realtime_conversation.startup_retry == StartupRetry::RenewingConnection
+            && cause == RealtimeFailureCause::Backend
+            && recoverable_dictation_error(&message)
+        {
+            return;
+        }
         if self.realtime_conversation.phase != RealtimeConversationPhase::Stopping
             || self.realtime_retry_cleanup_pending()
         {
@@ -2350,6 +2383,19 @@ impl ChatWidget {
             }
             return;
         }
+        // Starting a replacement on the same thread first emits the previous
+        // attachment's requested close, before the new attachment's Started.
+        if reason.as_deref() == Some("requested")
+            && self.realtime_conversation.phase == RealtimeConversationPhase::Starting
+            && !self.realtime_conversation.backend_started
+        {
+            return;
+        }
+        let renew_dictation = self.realtime_conversation.startup_retry
+            == StartupRetry::RenewingConnection
+            || (self.realtime_conversation.phase == RealtimeConversationPhase::Active
+                && self.realtime_conversation.dictation
+                && reason.as_deref() == Some("transport_closed"));
         let retry_after_stop =
             self.realtime_conversation.startup_retry == StartupRetry::WaitingForStop;
         let retry_after_early_close = self.realtime_conversation.phase
@@ -2367,7 +2413,7 @@ impl ChatWidget {
         self.finish_realtime_partial_transcripts();
         let muted = self.realtime_conversation.microphone_muted;
         let thread_id = self.realtime_conversation.thread_id;
-        let retry_thread_id = if retry_after_stop || retry_after_early_close {
+        let retry_thread_id = if retry_after_stop || retry_after_early_close || renew_dictation {
             thread_id.filter(|id| Some(*id) == self.thread_id())
         } else {
             None
@@ -2383,14 +2429,17 @@ impl ChatWidget {
             };
             self.record_realtime_failure(cause);
         }
-        let failed = self.realtime_conversation.failure_recorded;
         let session_lock =
             retry_thread_id.and_then(|_| self.realtime_conversation.session_lock.take());
-        self.reset_realtime_conversation();
+        self.reset_realtime_connection(renew_dictation && retry_thread_id.is_some());
         if let Some(thread_id) = retry_thread_id {
             self.realtime_conversation.session_lock = session_lock;
             // The old backend is closed. A late peer result belongs to its attempt ID.
-            self.realtime_conversation.startup_retry = StartupRetry::Used;
+            self.realtime_conversation.startup_retry = if renew_dictation {
+                StartupRetry::Available
+            } else {
+                StartupRetry::Used
+            };
             self.realtime_conversation.microphone_muted = muted;
             if retry_after_early_close {
                 self.add_info_message(
@@ -2402,11 +2451,10 @@ impl ChatWidget {
             return;
         }
         if let Some(reason) = reason
-            && reason != "error"
-            && !(failed && reason == "requested")
+            && !matches!(reason.as_str(), "error" | "requested")
         {
             let message = format!("Voice conversation ended: {reason}");
-            if self.app_event_tx.voice_only.load(Ordering::Relaxed) && reason != "requested" {
+            if self.app_event_tx.voice_only.load(Ordering::Relaxed) {
                 self.add_realtime_error(message);
             } else {
                 self.add_info_message(message, /*hint*/ None);
@@ -2442,8 +2490,16 @@ impl ChatWidget {
     }
 
     pub(crate) fn reset_realtime_conversation(&mut self) -> Option<ThreadId> {
+        self.reset_realtime_connection(false)
+    }
+
+    fn reset_realtime_connection(&mut self, keep_narration: bool) -> Option<ThreadId> {
+        #[cfg(not(target_os = "macos"))]
+        let _ = keep_narration;
         #[cfg(target_os = "macos")]
-        self.cancel_verbatim_speech();
+        if !keep_narration {
+            self.cancel_verbatim_speech();
+        }
         if self.realtime_conversation_is_running() {
             self.app_event_tx
                 .send(AppEvent::RealtimeConversationStateChanged);
@@ -2523,7 +2579,7 @@ impl ChatWidget {
             .live_transcript_cells()
             .next()
             .is_some();
-        self.realtime_conversation = RealtimeConversationUiState {
+        let mut next = RealtimeConversationUiState {
             attempt_id: self.realtime_conversation.attempt_id,
             dictation: self.realtime_conversation.dictation,
             // Keep parked speech tied to its input until it is taken for replay.
@@ -2534,6 +2590,34 @@ impl ChatWidget {
             delegated_reasoning_turns,
             ..RealtimeConversationUiState::default()
         };
+        #[cfg(target_os = "macos")]
+        if keep_narration {
+            std::mem::swap(
+                &mut next.verbatim_speech_task,
+                &mut self.realtime_conversation.verbatim_speech_task,
+            );
+            std::mem::swap(
+                &mut next.retiring_speech_task,
+                &mut self.realtime_conversation.retiring_speech_task,
+            );
+            std::mem::swap(
+                &mut next.verbatim_speech_sender,
+                &mut self.realtime_conversation.verbatim_speech_sender,
+            );
+            std::mem::swap(
+                &mut next.spoken_line_progress,
+                &mut self.realtime_conversation.spoken_line_progress,
+            );
+            std::mem::swap(
+                &mut next.verbatim_speech_control,
+                &mut self.realtime_conversation.verbatim_speech_control,
+            );
+            std::mem::swap(
+                &mut next.narrated_agent_items,
+                &mut self.realtime_conversation.narrated_agent_items,
+            );
+        }
+        self.realtime_conversation = next;
         if had_live_transcript {
             self.bump_active_cell_revision();
         }

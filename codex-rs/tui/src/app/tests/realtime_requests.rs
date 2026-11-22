@@ -321,6 +321,7 @@ async fn voice_cancel_restart_only_attaches_the_new_attempt() -> Result<()> {
                 attempt_id,
             );
             let command = AppEvent::CodexOp(Op::RealtimeConversationStart {
+                dictation: false,
                 thread_id,
                 attempt_id,
                 offer_sdp: String::from("v=0").into(),

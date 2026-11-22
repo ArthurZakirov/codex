@@ -1,6 +1,8 @@
 // Word-position-aware macOS speech worker. All AppKit calls stay on the process main thread.
 // stdin: SPEAK<TAB>base64(UTF-8)<TAB>voice-id<TAB>rate-multiplier[<TAB>UTF-16 paragraph start], PAUSE, RESUME, STOP
 // stdout: WORD<TAB>utf16-start<TAB>utf16-length, DONE, ERROR<TAB>reason
+import AVFoundation
+import AudioToolbox
 import AppKit
 import Foundation
 
@@ -9,30 +11,67 @@ private func emit(_ message: String) {
     fflush(stdout)
 }
 
-private final class SpeechService: NSObject, NSSpeechSynthesizerDelegate {
+private final class SpeechService: NSObject, NSSpeechSynthesizerDelegate, AVAudioPlayerDelegate {
     private var synthesizer = NSSpeechSynthesizer()
     private var source: NSString = ""
     private var starts = [0]
-    private var wordIndex: [Int: Int] = [:]
-    private var words: [NSRange] = []
-    private var gapTimer: Timer?
+    // Render one paragraph at a time. The live NSSpeech output can finish after
+    // a few words even though the same voice renders the entire paragraph to file.
+    private var player: AVAudioPlayer?
+    private var playbackTimer: Timer?
     private var paused = false
-    private var lastEmitted = -1
+    private var audioURL: URL?
+    private var cues: [(range: NSRange, fileOffset: Int64)] = []
+    private var cueIndex = 0
+    private var dataOffset: Int64 = 0
+    private var bytesPerSecond: Double = 1
 
-    // AppKit can omit a short word between two real callbacks. Bridge one word
-    // within the same phrase. Every native callback takes precedence.
-    private func scheduleAdjacentWord(after index: Int) {
-        guard !paused, words.indices.contains(index + 1) else { return }
-        let word = words[index]
-        let next = words[index + 1]
-        let gap = source.substring(with: NSRange(location: NSMaxRange(word), length: next.location - NSMaxRange(word)))
-        guard !gap.isEmpty, gap.allSatisfy({ $0 == " " || $0 == "\t" }) else { return }
-        let seconds = 60 / Double(max(synthesizer.rate, 1))
-        let weight = min(1.35, max(0.55, Double(word.length) / 5))
-        gapTimer = Timer.scheduledTimer(withTimeInterval: seconds * weight, repeats: false) { [weak self] _ in
-            guard let self, !self.paused else { return }
-            self.lastEmitted = next.location
-            emit("WORD\t\(next.location)\t\(next.length)")
+    private func clearPlayback() {
+        playbackTimer?.invalidate()
+        playbackTimer = nil
+        player?.stop()
+        player = nil
+        if let url = audioURL { try? FileManager.default.removeItem(at: url) }
+        audioURL = nil
+        cues.removeAll(keepingCapacity: true)
+        cueIndex = 0
+    }
+
+    private func renderParagraph(at index: Int) {
+        clearPlayback()
+        guard starts.indices.contains(index) else {
+            emit("DONE\ttrue")
+            exit(0)
+        }
+        base = starts[index]
+        current = base
+        let end = index + 1 < starts.count ? starts[index + 1] : source.length
+        let paragraph = source.substring(with: NSRange(location: base, length: end - base))
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("codex-speech-\(UUID().uuidString).aiff")
+        // The renderer writes dictated content; make the temporary file owner-only.
+        guard FileManager.default.createFile(atPath: url.path, contents: nil, attributes: [.posixPermissions: 0o600]) else {
+            emit("ERROR\tcannot create temporary speech audio")
+            exit(1)
+        }
+        audioURL = url
+        // A right arrow causes some macOS voices to report the whole sentence
+        // as one word. A comma keeps the pause and the original UTF-16 offsets.
+        let narration = paragraph.replacingOccurrences(of: "→", with: ",")
+        if !synthesizer.startSpeaking(narration, to: url) {
+            clearPlayback()
+            emit("ERROR\tcannot render speech audio")
+            exit(1)
+        }
+    }
+
+    private func updatePlayback() {
+        guard let player, !paused else { return }
+        let offset = dataOffset + Int64(player.currentTime * bytesPerSecond)
+        while cueIndex < cues.count && cues[cueIndex].fileOffset <= offset {
+            let word = cues[cueIndex].range
+            current = word.location
+            emit("WORD\t\(word.location)\t\(word.length)")
+            cueIndex += 1
         }
     }
     private var base = 0
@@ -45,7 +84,7 @@ private final class SpeechService: NSObject, NSSpeechSynthesizerDelegate {
         let index = starts.lastIndex(where: { $0 <= current }) ?? 0
         let target = back ? index - 1 : index + 1
         guard starts.indices.contains(target) else { return }
-        gapTimer?.invalidate()
+        clearPlayback()
         let old = synthesizer
         old.delegate = nil
         old.stopSpeaking()
@@ -56,14 +95,7 @@ private final class SpeechService: NSObject, NSSpeechSynthesizerDelegate {
         synthesizer = replacement
         synthesizer.delegate = self
         synthesizer.rate = old.rate
-        synthesizer.volume = muted ? 0 : 1
-        lastEmitted = -1
-        base = starts[target]
-        current = base
-        if !synthesizer.startSpeaking(source.substring(from: base)) {
-            emit("ERROR\tfailed to restart speech")
-            exit(1)
-        }
+        renderParagraph(at: target)
     }
     private var started = false
 
@@ -81,11 +113,6 @@ private final class SpeechService: NSObject, NSSpeechSynthesizerDelegate {
                 exit(1)
             }
             source = message as NSString
-            message.enumerateSubstrings(in: message.startIndex..<message.endIndex, options: [.byWords, .substringNotRequired]) { _, range, _, _ in
-                let word = NSRange(range, in: message)
-                self.wordIndex[word.location] = self.words.count
-                self.words.append(word)
-            }
             var offset = 0
             for line in message.components(separatedBy: "\n") {
                 if offset > 0 && !line.isEmpty { starts.append(offset) }
@@ -110,29 +137,26 @@ private final class SpeechService: NSObject, NSSpeechSynthesizerDelegate {
             // NSSpeechSynthesizer ignores rate updates during an active
             // utterance; set it after voice selection but before playback.
             synthesizer.rate *= multiplier
-            synthesizer.volume = muted ? 0 : 1
-            if !synthesizer.startSpeaking(source.substring(from: base)) {
-                emit("ERROR\tfailed to start speech")
-                exit(1)
-            }
+            renderParagraph(at: starts.firstIndex(of: start)!)
         case "MUTE", "UNMUTE":
             muted = verb == "MUTE"
-            synthesizer.volume = muted ? 0 : 1
+            player?.volume = muted ? 0 : 1
         case "BACK", "NEXT":
             seek(back: verb == "BACK")
         case "PAUSE":
             paused = true
-            gapTimer?.invalidate()
-            if started { synthesizer.pauseSpeaking(at: NSSpeechSynthesizer.Boundary(rawValue: 0)!) }
+            player?.pause()
         case "RESUME":
             paused = false
-            if started { synthesizer.continueSpeaking() }
+            if let player, !player.isPlaying { _ = player.play() }
         case "RATE":
             if fields.count == 2, let rate = Float(fields[1]), rate > 0 {
                 synthesizer.rate = rate
             }
         case "STOP":
+            synthesizer.delegate = nil
             if started { synthesizer.stopSpeaking() }
+            clearPlayback()
             exit(0)
         default:
             emit("ERROR\tunknown command")
@@ -142,41 +166,56 @@ private final class SpeechService: NSObject, NSSpeechSynthesizerDelegate {
 
     func speechSynthesizer(_ sender: NSSpeechSynthesizer, willSpeakWord range: NSRange, of string: String) {
         guard sender === synthesizer else { return }
-        let reported = base + range.location
-        // Some system voices include the preceding space in their word offset.
-        // AppKit may still report the length of the word without that space.
-        var first = reported
-        while first < source.length && first < reported + range.length {
-            if wordIndex[first] != nil { break }
-            guard let scalar = UnicodeScalar(source.character(at: first)),
-                  CharacterSet.whitespacesAndNewlines.union(.punctuationCharacters).contains(scalar)
-            else { break }
-            first += 1
-        }
-        guard first >= lastEmitted else { return }
-        gapTimer?.invalidate()
-        let index = wordIndex[first]
-        let word = index.map { words[$0] }
-        current = word?.location ?? reported
-        lastEmitted = current
-        emit("WORD\t\(current)\t\(word?.length ?? range.length)")
-        if let index { scheduleAdjacentWord(after: index) }
+        guard let url = audioURL, range.location != NSNotFound, range.length > 0,
+              NSMaxRange(range) <= source.length - base,
+              let size = try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize else { return }
+        cues.append((NSRange(location: base + range.location, length: range.length), Int64(size)))
     }
 
     func speechSynthesizer(_ sender: NSSpeechSynthesizer, didFinishSpeaking finished: Bool) {
-        guard sender === synthesizer else { return }
-        guard finished else {
-            emit("DONE\tfalse")
+        guard sender === synthesizer, let url = audioURL else { return }
+        do {
+            guard finished else { throw CocoaError(.fileReadUnknown) }
+            let file = try AVAudioFile(forReading: url)
+            let format = file.fileFormat.streamDescription.pointee
+            bytesPerSecond = format.mSampleRate * Double(format.mBytesPerFrame)
+            var audioFile: AudioFileID?
+            guard bytesPerSecond > 0,
+                  AudioFileOpenURL(url as CFURL, .readPermission, 0, &audioFile) == noErr,
+                  let audioFile else { throw CocoaError(.fileReadCorruptFile) }
+            defer { AudioFileClose(audioFile) }
+            var size = UInt32(MemoryLayout<Int64>.size)
+            guard AudioFileGetProperty(audioFile, kAudioFilePropertyDataOffset, &size, &dataOffset) == noErr else {
+                throw CocoaError(.fileReadCorruptFile)
+            }
+            let output = try AVAudioPlayer(contentsOf: url)
+            player = output
+            output.delegate = self
+            output.volume = muted ? 0 : 1
+            guard output.prepareToPlay(), paused || output.play() else { throw CocoaError(.fileReadUnknown) }
+            try? FileManager.default.removeItem(at: url)
+            audioURL = nil
+            playbackTimer = Timer.scheduledTimer(withTimeInterval: 0.015, repeats: true) { [weak self] _ in
+                self?.updatePlayback()
+            }
+        } catch {
+            clearPlayback()
+            emit("ERROR\tcould not play rendered speech: \(error.localizedDescription)")
             exit(1)
         }
-        // Keep the worker and its audio lease alive while the output device
-        // drains buffered speech. STOP remains immediate during this interval.
-        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(500)) {
-            guard sender === self.synthesizer else { return }
-            emit("DONE\ttrue")
-            exit(0)
-        }
     }
+
+    func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
+        guard player === self.player else { return }
+        guard flag else {
+            clearPlayback()
+            emit("ERROR\taudio output interrupted")
+            exit(1)
+        }
+        let next = (starts.firstIndex(of: base) ?? 0) + 1
+        renderParagraph(at: next)
+    }
+
 }
 
 private let service = SpeechService()

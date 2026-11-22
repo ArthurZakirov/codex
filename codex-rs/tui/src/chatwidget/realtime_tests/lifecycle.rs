@@ -431,6 +431,70 @@ async fn voice_waits_for_peer_when_backend_starts_first() {
 }
 
 #[tokio::test]
+async fn replacing_an_attachment_keeps_the_new_offer_until_its_started_event() {
+    let (mut chat, _sender, _events, _ops) = make_chatwidget_manual_with_sender().await;
+    let thread = ThreadId::new();
+    chat.thread_id = Some(thread);
+    start_voice_attempt_for_test(&mut chat, thread, 17);
+    chat.on_realtime_conversation_closed(Some("requested".into()));
+    assert!(chat.is_starting_realtime_attempt(thread, 17));
+    chat.on_realtime_conversation_started();
+    chat.on_realtime_webrtc_connected(17, Ok(()));
+    assert_eq!(
+        chat.realtime_conversation.phase,
+        RealtimeConversationPhase::Active
+    );
+}
+
+#[tokio::test]
+async fn interrupted_dictation_keeps_draft_and_mute_and_waits_for_cleanup() {
+    for message in [
+        "Your session hit the maximum duration of 60 minutes.",
+        "failed to connect realtime websocket: WebSocket protocol error: Connection reset without closing handshake",
+    ] {
+        let (mut chat, _sender, _events, mut ops) = make_chatwidget_manual_with_sender().await;
+        let thread_id = activate_voice(&mut chat);
+        chat.realtime_conversation.dictation = true;
+        chat.realtime_conversation.microphone_muted = true;
+        chat.bottom_pane.append_dictated_text("Ein Entwurf");
+        chat.on_realtime_error(message.into(), RealtimeFailureCause::Backend);
+        assert!(
+            matches!(ops.try_recv(), Ok(AppCommand::RealtimeConversationStop { thread_id: owner }) if owner == thread_id)
+        );
+        chat.on_realtime_conversation_closed(Some("error".into()));
+        assert_eq!(
+            chat.realtime_conversation.phase,
+            RealtimeConversationPhase::Stopping
+        );
+        chat.on_realtime_conversation_closed(Some("requested".into()));
+        assert_eq!(
+            chat.realtime_conversation.phase,
+            RealtimeConversationPhase::Starting
+        );
+        assert!(chat.realtime_conversation.microphone_muted);
+        assert!(chat.realtime_conversation.dictation);
+        assert_eq!(chat.bottom_pane.composer_text(), "Ein Entwurf");
+    }
+}
+
+#[tokio::test]
+async fn stopping_dictation_during_renewal_cancels_the_restart() {
+    let (mut chat, _sender, _events, _ops) = make_chatwidget_manual_with_sender().await;
+    activate_voice(&mut chat);
+    chat.realtime_conversation.dictation = true;
+    chat.on_realtime_error(
+        "Your session hit the maximum duration of 60 minutes.".into(),
+        RealtimeFailureCause::Backend,
+    );
+    chat.stop_realtime_conversation();
+    chat.on_realtime_conversation_closed(Some("requested".into()));
+    assert_eq!(
+        chat.realtime_conversation.phase,
+        RealtimeConversationPhase::Inactive
+    );
+}
+
+#[tokio::test]
 async fn startup_retry_waits_for_closed_then_uses_a_fresh_attempt_and_preserves_mute() {
     let (mut chat, _sender, mut events, mut ops) = make_chatwidget_manual_with_sender().await;
     let thread_id = activate_voice(&mut chat);
@@ -591,7 +655,7 @@ async fn session_lock_stops_a_parked_call_and_ignores_its_late_notice_after_rest
         ))
     );
 
-    chat.start_realtime_conversation(thread_id);
+    chat.start_realtime_conversation(thread_id, false);
     chat.stop_if_session_locked();
     assert_eq!(
         chat.realtime_conversation.phase,

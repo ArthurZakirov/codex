@@ -100,10 +100,18 @@ jobs:
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@d124f86f28ff42855784ff3319f48ac182c248f8 # 1.99.1
+      - name: Resolve fork workspace with the package build configuration
+        working-directory: codex-rs
+        run: cargo metadata --format-version 1 > /dev/null
       - name: Typecheck Codex TUI on macOS
-        run: cargo check --manifest-path codex-rs/Cargo.toml -p codex-tui --lib --locked -j 2
+        working-directory: codex-rs
+        run: cargo check -p codex-tui --lib --locked -j 2
+      - name: Test realtime lifecycle
+        working-directory: codex-rs
+        run: cargo test -p codex-tui --lib realtime_tests::lifecycle --locked -j 2 -- --test-threads=1
       - name: Test local voice playback
-        run: cargo test --manifest-path codex-rs/Cargo.toml -p codex-tui --lib verbatim_speech::tests --locked -j 2
+        working-directory: codex-rs
+        run: cargo test -p codex-tui --lib verbatim_speech::tests --locked -j 2
 
   repo-checks:
     name: repo-checks

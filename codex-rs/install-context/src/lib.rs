@@ -230,6 +230,37 @@ impl InstallContext {
 }
 
 impl CodexPackageLayout {
+    /// macOS can rename a running package into a backup during an update.
+    /// Resolve its mapped executable at helper launch time so the child uses
+    /// the same physical release as its parent.
+    pub fn for_running_voice() -> Option<Self> {
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            #[link(name = "proc")]
+            unsafe extern "C" {
+                fn proc_regionfilename(pid: i32, address: u64, buffer: *mut u8, size: u32) -> i32;
+            }
+            let mut bytes = [0_u8; 4096];
+            // SAFETY: query our own mapped function; the kernel writes at most bytes.len().
+            let size = unsafe {
+                proc_regionfilename(
+                    std::process::id() as i32,
+                    Self::for_running_voice as *const () as usize as u64,
+                    bytes.as_mut_ptr(),
+                    bytes.len() as u32,
+                )
+            };
+            if size > 0 && (size as usize) < bytes.len() {
+                let path = &bytes[..size as usize];
+                return Self::from_exe(Path::new(OsStr::from_bytes(
+                    path.strip_suffix(&[0]).unwrap_or(path),
+                )));
+            }
+        }
+        InstallContext::current().package_layout.clone()
+    }
+
     fn from_exe(exe_path: &Path) -> Option<Self> {
         let canonical_exe = canonical_absolute_path(exe_path)?;
         let exe_dir = canonical_exe.parent()?;
