@@ -639,7 +639,7 @@ async fn session_lock_stops_a_parked_call_and_ignores_its_late_notice_after_rest
         ))
     );
 
-    chat.start_realtime_conversation(thread_id);
+    chat.start_realtime_conversation(thread_id, false);
     chat.stop_if_session_locked();
     assert_eq!(
         chat.realtime_conversation.phase,
