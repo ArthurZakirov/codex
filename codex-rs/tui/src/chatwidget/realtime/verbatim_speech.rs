@@ -465,7 +465,10 @@ fn configured_speech_rate_multiplier() -> f32 {
 /// The original Markdown remains unchanged in the chat history.
 pub(crate) fn markdown_to_spoken_text(markdown: &str) -> String {
     let mut spoken = String::new();
-    for event in Parser::new(spoken_markdown_without_checkout_footers(markdown)) {
+    for event in Parser::new_ext(
+        spoken_markdown_without_checkout_footers(markdown),
+        pulldown_cmark::Options::ENABLE_TABLES,
+    ) {
         match event {
             Event::Text(text) | Event::Code(text) => spoken.push_str(&text),
             Event::SoftBreak if reading_controls().navigation => spoken.push(' '),
@@ -486,13 +489,19 @@ pub(crate) fn markdown_to_spoken_text(markdown: &str) -> String {
                 | TagEnd::Heading(_)
                 | TagEnd::Item
                 | TagEnd::CodeBlock
+                | TagEnd::TableHead
                 | TagEnd::TableRow,
             ) => {
                 if !spoken.ends_with('\n') {
                     spoken.push('\n');
                 }
             }
-            Event::End(TagEnd::TableCell) => spoken.push_str(". "),
+            Event::End(TagEnd::TableCell) => {
+                if !spoken.ends_with(['.', '!', '?', '\n']) {
+                    spoken.push('.');
+                }
+                spoken.push(' ');
+            }
             Event::TaskListMarker(checked) => {
                 spoken.push_str(if checked { "checked. " } else { "unchecked. " });
             }
@@ -1074,6 +1083,20 @@ mod tests {
         assert_eq!(
             super::detect_speech_language("git switch feature; cargo test"),
             super::SpeechLanguage::English
+        );
+    }
+
+    #[test]
+    fn linked_table_cells_keep_the_full_sentence_and_separate_rows() {
+        let markdown = "| Reviewer | Summary |\n|---|---|\n| [Standards](/tmp/link) | Checks two explicit conventions about argument parsing, formatting, and import-time behavior. |\n| Correctness | Exercises edge cases. |";
+        let spoken = markdown_to_spoken_text(markdown);
+        assert_eq!(
+            spoken.lines().map(str::trim_end).collect::<Vec<_>>(),
+            [
+                "Reviewer. Summary.",
+                "Standards. Checks two explicit conventions about argument parsing, formatting, and import-time behavior.",
+                "Correctness. Exercises edge cases.",
+            ]
         );
     }
 
