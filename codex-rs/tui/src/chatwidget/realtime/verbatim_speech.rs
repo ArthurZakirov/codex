@@ -212,10 +212,9 @@ fn speech_helper_path() -> Option<std::path::PathBuf> {
         let path = std::path::PathBuf::from(override_path);
         return path.is_file().then_some(path);
     }
-    let path = std::env::current_exe()
-        .ok()?
-        .parent()?
-        .parent()?
+    let path = codex_install_context::CodexPackageLayout::for_running_voice()?
+        .package_dir
+        .as_path()
         .join("codex-resources/voice/bin/codex-voice-speech-helper");
     path.is_file().then_some(path)
 }
