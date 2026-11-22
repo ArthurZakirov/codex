@@ -64,6 +64,31 @@ private final class SpeechService: NSObject, NSSpeechSynthesizerDelegate, AVAudi
         }
     }
 
+    // Some voices return one range for a whole phrase. Keep native boundaries
+    // where available and estimate the interior word times over its audio span.
+    private func expandPhraseCues(audioEnd: Int64) {
+        let native = cues
+        cues.removeAll(keepingCapacity: true)
+        for (index, cue) in native.enumerated() {
+            let phrase = source.substring(with: cue.range)
+            var words: [NSRange] = []
+            phrase.enumerateSubstrings(in: phrase.startIndex..<phrase.endIndex, options: [.byWords, .substringNotRequired]) { _, range, _, _ in
+                words.append(NSRange(range, in: phrase))
+            }
+            guard words.count > 1 else {
+                cues.append(cue)
+                continue
+            }
+            let start = max(dataOffset, cue.fileOffset)
+            let end = index + 1 < native.count ? native[index + 1].fileOffset : audioEnd
+            for word in words {
+                let fraction = Double(word.location) / Double(cue.range.length)
+                let offset = start + Int64(Double(max(0, end - start)) * fraction)
+                cues.append((NSRange(location: cue.range.location + word.location, length: word.length), offset))
+            }
+        }
+    }
+
     private func updatePlayback() {
         guard let player, !paused else { return }
         let offset = dataOffset + Int64(player.currentTime * bytesPerSecond)
@@ -189,6 +214,7 @@ private final class SpeechService: NSObject, NSSpeechSynthesizerDelegate, AVAudi
                 throw CocoaError(.fileReadCorruptFile)
             }
             let output = try AVAudioPlayer(contentsOf: url)
+            expandPhraseCues(audioEnd: dataOffset + Int64(output.duration * bytesPerSecond))
             player = output
             output.delegate = self
             output.volume = muted ? 0 : 1
