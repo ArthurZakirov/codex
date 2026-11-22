@@ -108,7 +108,10 @@ jobs:
         run: cargo check -p codex-tui --lib --locked -j 2
       - name: Test realtime lifecycle
         working-directory: codex-rs
-        run: cargo test -p codex-tui --lib realtime_tests::lifecycle --locked -j 2 -- --test-threads=1
+        shell: bash
+        run: |
+          cargo test -p codex-tui --lib realtime::tests::lifecycle --locked -j 2 -- --test-threads=1 | tee "$RUNNER_TEMP/voice-lifecycle-tests.log"
+          grep -Eq 'test result: ok\. [1-9][0-9]* passed' "$RUNNER_TEMP/voice-lifecycle-tests.log"
       - name: Test local voice playback
         working-directory: codex-rs
         run: cargo test -p codex-tui --lib verbatim_speech::tests --locked -j 2
