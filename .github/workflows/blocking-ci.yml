@@ -107,6 +107,8 @@ jobs:
         working-directory: codex-rs
         run: cargo check -p codex-tui --lib --locked -j 2
       - name: Test realtime lifecycle
+        env:
+          RUST_MIN_STACK: "8388608"
         working-directory: codex-rs
         shell: bash
         run: |
