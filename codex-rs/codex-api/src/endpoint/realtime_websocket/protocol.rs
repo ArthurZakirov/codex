@@ -147,7 +147,7 @@ pub(super) struct SessionAudio {
 pub(super) struct SessionAudioInput {
     pub(super) format: SessionAudioFormat,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) noise_reduction: Option<SessionNoiseReduction>,
+    pub(super) noise_reduction: Option<Option<SessionNoiseReduction>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) transcription: Option<SessionInputAudioTranscription>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -189,6 +189,7 @@ pub(super) struct SessionNoiseReduction {
 #[serde(rename_all = "snake_case")]
 pub(super) enum NoiseReductionType {
     NearField,
+    FarField,
 }
 
 #[derive(Debug, Clone, Serialize)]
