@@ -547,6 +547,11 @@ pub(crate) enum AppEvent {
         source: ThreadId,
         link: crate::markdown_render::FileLink,
     },
+    TranscriptEditorFailed {
+        backend_id: crate::backend_id::BackendId,
+        source: ThreadId,
+        message: String,
+    },
     SidebarDocumentResolved {
         backend_id: crate::backend_id::BackendId,
         parent: ThreadId,
