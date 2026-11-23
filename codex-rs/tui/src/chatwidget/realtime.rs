@@ -353,7 +353,7 @@ fn prepare_voice_config(
     let Some(settings) = value.as_object_mut() else {
         return Ok(());
     };
-    let existing_keys = settings.len();
+    let original_settings = settings.clone();
     for (name, default) in [
         ("paragraph_highlight_color", serde_json::json!("#63A8F8")),
         ("paragraph_highlight_opacity_percent", serde_json::json!(10)),
@@ -384,6 +384,23 @@ fn prepare_voice_config(
     settings
         .entry("dictation")
         .or_insert_with(|| serde_json::json!({"enabled": false, "auto_start": false}));
+    if let Some(dictation) = settings
+        .get_mut("dictation")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        dictation
+            .entry("model")
+            .or_insert(serde_json::json!("gpt-4o-mini-transcribe"));
+        dictation
+            .entry("noise_reduction")
+            .or_insert(serde_json::json!("default"));
+    }
+    if let Some(help) = settings
+        .get_mut("_help")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        help.entry("dictation_audio").or_insert(serde_json::json!("model: gpt-4o-mini-transcribe or gpt-4o-transcribe. noise_reduction: default, off, near_field (headset), or far_field (room microphone). Restart dictation to apply."));
+    }
     if !settings.contains_key("focus_mode") {
         #[cfg(target_os = "macos")]
         let focus_mode =
@@ -395,7 +412,7 @@ fn prepare_voice_config(
         };
         settings.insert("focus_mode".into(), focus_mode);
     }
-    if settings.len() == existing_keys {
+    if *settings == original_settings {
         return Ok(());
     }
     let directory = path

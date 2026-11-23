@@ -72,6 +72,15 @@ pub(super) fn conversation_function_call_output_message(
     }
 }
 
+fn dictation_settings() -> serde_json::Value {
+    std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .and_then(|home| std::fs::read(home.join(".config/codex-voice/config.json")).ok())
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .and_then(|mut config| config.get_mut("dictation").map(serde_json::Value::take))
+        .unwrap_or_default()
+}
+
 pub(super) fn session_update_session(
     instructions: String,
     session_mode: RealtimeSessionMode,
@@ -91,9 +100,9 @@ pub(super) fn session_update_session(
                         r#type: AudioFormatType::AudioPcm,
                         rate: REALTIME_AUDIO_SAMPLE_RATE,
                     },
-                    noise_reduction: Some(SessionNoiseReduction {
+                    noise_reduction: Some(Some(SessionNoiseReduction {
                         r#type: NoiseReductionType::NearField,
-                    }),
+                    })),
                     transcription: Some(SessionInputAudioTranscription {
                         model: REALTIME_V2_INPUT_TRANSCRIPTION_MODEL.to_string(),
                     }),
@@ -142,34 +151,51 @@ pub(super) fn session_update_session(
             ]),
             tool_choice: Some(REALTIME_V2_TOOL_CHOICE.to_string()),
         },
-        RealtimeSessionMode::Transcription => SessionUpdateSession {
-            id: None,
-            r#type: SessionType::Transcription,
-            model: None,
-            instructions: None,
-            output_modalities: None,
-            audio: SessionAudio {
-                input: SessionAudioInput {
-                    format: SessionAudioFormat {
-                        r#type: AudioFormatType::AudioPcm,
-                        rate: REALTIME_AUDIO_SAMPLE_RATE,
+        RealtimeSessionMode::Transcription => {
+            let settings = dictation_settings();
+            let model = settings["model"]
+                .as_str()
+                .filter(|model| !model.trim().is_empty())
+                .unwrap_or(REALTIME_V2_INPUT_TRANSCRIPTION_MODEL);
+            let noise_reduction = match settings["noise_reduction"].as_str() {
+                Some("near_field") => Some(Some(SessionNoiseReduction {
+                    r#type: NoiseReductionType::NearField,
+                })),
+                Some("far_field") => Some(Some(SessionNoiseReduction {
+                    r#type: NoiseReductionType::FarField,
+                })),
+                Some("off") => Some(None),
+                _ => None,
+            };
+            SessionUpdateSession {
+                id: None,
+                r#type: SessionType::Transcription,
+                model: None,
+                instructions: None,
+                output_modalities: None,
+                audio: SessionAudio {
+                    input: SessionAudioInput {
+                        format: SessionAudioFormat {
+                            r#type: AudioFormatType::AudioPcm,
+                            rate: REALTIME_AUDIO_SAMPLE_RATE,
+                        },
+                        noise_reduction,
+                        transcription: Some(SessionInputAudioTranscription {
+                            model: model.to_string(),
+                        }),
+                        turn_detection: Some(SessionTurnDetection {
+                            r#type: TurnDetectionType::ServerVad,
+                            interrupt_response: None,
+                            create_response: None,
+                            silence_duration_ms: 500,
+                        }),
                     },
-                    noise_reduction: None,
-                    transcription: Some(SessionInputAudioTranscription {
-                        model: REALTIME_V2_INPUT_TRANSCRIPTION_MODEL.to_string(),
-                    }),
-                    turn_detection: Some(SessionTurnDetection {
-                        r#type: TurnDetectionType::ServerVad,
-                        interrupt_response: None,
-                        create_response: None,
-                        silence_duration_ms: 500,
-                    }),
+                    output: None,
                 },
-                output: None,
-            },
-            tools: None,
-            tool_choice: None,
-        },
+                tools: None,
+                tool_choice: None,
+            }
+        }
     }
 }
 
