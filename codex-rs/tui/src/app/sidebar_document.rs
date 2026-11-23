@@ -39,8 +39,16 @@ pub(super) async fn open_in_editor(
         .map_err(|()| color_eyre::eyre::eyre!("Expected a local file"))?;
     let meta = tokio::fs::metadata(local).await?;
     color_eyre::eyre::ensure!(meta.is_file() || meta.is_dir(), "Expected a file or folder");
+    launch_editor(scheme, &path, link.location.filter(|_| meta.is_file())).await
+}
+
+async fn launch_editor(
+    scheme: &str,
+    path: &url::Url,
+    location: Option<SourceLocation>,
+) -> Result<()> {
     let status = tokio::process::Command::new("/usr/bin/open")
-        .arg(editor_uri(scheme, &path, link.location))
+        .arg(editor_uri(scheme, path, location))
         .output()
         .await?
         .status;
@@ -539,6 +547,30 @@ impl App {
         let Some(parent) = self.sidebar_parent() else {
             return Ok(());
         };
+        // Reader links and chooser selections can reach the preview directly.
+        // A directory has no document contents to request from the app server.
+        let url = path.to_url();
+        if !server.uses_remote_workspace()
+            && cfg!(target_os = "macos")
+            && let Ok(local) = url.to_file_path()
+            && tokio::fs::metadata(local)
+                .await
+                .is_ok_and(|meta| meta.is_dir())
+        {
+            if focus {
+                if let Some(scheme) = self.transcript_editor_scheme(server) {
+                    if let Err(error) = launch_editor(scheme, &url, None).await {
+                        self.chat_widget
+                            .add_error_message(format!("Could not open folder: {error}"));
+                    }
+                } else {
+                    self.chat_widget.add_error_message(
+                        "Set file_opener to open folders in an editor.".to_owned(),
+                    );
+                }
+            }
+            return Ok(());
+        }
         let backend_id = server.backend_id();
         let existing = self.sidebar().and_then(|pane| {
             pane.documents.iter().find_map(|(&id, doc)| {
