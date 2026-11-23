@@ -809,7 +809,13 @@ impl ChatWidget {
             StatusLineItem::CodexVersion => Some(
                 codex_build_info::BuildInfo::voice_release_tag().map_or_else(
                     || CODEX_CLI_VERSION.to_string(),
-                    |tag| format!("Codex Voice Fork {tag}"),
+                    |tag| {
+                        #[cfg(target_os = "macos")]
+                        if self.narration_muted() {
+                            return format!("Narration muted · Codex Voice Fork {tag}");
+                        }
+                        format!("Codex Voice Fork {tag}")
+                    },
                 ),
             ),
             StatusLineItem::ContextWindowSize => self
