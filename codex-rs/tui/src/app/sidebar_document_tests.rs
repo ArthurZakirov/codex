@@ -32,6 +32,7 @@ fn focused_markdown_link_opens_read_only_preview_only_with_workspace() -> Result
 
 async fn document_preview_scenario() -> Result<()> {
     let (mut app, mut events, _ops) = make_test_app_with_channels().await;
+    app.config.file_opener = codex_config::types::UriBasedFileOpener::None;
     app.local_settings.transcript_mode = crate::transcript_mode::TranscriptMode::Owned;
     app.config.features.disable(Feature::TuiWorkspace)?;
     app.local_settings.tui.animations = false;
@@ -671,4 +672,21 @@ fn visible_sidebar_row(tui: &crate::tui::Tui, sidebar: Rect, row: u16) -> String
         .collect::<String>()
         .trim()
         .to_owned()
+}
+
+#[test]
+fn editor_uri_preserves_encoded_paths_and_source_locations() {
+    let path = url::Url::from_file_path("/tmp/src #1/example.rs").unwrap();
+    assert_eq!(
+        editor_uri("vscode", &path, None),
+        "vscode://file/tmp/src%20%231/example.rs"
+    );
+    let location = SourceLocation {
+        line: 42,
+        column: 7,
+    };
+    assert_eq!(
+        editor_uri("cursor", &path, Some(location)),
+        "cursor://file/tmp/src%20%231/example.rs:42:7"
+    );
 }

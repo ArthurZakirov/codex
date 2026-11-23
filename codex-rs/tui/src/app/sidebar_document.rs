@@ -26,6 +26,36 @@ use ratatui::layout::Position;
 use ratatui::widgets::Widget;
 use unicode_segmentation::UnicodeSegmentation;
 
+pub(super) async fn open_in_editor(
+    server: &AppServerSession,
+    source: ThreadId,
+    link: FileLink,
+    scheme: &str,
+) -> Result<()> {
+    let target = AppServerPath::from_app_server(link.path);
+    let path = server.resolve_thread_file(source, &target).await?.to_url();
+    let local = path
+        .to_file_path()
+        .map_err(|()| color_eyre::eyre::eyre!("Expected a local file"))?;
+    let meta = tokio::fs::metadata(local).await?;
+    color_eyre::eyre::ensure!(meta.is_file() || meta.is_dir(), "Expected a file or folder");
+    let status = tokio::process::Command::new("/usr/bin/open")
+        .arg(editor_uri(scheme, &path, link.location))
+        .output()
+        .await?
+        .status;
+    color_eyre::eyre::ensure!(status.success(), "macOS could not open the {scheme} URL");
+    Ok(())
+}
+
+fn editor_uri(scheme: &str, path: &url::Url, location: Option<SourceLocation>) -> String {
+    let mut uri = format!("{scheme}://file{}", path.path());
+    if let Some(SourceLocation { line, column }) = location {
+        uri.push_str(&format!(":{line}:{column}"));
+    }
+    uri
+}
+
 #[derive(Debug)]
 struct FileCell {
     source: String,
@@ -415,6 +445,23 @@ impl App {
             return None;
         };
         pane.documents.get(&id)
+    }
+
+    pub(super) fn transcript_editor_scheme(
+        &self,
+        server: &AppServerSession,
+    ) -> Option<&'static str> {
+        use codex_config::types::UriBasedFileOpener;
+        if server.uses_remote_workspace() || !cfg!(target_os = "macos") {
+            return None;
+        }
+        match self.config.file_opener {
+            UriBasedFileOpener::VsCode => Some("vscode"),
+            UriBasedFileOpener::VsCodeInsiders => Some("vscode-insiders"),
+            UriBasedFileOpener::Cursor => Some("cursor"),
+            UriBasedFileOpener::Windsurf => Some("windsurf"),
+            UriBasedFileOpener::None => None,
+        }
     }
 
     pub(super) fn document_preview_available(

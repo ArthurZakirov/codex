@@ -103,6 +103,7 @@ impl App {
                     | AppEvent::StartQueuedSavedChat
                     | AppEvent::OpenSidebarAgent { .. }
                     | AppEvent::OpenSidebarDocument { .. }
+                    | AppEvent::TranscriptEditorFailed { .. }
                     | AppEvent::SidebarDocumentResolved { .. }
                     | AppEvent::SidebarDocumentLoaded { .. }
                     | AppEvent::SidebarFilesLoaded { .. }
@@ -3708,12 +3709,34 @@ impl App {
                     }
                 }
             }
-            AppEvent::OpenSidebarDocument { backend_id, source, link } => {
+            AppEvent::OpenSidebarDocument { backend_id, source, link, from_transcript } => {
+                if from_transcript && backend_id == app_server.backend_id()
+                    && self.current_displayed_thread_id() == Some(source)
+                    && let Some(scheme) = self.transcript_editor_scheme(app_server)
+                {
+                    let server = app_server.request_view();
+                    let tx = self.app_event_tx.clone();
+                    tokio::spawn(async move {
+                        if let Err(error) = sidebar_document::open_in_editor(&server, source, link, scheme).await {
+                            tx.send(AppEvent::TranscriptEditorFailed {
+                                backend_id,
+                                source,
+                                message: format!("Could not open file in editor: {error}"),
+                            });
+                        }
+                    });
+                    return Ok(AppRunControl::Continue);
+                }
                 if app_server.backend_id() == backend_id
                     && self.current_displayed_thread_id() == Some(source)
                     && self.document_preview_available(tui, app_server)
                 {
                     Box::pin(self.open_document(tui, app_server, source, link)).await?;
+                }
+            }
+            AppEvent::TranscriptEditorFailed { backend_id, source, message } => {
+                if app_server.backend_id() == backend_id && self.current_displayed_thread_id() == Some(source) {
+                    self.chat_widget.add_error_message(message);
                 }
             }
             AppEvent::SidebarDocumentResolved { backend_id, parent, source, request, original_path, path, location, } => {

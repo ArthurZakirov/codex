@@ -1547,6 +1547,7 @@ impl App {
                 && let Some(source) = self.current_displayed_thread_id()
             {
                 self.app_event_tx.send(AppEvent::OpenSidebarDocument {
+                    from_transcript: true,
                     backend_id: app_server.backend_id(),
                     source,
                     link,
