@@ -74,6 +74,10 @@ pub(crate) fn reading_controls() -> &'static ReadingControls {
 }
 
 impl ChatWidget {
+    pub(crate) fn narration_muted(&self) -> bool {
+        MUTED.load(Ordering::Acquire)
+    }
+
     pub(crate) fn handle_reading_key(&mut self, key: crossterm::event::KeyEvent) -> bool {
         if !enabled() {
             return false;
@@ -87,6 +91,8 @@ impl ChatWidget {
         }
         if pressed(controls.mute) {
             let was_muted = MUTED.fetch_xor(true, Ordering::AcqRel);
+            self.refresh_status_line();
+            self.request_redraw();
             self.add_info_message(
                 if was_muted {
                     "Voice narration audible."
