@@ -7,6 +7,8 @@ on:
   push:
     branches:
       - feat/portable-codex-voice-release
+    tags:
+      - "voice-v*-r*"
     paths:
       - .github/voice-release-request
   workflow_dispatch:
@@ -66,7 +68,7 @@ jobs:
       - name: Validate release parameters and source version
         shell: bash
         env:
-          RELEASE_TAG: ${{ inputs.tag }}
+          RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || inputs.tag }}
         run: |
           set -euo pipefail
           version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' codex-rs/Cargo.toml | head -1)"
@@ -221,8 +223,15 @@ jobs:
           if find dist -maxdepth 1 -name 'codex-voice-x86_64-apple-darwin.tar.gz' | grep -q .; then
             echo "Unexpected Intel release artifact" >&2; exit 1
           fi
+          # A tag-triggered build already has its immutable source ref. Do not
+          # let the releases endpoint try to create that ref as the Actions app.
+          release_target=(--target "$GITHUB_SHA")
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            [[ "$GITHUB_REF_NAME" == "$RELEASE_TAG" ]]
+            release_target=(--verify-tag)
+          fi
           gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
-            --target "$GITHUB_SHA" --prerelease \
+            "${release_target[@]}" --prerelease \
             --title "Codex Voice $RELEASE_TAG" \
             --notes "Personal Apple Silicon macOS preview (arm64 only); unsigned/not notarized. Use the version-pinned DevMac installer. Includes the packaged GStreamer native voice runtime." \
             dist/codex-voice-aarch64-apple-darwin.tar.gz dist/SHA256SUMS
