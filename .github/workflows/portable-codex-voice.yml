@@ -14,7 +14,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Optional new immutable release tag (e.g. voice-v0.166.0-r1)"
+        description: "Version label for a build artifact. Push a voice version tag to publish a release."
         required: false
         type: string
 
@@ -193,6 +193,9 @@ jobs:
           if-no-files-found: error
 
   publish:
+    # Branch builds produce downloadable artifacts. Publish only an existing
+    # version tag, so the release API can use its default target_commitish.
+    if: github.ref_type == 'tag'
     needs: build
     runs-on: ubuntu-24.04
     permissions:
@@ -223,15 +226,9 @@ jobs:
           if find dist -maxdepth 1 -name 'codex-voice-x86_64-apple-darwin.tar.gz' | grep -q .; then
             echo "Unexpected Intel release artifact" >&2; exit 1
           fi
-          # A tag-triggered build already has its immutable source ref. Do not
-          # let the releases endpoint try to create that ref as the Actions app.
-          release_target=(--target "$GITHUB_SHA")
-          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
-            [[ "$GITHUB_REF_NAME" == "$RELEASE_TAG" ]]
-            release_target=(--verify-tag)
-          fi
+          [[ "$GITHUB_REF_NAME" == "$RELEASE_TAG" ]]
           gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
-            "${release_target[@]}" --prerelease \
+            --verify-tag --prerelease \
             --title "Codex Voice $RELEASE_TAG" \
             --notes "Personal Apple Silicon macOS preview (arm64 only); unsigned/not notarized. Use the version-pinned DevMac installer. Includes the packaged GStreamer native voice runtime." \
             dist/codex-voice-aarch64-apple-darwin.tar.gz dist/SHA256SUMS
