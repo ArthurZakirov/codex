@@ -914,7 +914,8 @@ impl App {
         self.transcript_view.agent_links = self
             .side_retention_enabled(tui)
             .then(|| app_server.backend_id());
-        self.transcript_view.document_links = self.document_preview_available(tui, app_server);
+        self.transcript_view.document_links = self.document_preview_available(tui, app_server)
+            || self.transcript_editor_scheme(app_server).is_some();
         crate::markdown_render::preferences::set_document_links(
             self.transcript_view.document_links,
         );

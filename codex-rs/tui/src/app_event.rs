@@ -542,6 +542,7 @@ pub(crate) enum AppEvent {
         agent: ThreadId,
     },
     OpenSidebarDocument {
+        from_transcript: bool,
         backend_id: crate::backend_id::BackendId,
         source: ThreadId,
         link: crate::markdown_render::FileLink,

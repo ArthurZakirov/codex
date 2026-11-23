@@ -3708,7 +3708,16 @@ impl App {
                     }
                 }
             }
-            AppEvent::OpenSidebarDocument { backend_id, source, link } => {
+            AppEvent::OpenSidebarDocument { backend_id, source, link, from_transcript } => {
+                if from_transcript && backend_id == app_server.backend_id()
+                    && self.current_displayed_thread_id() == Some(source)
+                    && let Some(scheme) = self.transcript_editor_scheme(app_server)
+                {
+                    if let Err(error) = sidebar_document::open_in_editor(app_server, source, link, scheme).await {
+                        self.chat_widget.add_error_message(format!("Could not open file in editor: {error}"));
+                    }
+                    return Ok(AppRunControl::Continue);
+                }
                 if app_server.backend_id() == backend_id
                     && self.current_displayed_thread_id() == Some(source)
                     && self.document_preview_available(tui, app_server)
