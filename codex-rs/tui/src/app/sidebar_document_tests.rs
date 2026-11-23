@@ -124,6 +124,27 @@ async fn document_preview_scenario() -> Result<()> {
     let error = side_frame(&mut app, &mut tui, size)?;
     assert!(error.contains("Could not open file"), "{error}");
 
+    #[cfg(target_os = "macos")]
+    {
+        let folder = dir.path().join("Dotfiles checkout");
+        std::fs::create_dir(&folder)?;
+        let original =
+            codex_app_server_client::AppServerPath::from_app_server(folder.display().to_string());
+        let resolved = server.resolve_thread_file(parent, &original).await?;
+        let before = app.sidebar().expect("open sidebar").documents.len();
+        Box::pin(app.open_resolved_document(
+            &mut tui,
+            &mut server,
+            parent,
+            original,
+            resolved,
+            None,
+            true,
+        ))
+        .await?;
+        assert_eq!(app.sidebar().expect("open sidebar").documents.len(), before);
+    }
+
     std::fs::write(
         dir.path().join("guide.md"),
         format!(
